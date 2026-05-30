@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Create PowerPoint slides from SEM images with editable scale bars."""
+"""Create PowerPoint slides or SVGs from SEM images with editable scale bars."""
 
 from __future__ import annotations
 
+import base64
 import math
 import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, cast
+from xml.sax.saxutils import escape
 
 from PIL import Image
 from pptx import Presentation
@@ -41,6 +43,7 @@ DEFAULTS = {
     "line_width_pt": 3.0,
     # font_size_pt = 0 means automatic.
     "font_size_pt": 36,
+    "font_bold": False,
     "inset_x_percent": 8,
     "inset_y_percent": 15,
 }
@@ -48,6 +51,9 @@ DEFAULTS = {
 DEFAULT_SLIDE_W = Inches(DEFAULTS["slide_width_inches"])
 DEFAULT_SLIDE_H = Inches(DEFAULTS["slide_height_inches"])
 DEFAULT_MARGIN_INCHES = DEFAULTS["slide_margin_inches"]
+POINTS_PER_INCH = 72.0
+DEFAULT_PAGE_W_PT = int(round(DEFAULTS["slide_width_inches"] * POINTS_PER_INCH))
+DEFAULT_PAGE_H_PT = int(round(DEFAULTS["slide_height_inches"] * POINTS_PER_INCH))
 AUTO_SCALE_PRESETS = {
     "short": (0.11, 0.08, 0.14),
     "medium": (0.16, 0.12, 0.20),
@@ -96,6 +102,16 @@ class SlideItem:
     scale_nm: float
     scale_px: float
     label: str
+
+
+@dataclass(frozen=True)
+class PageLayout:
+    page_w: int
+    page_h: int
+    image_x: int
+    image_y: int
+    image_w: int
+    image_h: int
 
 
 def decode_metadata_value(value: object) -> str:
@@ -291,6 +307,24 @@ def fit_image(width_px: int, height_px: int, slide_w: int, slide_h: int, margin:
     return image_x, image_y, image_w, image_h
 
 
+def fit_tight_page(width_px: int, height_px: int, max_page_w: int, max_page_h: int, margin: int) -> PageLayout:
+    max_image_w = max_page_w - margin * 2
+    max_image_h = max_page_h - margin * 2
+    if max_image_w <= 0 or max_image_h <= 0:
+        raise ValueError("Page margin is too large for the output page size.")
+    scale = min(max_image_w / width_px, max_image_h / height_px)
+    image_w = int(round(width_px * scale))
+    image_h = int(round(height_px * scale))
+    return PageLayout(
+        page_w=image_w + margin * 2,
+        page_h=image_h + margin * 2,
+        image_x=margin,
+        image_y=margin,
+        image_w=image_w,
+        image_h=image_h,
+    )
+
+
 def remove_shape_effects(shape) -> None:
     style = shape._element.find(qn("p:style"))
     if style is not None:
@@ -313,6 +347,7 @@ def add_scale_bar(
     image_h: int,
     color: str,
     font_size: int | None,
+    font_bold: bool,
     position: str,
     inset_x_percent: float,
     inset_y_percent: float,
@@ -365,7 +400,7 @@ def add_scale_bar(
     paragraph.alignment = PP_ALIGN.CENTER
     run = paragraph.add_run()
     run.text = item.label
-    run.font.bold = True
+    run.font.bold = font_bold
     run.font.name = "Arial"
     run.font.size = Pt(font_pt)
     run.font.color.rgb = rgb
@@ -379,6 +414,7 @@ def build_pptx(
     margin: int,
     color: str,
     font_size: int | None,
+    font_bold: bool,
     position: str,
     inset_x_percent: float,
     inset_y_percent: float,
@@ -402,6 +438,7 @@ def build_pptx(
             image_h,
             color,
             font_size,
+            font_bold,
             position,
             inset_x_percent,
             inset_y_percent,
@@ -412,6 +449,140 @@ def build_pptx(
     prs.save(str(output))
 
 
+def safe_filename_part(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", value).strip(" .")
+    return cleaned or "image"
+
+
+def split_output_path(output_path: Path, item: SlideItem, index: int, total: int, suffix: str) -> Path:
+    output_path = output_path.with_suffix(suffix)
+    if total == 1:
+        return output_path
+    stem = safe_filename_part(item.source_path.stem)
+    return output_path.with_name(f"{output_path.stem}_{index:02d}_{stem}{suffix}")
+
+
+def svg_output_path(output_path: Path, item: SlideItem, index: int, total: int) -> Path:
+    return split_output_path(output_path, item, index, total, ".svg")
+
+
+def svg_num(value: float) -> str:
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text if text and text != "-0" else "0"
+
+
+def svg_attr(value: str) -> str:
+    return escape(value, {'"': "&quot;"})
+
+
+def add_svg_scale_bar(
+    parts: list[str],
+    item: SlideItem,
+    image_x: int,
+    image_y: int,
+    image_w: int,
+    image_h: int,
+    color: str,
+    font_size: int | None,
+    font_bold: bool,
+    position: str,
+    inset_x_percent: float,
+    inset_y_percent: float,
+    line_width_pt: float,
+) -> None:
+    scale_w = int(round(item.scale_px / item.width_px * image_w))
+    inset_x = int(round(image_w * inset_x_percent / 100))
+    inset_y = int(round(image_h * inset_y_percent / 100))
+    font_pt = font_size or max(10, min(24, int(round(image_w / POINTS_PER_INCH * 1.4))))
+    text_h = font_pt * 1.8
+    label_gap = font_pt * 0.25
+
+    if position == "bottom-left":
+        x1 = image_x + inset_x
+        y1 = image_y + image_h - inset_y
+    elif position == "top-right":
+        x1 = image_x + image_w - inset_x - scale_w
+        y1 = image_y + inset_y + text_h + label_gap
+    elif position == "top-left":
+        x1 = image_x + inset_x
+        y1 = image_y + inset_y + text_h + label_gap
+    else:
+        x1 = image_x + image_w - inset_x - scale_w
+        y1 = image_y + image_h - inset_y
+
+    x1 = max(image_x, min(x1, image_x + image_w - scale_w))
+    y1 = max(image_y + text_h + label_gap, min(y1, image_y + image_h))
+    text_y = y1 - label_gap - font_pt * 0.35
+    svg_color = f"#{color}"
+    font_weight = "700" if font_bold else "400"
+    label = svg_attr(item.label)
+
+    parts.append(
+        f'  <line x1="{svg_num(x1)}" y1="{svg_num(y1)}" '
+        f'x2="{svg_num(x1 + scale_w)}" y2="{svg_num(y1)}" '
+        f'stroke="{svg_color}" stroke-width="{svg_num(line_width_pt)}" '
+        'stroke-linecap="butt" />'
+    )
+    parts.append(
+        f'  <text x="{svg_num(x1 + scale_w / 2)}" y="{svg_num(text_y)}" '
+        f'fill="{svg_color}" font-family="Arial, Helvetica, sans-serif" '
+        f'font-size="{svg_num(font_pt)}" font-weight="{font_weight}" text-anchor="middle">{label}</text>'
+    )
+
+
+def build_svg(
+    item: SlideItem,
+    output: Path,
+    max_page_w: int,
+    max_page_h: int,
+    margin: int,
+    color: str,
+    font_size: int | None,
+    font_bold: bool,
+    position: str,
+    inset_x_percent: float,
+    inset_y_percent: float,
+    line_width_pt: float,
+) -> None:
+    layout = fit_tight_page(item.width_px, item.height_px, max_page_w, max_page_h, margin)
+    image_data = base64.b64encode(item.png_path.read_bytes()).decode("ascii")
+    image_href = f"data:image/png;base64,{image_data}"
+
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'xmlns:xlink="http://www.w3.org/1999/xlink" '
+            f'width="{svg_num(layout.page_w)}pt" height="{svg_num(layout.page_h)}pt" '
+            f'viewBox="0 0 {svg_num(layout.page_w)} {svg_num(layout.page_h)}">'
+        ),
+        (
+            f'  <image x="{svg_num(layout.image_x)}" y="{svg_num(layout.image_y)}" '
+            f'width="{svg_num(layout.image_w)}" height="{svg_num(layout.image_h)}" '
+            f'href="{image_href}" xlink:href="{image_href}" preserveAspectRatio="none" />'
+        ),
+    ]
+    add_svg_scale_bar(
+        parts,
+        item,
+        layout.image_x,
+        layout.image_y,
+        layout.image_w,
+        layout.image_h,
+        color,
+        font_size,
+        font_bold,
+        position,
+        inset_x_percent,
+        inset_y_percent,
+        line_width_pt,
+    )
+    parts.append("</svg>")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(parts) + "\n", encoding="utf-8")
+
+
 def generate_pptx(
     input_path: Path | Iterable[Path],
     output_path: Path,
@@ -420,6 +591,7 @@ def generate_pptx(
     position: str = DEFAULTS["scale_position"],
     bar_color: str = DEFAULTS["bar_color"],
     font_size: int | None = None,
+    font_bold: bool = DEFAULTS["font_bold"],
     margin_inches: float = DEFAULT_MARGIN_INCHES,
     inset_x_percent: float = DEFAULTS["inset_x_percent"],
     inset_y_percent: float = DEFAULTS["inset_y_percent"],
@@ -445,9 +617,55 @@ def generate_pptx(
             margin,
             color,
             font_size,
+            font_bold,
             position,
             inset_x_percent,
             inset_y_percent,
             line_width_pt,
         )
+    return items
+
+
+def generate_svg(
+    input_path: Path | Iterable[Path],
+    output_path: Path,
+    fixed_scale: str | None = None,
+    auto_scale_preset: str = DEFAULTS["auto_scale_preset"],
+    position: str = DEFAULTS["scale_position"],
+    bar_color: str = DEFAULTS["bar_color"],
+    font_size: int | None = None,
+    font_bold: bool = DEFAULTS["font_bold"],
+    margin_inches: float = DEFAULT_MARGIN_INCHES,
+    inset_x_percent: float = DEFAULTS["inset_x_percent"],
+    inset_y_percent: float = DEFAULTS["inset_y_percent"],
+    line_width_pt: float = DEFAULTS["line_width_pt"],
+) -> list[SlideItem]:
+    page_w, page_h = DEFAULT_PAGE_W_PT, DEFAULT_PAGE_H_PT
+    margin = int(round(margin_inches * POINTS_PER_INCH))
+    fixed_scale_nm = parse_scale_nm(fixed_scale) if fixed_scale else None
+    color = hex_color(bar_color)
+    image_paths = find_images(input_path)
+
+    with tempfile.TemporaryDirectory(prefix="sem_scale_svg_") as temp:
+        temp_dir = Path(temp)
+        items = [
+            prepare_slide_item(path, temp_dir, index, fixed_scale_nm, auto_scale_preset)
+            for index, path in enumerate(image_paths, start=1)
+        ]
+        total = len(items)
+        for index, item in enumerate(items, start=1):
+            build_svg(
+                item,
+                svg_output_path(output_path, item, index, total),
+                page_w,
+                page_h,
+                margin,
+                color,
+                font_size,
+                font_bold,
+                position,
+                inset_x_percent,
+                inset_y_percent,
+                line_width_pt,
+            )
     return items

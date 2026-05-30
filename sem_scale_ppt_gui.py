@@ -16,6 +16,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -33,22 +34,32 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QRadioButton,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from sem_scale_ppt import DEFAULTS, DEFAULT_MARGIN_INCHES, IMAGE_EXTENSIONS, generate_pptx
+from sem_scale_ppt import (
+    DEFAULTS,
+    DEFAULT_MARGIN_INCHES,
+    IMAGE_EXTENSIONS,
+    generate_pptx,
+    generate_svg,
+    svg_output_path,
+)
 
 
 class GenerateOptions(TypedDict):
     input_path: list[Path]
     output_path: Path
+    output_format: str
     fixed_scale: str | None
     auto_scale_preset: str
     position: str
     bar_color: str
     font_size: int | None
+    font_bold: bool
     margin_inches: float
     inset_x_percent: float
     inset_y_percent: float
@@ -65,6 +76,10 @@ AUTO_SCALE_PRESETS = {
     "短": "short",
     "中": "medium",
     "长": "long",
+}
+OUTPUT_FORMATS = {
+    "PPTX": "pptx",
+    "SVG": "svg",
 }
 
 
@@ -158,7 +173,7 @@ class NoWheelDoubleSpinBox(QDoubleSpinBox):
 
 
 class GeneratorWorker(QObject):
-    finished = Signal(str)
+    finished = Signal(list)
     failed = Signal(str)
     log = Signal(str)
 
@@ -168,16 +183,57 @@ class GeneratorWorker(QObject):
 
     def run(self) -> None:
         try:
-            self.log.emit("正在生成 PPT...")
-            items = generate_pptx(**self.options)
-            output_path = self.options["output_path"]
-            self.log.emit(f"已生成: {output_path}")
+            output_format = self.options["output_format"]
+            self.log.emit(f"正在生成 {output_format.upper()}...")
+            output_paths: list[Path]
+            if output_format == "svg":
+                items = generate_svg(
+                    input_path=self.options["input_path"],
+                    output_path=self.options["output_path"],
+                    fixed_scale=self.options["fixed_scale"],
+                    auto_scale_preset=self.options["auto_scale_preset"],
+                    position=self.options["position"],
+                    bar_color=self.options["bar_color"],
+                    font_size=self.options["font_size"],
+                    font_bold=self.options["font_bold"],
+                    margin_inches=self.options["margin_inches"],
+                    inset_x_percent=self.options["inset_x_percent"],
+                    inset_y_percent=self.options["inset_y_percent"],
+                    line_width_pt=self.options["line_width_pt"],
+                )
+                total = len(items)
+                output_paths = [
+                    svg_output_path(self.options["output_path"], item, index, total)
+                    for index, item in enumerate(items, start=1)
+                ]
+            else:
+                items = generate_pptx(
+                    input_path=self.options["input_path"],
+                    output_path=self.options["output_path"],
+                    fixed_scale=self.options["fixed_scale"],
+                    auto_scale_preset=self.options["auto_scale_preset"],
+                    position=self.options["position"],
+                    bar_color=self.options["bar_color"],
+                    font_size=self.options["font_size"],
+                    font_bold=self.options["font_bold"],
+                    margin_inches=self.options["margin_inches"],
+                    inset_x_percent=self.options["inset_x_percent"],
+                    inset_y_percent=self.options["inset_y_percent"],
+                    line_width_pt=self.options["line_width_pt"],
+                )
+                output_paths = [self.options["output_path"]]
+            if len(output_paths) == 1:
+                self.log.emit(f"已生成: {output_paths[0]}")
+            else:
+                self.log.emit(f"已生成 {len(output_paths)} 个 {output_format.upper()}:")
+                for path in output_paths:
+                    self.log.emit(f"  {path}")
             for item in items:
                 self.log.emit(
                     f"{item.source_path.name}: {item.calibration.nm_per_pixel:g} nm/px, "
                     f"标尺 {item.label} = {item.scale_px:.1f} px"
                 )
-            self.finished.emit(str(output_path))
+            self.finished.emit([str(path) for path in output_paths])
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -194,7 +250,9 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         root = QWidget()
-        layout = QHBoxLayout(root)
+        root_layout = QVBoxLayout(root)
+        main_layout = QHBoxLayout()
+        root_layout.addLayout(main_layout, stretch=3)
 
         queue_box = QWidget()
         queue_layout = QVBoxLayout(queue_box)
@@ -222,7 +280,7 @@ class MainWindow(QMainWindow):
         queue_buttons_2.addWidget(self._button("自然排序", self.sort_queue))
         queue_buttons_2.addWidget(self._button("清空", self.clear_queue))
         queue_layout.addLayout(queue_buttons_2)
-        layout.addWidget(queue_box, stretch=1)
+        main_layout.addWidget(queue_box, stretch=1)
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
@@ -231,9 +289,23 @@ class MainWindow(QMainWindow):
         output_box = QGroupBox("输出")
         output_layout = QGridLayout(output_box)
         self.output_edit = QLineEdit(str(Path.cwd() / DEFAULTS["output_filename"]))
-        output_layout.addWidget(QLabel("输出 PPTX"), 0, 0)
-        output_layout.addWidget(self.output_edit, 1, 0)
-        output_layout.addWidget(self._button("另存为", self.choose_output), 1, 1)
+        self.output_format_group = QButtonGroup(self)
+        self.output_format_group.setExclusive(True)
+        self.output_format_buttons: dict[str, QRadioButton] = {}
+        format_row = QHBoxLayout()
+        for label in OUTPUT_FORMATS:
+            button = QRadioButton(label)
+            button.toggled.connect(self.on_output_format_changed)
+            self.output_format_group.addButton(button)
+            self.output_format_buttons[label] = button
+            format_row.addWidget(button)
+        format_row.addStretch()
+        self.output_format_buttons["PPTX"].setChecked(True)
+        output_layout.addWidget(QLabel("输出格式"), 0, 0)
+        output_layout.addLayout(format_row, 0, 1)
+        output_layout.addWidget(QLabel("输出文件"), 1, 0)
+        output_layout.addWidget(self.output_edit, 2, 0)
+        output_layout.addWidget(self._button("另存为", self.choose_output), 2, 1)
         right_layout.addWidget(output_box)
 
         options_box = QGroupBox("标尺设置")
@@ -260,6 +332,8 @@ class MainWindow(QMainWindow):
         self.font_spin.setRange(0, 72)
         self.font_spin.setValue(DEFAULTS["font_size_pt"])
         self.font_spin.setSpecialValueText("自动")
+        self.font_bold_check = QCheckBox("加粗")
+        self.font_bold_check.setChecked(bool(DEFAULTS["font_bold"]))
         self.margin_edit = QLineEdit(f"{DEFAULT_MARGIN_INCHES:g}")
         self.inset_x_spin = NoWheelSpinBox()
         self.inset_x_spin.setRange(0, 40)
@@ -281,12 +355,13 @@ class MainWindow(QMainWindow):
         form.addRow("线宽 pt", self.line_width_spin)
         form.addRow("颜色", color_row)
         form.addRow("字体大小 pt", self.font_spin)
+        form.addRow("字体样式", self.font_bold_check)
         form.addRow("页面边距 inch", self.margin_edit)
         right_layout.addWidget(options_box)
 
         action_row = QHBoxLayout()
         action_row.addStretch()
-        self.generate_button = QPushButton("生成 PPT")
+        self.generate_button = QPushButton("生成 PPTX")
         self.generate_button.clicked.connect(lambda: self.generate(open_after=False))
         self.generate_open_button = QPushButton("生成并打开")
         self.generate_open_button.clicked.connect(lambda: self.generate(open_after=True))
@@ -294,16 +369,35 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.generate_open_button)
         right_layout.addLayout(action_row)
 
+        right_layout.addStretch()
+        main_layout.addWidget(right_panel, stretch=1)
+
         self.log_edit = QPlainTextEdit()
         self.log_edit.setReadOnly(True)
-        right_layout.addWidget(self.log_edit, stretch=1)
-        layout.addWidget(right_panel, stretch=1)
+        root_layout.addWidget(self.log_edit, stretch=1)
         self.setCentralWidget(root)
 
     def _button(self, text: str, callback) -> QPushButton:
         button = QPushButton(text)
         button.clicked.connect(callback)
         return button
+
+    def current_output_format(self) -> str:
+        for label, output_format in OUTPUT_FORMATS.items():
+            if self.output_format_buttons[label].isChecked():
+                return output_format
+        return OUTPUT_FORMATS["PPTX"]
+
+    def current_output_suffix(self) -> str:
+        return f".{self.current_output_format()}"
+
+    def on_output_format_changed(self, *_args) -> None:
+        suffix = self.current_output_suffix()
+        output_text = self.output_edit.text().strip()
+        if output_text:
+            self.output_edit.setText(str(Path(output_text).with_suffix(suffix)))
+        if hasattr(self, "generate_button"):
+            self.generate_button.setText(f"生成 {self.current_output_format().upper()}")
 
     def choose_input_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择 SEM 图片文件夹", str(Path.cwd()))
@@ -321,10 +415,18 @@ class MainWindow(QMainWindow):
             self.add_paths([Path(path) for path in paths])
 
     def choose_output(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "保存 PPTX", self.output_edit.text(), "PowerPoint (*.pptx)")
+        output_format = self.current_output_format()
+        if output_format == "svg":
+            file_filter = "SVG (*.svg)"
+            title = "保存 SVG"
+        else:
+            file_filter = "PowerPoint (*.pptx)"
+            title = "保存 PPTX"
+        path, _ = QFileDialog.getSaveFileName(self, title, self.output_edit.text(), file_filter)
         if path:
-            if not path.lower().endswith(".pptx"):
-                path += ".pptx"
+            suffix = self.current_output_suffix()
+            if Path(path).suffix.lower() != suffix:
+                path += suffix
             self.output_edit.setText(path)
 
     def choose_color(self) -> None:
@@ -412,26 +514,28 @@ class MainWindow(QMainWindow):
         self.auto_scale_combo.setEnabled(checked)
         self.fixed_scale_edit.setEnabled(not checked)
 
-    def temporary_output_path(self) -> Path:
+    def temporary_output_path(self, output_format: str) -> Path:
         output_dir = Path(tempfile.gettempdir()) / "sem_scale_ppt"
         output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return output_dir / f"sem_scale_{timestamp}.pptx"
+        return output_dir / f"sem_scale_{timestamp}.{output_format}"
 
     def generate(self, open_after: bool = False) -> None:
         try:
             input_paths = self.checked_paths()
             if not input_paths:
                 raise ValueError("请至少添加并勾选一张 SEM 图片。")
+            output_format = self.current_output_format()
+            suffix = f".{output_format}"
             if open_after:
-                output_path = self.temporary_output_path()
+                output_path = self.temporary_output_path(output_format)
             else:
                 output_text = self.output_edit.text().strip()
                 if not output_text:
-                    raise ValueError("请选择输出 PPTX 路径。")
+                    raise ValueError("请选择输出文件路径。")
                 output_path = Path(output_text)
-                if output_path.suffix.lower() != ".pptx":
-                    output_path = output_path.with_suffix(".pptx")
+                if output_path.suffix.lower() != suffix:
+                    output_path = output_path.with_suffix(suffix)
 
             margin = float(self.margin_edit.text().strip())
             fixed_scale = None if self.auto_scale_check.isChecked() else self.fixed_scale_edit.text().strip()
@@ -441,11 +545,13 @@ class MainWindow(QMainWindow):
             options: GenerateOptions = {
                 "input_path": input_paths,
                 "output_path": output_path,
+                "output_format": output_format,
                 "fixed_scale": fixed_scale,
                 "auto_scale_preset": AUTO_SCALE_PRESETS[self.auto_scale_combo.currentText()],
                 "position": POSITIONS[self.position_combo.currentText()],
                 "bar_color": self.color_edit.text().strip(),
                 "font_size": self.font_spin.value() or None,
+                "font_bold": self.font_bold_check.isChecked(),
                 "margin_inches": margin,
                 "inset_x_percent": float(self.inset_x_spin.value()),
                 "inset_y_percent": float(self.inset_y_spin.value()),
@@ -474,18 +580,29 @@ class MainWindow(QMainWindow):
     def append_log(self, message: str) -> None:
         self.log_edit.appendPlainText(message)
 
-    def on_finished(self, output_path: str) -> None:
+    def on_finished(self, output_paths: list[str]) -> None:
         self.generate_button.setEnabled(True)
         self.generate_open_button.setEnabled(True)
+        output_count = len(output_paths)
         if self.open_after_generate:
+            target_path = Path(output_paths[0]).parent if output_count > 1 else Path(output_paths[0])
             try:
-                os.startfile(output_path)
+                os.startfile(target_path)
             except OSError as exc:
-                QMessageBox.warning(self, "无法打开 PPT", str(exc))
+                QMessageBox.warning(self, "无法打开文件", str(exc))
             else:
-                self.append_log("已打开临时 PPT。请在 PowerPoint 中手动另存为需要的位置。")
+                if output_count > 1:
+                    self.append_log("已打开输出文件夹。")
+                else:
+                    self.append_log("已打开临时文件。请在对应软件中手动另存为需要的位置。")
         else:
-            QMessageBox.information(self, "完成", f"PPT 已生成:\n{output_path}")
+            if output_count == 1:
+                message = f"文件已生成:\n{output_paths[0]}"
+            else:
+                output_dir = Path(output_paths[0]).parent
+                output_format = Path(output_paths[0]).suffix.upper().lstrip(".")
+                message = f"已生成 {output_count} 个 {output_format}:\n{output_dir}"
+            QMessageBox.information(self, "完成", message)
         self.thread = None
         self.worker = None
         self.open_after_generate = False

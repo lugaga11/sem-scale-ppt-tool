@@ -1,0 +1,13 @@
+﻿__pycache__/
+*.py[cod]
+
+artifacts/
+build/
+dist/
+
+sample/
+
+.venv/
+venv/
+.env
+*.pptx

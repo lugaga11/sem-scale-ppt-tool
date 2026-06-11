@@ -9,12 +9,13 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, cast
+from typing import Iterable, Mapping, cast
 from xml.sax.saxutils import escape
 
 from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.shapes import MSO_CONNECTOR
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.oxml.ns import qn
@@ -46,6 +47,8 @@ DEFAULTS = {
     "font_bold": False,
     "inset_x_percent": 8,
     "inset_y_percent": 15,
+    "thickness_band_width_percent": 30,
+    "thickness_min_gap_percent": 8,
 }
 
 DEFAULT_SLIDE_W = Inches(DEFAULTS["slide_width_inches"])
@@ -93,6 +96,35 @@ class Calibration:
 
 
 @dataclass(frozen=True)
+class ThicknessMeasurement:
+    top_y_px: float
+    bottom_y_px: float
+    thickness_nm: float
+    label: str
+    x_center_px: float
+    band_x0_px: int
+    band_x1_px: int
+    confidence: float
+
+
+@dataclass(frozen=True)
+class ThicknessOverride:
+    top_y_px: float
+    bottom_y_px: float
+    x_center_px: float | None = None
+
+
+@dataclass(frozen=True)
+class ThicknessCandidate:
+    top_y_px: float
+    bottom_y_px: float
+    x_center_px: float
+    band_x0_px: int
+    band_x1_px: int
+    score: float
+
+
+@dataclass(frozen=True)
 class SlideItem:
     source_path: Path
     png_path: Path
@@ -102,6 +134,7 @@ class SlideItem:
     scale_nm: float
     scale_px: float
     label: str
+    thickness: ThicknessMeasurement | None
 
 
 @dataclass(frozen=True)
@@ -210,6 +243,217 @@ def format_scale_label(scale_nm: float) -> str:
     return f"{number} {unit}"
 
 
+def format_thickness_label(thickness_nm: float) -> str:
+    if thickness_nm >= 100:
+        return f"{thickness_nm / 1000.0:.3f} \u03bcm"
+    return f"{thickness_nm:.3f} nm"
+
+
+def moving_average(values: list[float], radius: int) -> list[float]:
+    if not values:
+        return []
+    radius = max(0, radius)
+    prefix = [0.0]
+    for value in values:
+        prefix.append(prefix[-1] + value)
+    smoothed: list[float] = []
+    for index in range(len(values)):
+        start = max(0, index - radius)
+        end = min(len(values), index + radius + 1)
+        smoothed.append((prefix[end] - prefix[start]) / (end - start))
+    return smoothed
+
+
+def weighted_median(values: list[tuple[float, float]]) -> float:
+    if not values:
+        raise ValueError("Cannot calculate weighted median for an empty sequence.")
+    total = sum(max(0.0, weight) for _, weight in values)
+    if total <= 0:
+        return sorted(value for value, _ in values)[len(values) // 2]
+    threshold = total / 2
+    running = 0.0
+    sorted_values = sorted(values, key=lambda item: item[0])
+    for value, weight in sorted_values:
+        running += max(0.0, weight)
+        if running >= threshold:
+            return value
+    return sorted_values[-1][0]
+
+
+def detect_sem_content_bottom(gray: Image.Image) -> int:
+    width, height = gray.size
+    pixels = gray.load()
+    if pixels is None:
+        raise ValueError("Unable to load image pixels.")
+    sample_step = max(1, width // 256)
+    footer_top = height
+    bright_run = 0
+    for y in range(height - 1, int(height * 0.45), -1):
+        values = [pixels[x, y] for x in range(0, width, sample_step)]
+        bright_fraction = sum(value > 245 for value in values) / len(values)
+        if bright_fraction > 0.85:
+            bright_run += 1
+            footer_top = y
+        elif bright_run >= 10:
+            return max(1, footer_top)
+        else:
+            bright_run = 0
+            footer_top = height
+    return max(1, footer_top) if bright_run >= 10 else height
+
+
+def row_profile(gray: Image.Image, x0: int, x1: int, y_end: int) -> list[float]:
+    pixels = gray.load()
+    if pixels is None:
+        raise ValueError("Unable to load image pixels.")
+    sample_step = max(1, (x1 - x0) // 256)
+    profile: list[float] = []
+    for y in range(y_end):
+        values = [pixels[x, y] for x in range(x0, x1, sample_step)]
+        profile.append(sum(values) / len(values))
+    return profile
+
+
+def detect_thickness_candidate(
+    gray: Image.Image,
+    x0: int,
+    x1: int,
+    content_bottom: int,
+    min_gap_percent: float,
+) -> ThicknessCandidate | None:
+    profile = row_profile(gray, x0, x1, content_bottom)
+    if len(profile) < 40:
+        return None
+    smooth = moving_average(profile, max(3, min(12, int(content_bottom * 0.008))))
+    gradient = [0.0] * len(smooth)
+    for index in range(1, len(smooth) - 1):
+        gradient[index] = (smooth[index + 1] - smooth[index - 1]) / 2
+
+    top_start = max(5, int(content_bottom * 0.03))
+    top_end = min(content_bottom - 10, max(top_start + 10, int(content_bottom * 0.55)))
+    if top_end <= top_start:
+        return None
+    top_edge_y = max(range(top_start, top_end), key=lambda y: gradient[y])
+    top_peak_start = max(0, top_edge_y - 2)
+    top_peak_end = min(content_bottom, top_edge_y + 16)
+    top_y = max(range(top_peak_start, top_peak_end), key=lambda y: smooth[y])
+
+    min_gap = max(12, int(content_bottom * min_gap_percent / 100))
+    lower_start = min(content_bottom - 10, top_y + min_gap)
+    lower_end = min(content_bottom - 3, max(lower_start + 10, int(content_bottom * 0.95)))
+    if lower_end <= lower_start:
+        return None
+    lower_edge_y = max(range(lower_start, lower_end), key=lambda y: -gradient[y])
+    lower_peak_start = max(lower_start, lower_edge_y - max(8, int(content_bottom * 0.025)))
+    lower_peak_end = min(content_bottom, lower_edge_y + 4)
+    bottom_y = max(range(lower_peak_start, lower_peak_end), key=lambda y: smooth[y])
+    if bottom_y <= top_y:
+        return None
+
+    contrast_offset = max(8, int(content_bottom * 0.035))
+    top_contrast = smooth[top_y] - smooth[max(0, top_y - contrast_offset)]
+    bottom_contrast = smooth[bottom_y] - smooth[min(content_bottom - 1, bottom_y + contrast_offset)]
+    edge_strength = max(0.0, gradient[top_edge_y]) + max(0.0, -gradient[lower_edge_y])
+    score = top_contrast + bottom_contrast + edge_strength
+    if score < 70:
+        return None
+    return ThicknessCandidate(
+        top_y_px=float(top_y),
+        bottom_y_px=float(bottom_y),
+        x_center_px=(x0 + x1) / 2,
+        band_x0_px=x0,
+        band_x1_px=x1,
+        score=score,
+    )
+
+
+def detect_thickness_measurement(
+    image: Image.Image,
+    calibration: Calibration,
+    band_width_percent: float = DEFAULTS["thickness_band_width_percent"],
+    min_gap_percent: float = DEFAULTS["thickness_min_gap_percent"],
+) -> ThicknessMeasurement | None:
+    gray = image.convert("L")
+    width, height = gray.size
+    content_bottom = detect_sem_content_bottom(gray)
+    if content_bottom < max(60, int(height * 0.2)):
+        return None
+
+    band_fraction = max(5.0, min(100.0, float(band_width_percent))) / 100
+    band_width = min(width, max(40, int(round(width * band_fraction))))
+    half_band = band_width / 2
+    center_fractions = (0.35, 0.45, 0.55, 0.65, 0.75)
+    centers = sorted(
+        {
+            int(round(min(max(width * fraction, half_band), width - half_band)))
+            for fraction in center_fractions
+        }
+    )
+
+    candidates: list[ThicknessCandidate] = []
+    for center in centers:
+        x0 = max(0, int(round(center - half_band)))
+        x1 = min(width, int(round(center + half_band)))
+        if x1 - x0 < 20:
+            continue
+        candidate = detect_thickness_candidate(gray, x0, x1, content_bottom, min_gap_percent)
+        if candidate:
+            candidates.append(candidate)
+    if not candidates:
+        return None
+
+    best_score = max(candidate.score for candidate in candidates)
+    usable = [candidate for candidate in candidates if candidate.score >= max(70.0, best_score * 0.55)]
+    if not usable:
+        return None
+    top_y = weighted_median([(candidate.top_y_px, candidate.score) for candidate in usable])
+    bottom_y = weighted_median([(candidate.bottom_y_px, candidate.score) for candidate in usable])
+    if bottom_y <= top_y:
+        return None
+
+    score_total = sum(candidate.score for candidate in usable)
+    x_center = sum(candidate.x_center_px * candidate.score for candidate in usable) / score_total
+    best = max(usable, key=lambda candidate: candidate.score)
+    thickness_nm = (bottom_y - top_y) * calibration.nm_per_pixel
+    return ThicknessMeasurement(
+        top_y_px=top_y,
+        bottom_y_px=bottom_y,
+        thickness_nm=thickness_nm,
+        label=format_thickness_label(thickness_nm),
+        x_center_px=x_center,
+        band_x0_px=best.band_x0_px,
+        band_x1_px=best.band_x1_px,
+        confidence=min(1.0, best_score / 180.0),
+    )
+
+
+def measurement_from_override(
+    override: ThicknessOverride,
+    calibration: Calibration,
+    width_px: int,
+    height_px: int,
+) -> ThicknessMeasurement | None:
+    top_y = max(0.0, min(float(override.top_y_px), float(height_px - 1)))
+    bottom_y = max(0.0, min(float(override.bottom_y_px), float(height_px - 1)))
+    if bottom_y < top_y:
+        top_y, bottom_y = bottom_y, top_y
+    if bottom_y <= top_y:
+        return None
+    x_center = override.x_center_px if override.x_center_px is not None else width_px / 2
+    x_center = max(0.0, min(float(x_center), float(width_px - 1)))
+    thickness_nm = (bottom_y - top_y) * calibration.nm_per_pixel
+    return ThicknessMeasurement(
+        top_y_px=top_y,
+        bottom_y_px=bottom_y,
+        thickness_nm=thickness_nm,
+        label=format_thickness_label(thickness_nm),
+        x_center_px=x_center,
+        band_x0_px=0,
+        band_x1_px=width_px,
+        confidence=1.0,
+    )
+
+
 def choose_scale_nm(
     width_px: int,
     nm_per_pixel: float,
@@ -239,6 +483,10 @@ def find_images(input_paths: Path | Iterable[Path]) -> list[Path]:
     if not images:
         raise ValueError("No supported image files found.")
     return images
+
+
+def path_key(path: Path) -> str:
+    return str(path.resolve()).casefold()
 
 
 def hex_color(value: str) -> str:
@@ -271,6 +519,8 @@ def prepare_slide_item(
     index: int,
     fixed_scale_nm: float | None,
     auto_scale_preset: str,
+    detect_thickness: bool,
+    thickness_override: ThicknessOverride | None = None,
 ) -> SlideItem:
     with Image.open(path) as image:
         width_px, height_px = image.size
@@ -284,6 +534,12 @@ def prepare_slide_item(
         convert_image_to_png(image, png_path)
         scale_nm = choose_scale_nm(width_px, calibration.nm_per_pixel, fixed_scale_nm, auto_scale_preset)
         scale_px = scale_nm / calibration.nm_per_pixel
+        if thickness_override is not None:
+            thickness = measurement_from_override(thickness_override, calibration, width_px, height_px)
+        elif detect_thickness:
+            thickness = detect_thickness_measurement(image, calibration)
+        else:
+            thickness = None
     return SlideItem(
         source_path=path,
         png_path=png_path,
@@ -293,6 +549,7 @@ def prepare_slide_item(
         scale_nm=scale_nm,
         scale_px=scale_px,
         label=format_scale_label(scale_nm),
+        thickness=thickness,
     )
 
 
@@ -406,6 +663,88 @@ def add_scale_bar(
     run.font.color.rgb = rgb
 
 
+def add_filled_triangle(slide, x: int, tip_y: int, arrow_w: int, arrow_h: int, points_down: bool, rgb: RGBColor) -> None:
+    left = int(round(x - arrow_w / 2))
+    top = int(round(tip_y - arrow_h if points_down else tip_y))
+    triangle = slide.shapes.add_shape(MSO_SHAPE.ISOSCELES_TRIANGLE, Emu(left), Emu(top), Emu(arrow_w), Emu(arrow_h))
+    if points_down:
+        triangle.rotation = 180
+    triangle.fill.solid()
+    triangle.fill.fore_color.rgb = rgb
+    triangle.line.fill.background()
+    remove_shape_effects(triangle)
+
+
+def add_thickness_marker(
+    slide,
+    item: SlideItem,
+    image_x: int,
+    image_y: int,
+    image_w: int,
+    image_h: int,
+    color: str,
+    font_size: int | None,
+    font_bold: bool,
+    line_width_pt: float,
+) -> None:
+    measurement = item.thickness
+    if measurement is None:
+        return
+
+    x = int(round(image_x + measurement.x_center_px / item.width_px * image_w))
+    top_y = int(round(image_y + measurement.top_y_px / item.height_px * image_h))
+    bottom_y = int(round(image_y + measurement.bottom_y_px / item.height_px * image_h))
+    span = bottom_y - top_y
+    if span <= 0:
+        return
+
+    rgb = RGBColor.from_string(color)
+    font_pt = font_size or max(10, min(24, int(round(image_w / int(Inches(1)) * 1.4))))
+    arrow_h = max(int(Pt(4)), min(int(Pt(font_pt * 0.75)), int(span * 0.35)))
+    arrow_w = int(round(arrow_h * 0.72))
+    line_start = top_y + int(round(arrow_h * 0.72))
+    line_end = bottom_y - int(round(arrow_h * 0.72))
+    if line_end <= line_start:
+        line_start, line_end = top_y, bottom_y
+
+    line = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Emu(x), Emu(line_start), Emu(x), Emu(line_end))
+    line.line.color.rgb = rgb
+    line.line.width = Pt(line_width_pt)
+    remove_shape_effects(line)
+    add_filled_triangle(slide, x, top_y, arrow_w, arrow_h, False, rgb)
+    add_filled_triangle(slide, x, bottom_y, arrow_w, arrow_h, True, rgb)
+
+    gap = int(Pt(font_pt * 0.35))
+    text_h = int(Pt(font_pt * 1.45))
+    text_w = int(max(Pt(font_pt * 3.4), Pt(font_pt * max(3.0, len(measurement.label) * 0.66))))
+    text_y = int(round((top_y + bottom_y) / 2 - text_h / 2))
+    text_x = x + arrow_w + gap
+    if text_x + text_w > image_x + image_w:
+        text_x = x - arrow_w - gap - text_w
+    text_x = max(image_x, min(text_x, image_x + image_w - text_w))
+    text_y = max(image_y, min(text_y, image_y + image_h - text_h))
+
+    box = slide.shapes.add_textbox(Emu(text_x), Emu(text_y), Emu(text_w), Emu(text_h))
+    box.fill.background()
+    box.line.fill.background()
+    remove_shape_effects(box)
+    frame = box.text_frame
+    frame.clear()
+    frame.margin_left = 0
+    frame.margin_right = 0
+    frame.margin_top = 0
+    frame.margin_bottom = 0
+    frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+    paragraph = frame.paragraphs[0]
+    paragraph.alignment = PP_ALIGN.LEFT
+    run = paragraph.add_run()
+    run.text = measurement.label
+    run.font.bold = font_bold
+    run.font.name = "Arial"
+    run.font.size = Pt(font_pt)
+    run.font.color.rgb = rgb
+
+
 def build_pptx(
     items: list[SlideItem],
     output: Path,
@@ -442,6 +781,18 @@ def build_pptx(
             position,
             inset_x_percent,
             inset_y_percent,
+            line_width_pt,
+        )
+        add_thickness_marker(
+            slide,
+            item,
+            image_x,
+            image_y,
+            image_w,
+            image_h,
+            color,
+            font_size,
+            font_bold,
             line_width_pt,
         )
 
@@ -530,6 +881,73 @@ def add_svg_scale_bar(
     )
 
 
+def add_svg_thickness_marker(
+    parts: list[str],
+    item: SlideItem,
+    image_x: int,
+    image_y: int,
+    image_w: int,
+    image_h: int,
+    color: str,
+    font_size: int | None,
+    font_bold: bool,
+    line_width_pt: float,
+) -> None:
+    measurement = item.thickness
+    if measurement is None:
+        return
+
+    x = image_x + measurement.x_center_px / item.width_px * image_w
+    top_y = image_y + measurement.top_y_px / item.height_px * image_h
+    bottom_y = image_y + measurement.bottom_y_px / item.height_px * image_h
+    span = bottom_y - top_y
+    if span <= 0:
+        return
+
+    font_pt = font_size or max(10, min(24, int(round(image_w / POINTS_PER_INCH * 1.4))))
+    arrow_h = max(4.0, min(font_pt * 0.75, span * 0.35))
+    arrow_w = arrow_h * 0.72
+    line_start = top_y + arrow_h * 0.72
+    line_end = bottom_y - arrow_h * 0.72
+    if line_end <= line_start:
+        line_start, line_end = top_y, bottom_y
+
+    svg_color = f"#{color}"
+    font_weight = "700" if font_bold else "400"
+    label = svg_attr(measurement.label)
+    text_x = x + arrow_w + font_pt * 0.35
+    text_anchor = "start"
+    if text_x + font_pt * max(3.4, len(measurement.label) * 0.66) > image_x + image_w:
+        text_x = x - arrow_w - font_pt * 0.35
+        text_anchor = "end"
+    text_y = (top_y + bottom_y) / 2 + font_pt * 0.35
+
+    parts.append(
+        f'  <line x1="{svg_num(x)}" y1="{svg_num(line_start)}" '
+        f'x2="{svg_num(x)}" y2="{svg_num(line_end)}" '
+        f'stroke="{svg_color}" stroke-width="{svg_num(line_width_pt)}" '
+        'stroke-linecap="butt" />'
+    )
+    parts.append(
+        f'  <polygon points="{svg_num(x)},{svg_num(top_y)} '
+        f'{svg_num(x - arrow_w / 2)},{svg_num(top_y + arrow_h)} '
+        f'{svg_num(x + arrow_w / 2)},{svg_num(top_y + arrow_h)}" '
+        f'fill="{svg_color}" />'
+    )
+    parts.append(
+        f'  <polygon points="{svg_num(x)},{svg_num(bottom_y)} '
+        f'{svg_num(x - arrow_w / 2)},{svg_num(bottom_y - arrow_h)} '
+        f'{svg_num(x + arrow_w / 2)},{svg_num(bottom_y - arrow_h)}" '
+        f'fill="{svg_color}" />'
+    )
+    parts.append(
+        f'  <text x="{svg_num(text_x)}" y="{svg_num(text_y)}" '
+        f'fill="{svg_color}" font-family="Arial, Helvetica, sans-serif" '
+        f'font-size="{svg_num(font_pt)}" font-weight="{font_weight}" '
+        f'text-anchor="{text_anchor}">{label}</text>'
+    )
+
+
 def build_svg(
     item: SlideItem,
     output: Path,
@@ -577,6 +995,18 @@ def build_svg(
         inset_y_percent,
         line_width_pt,
     )
+    add_svg_thickness_marker(
+        parts,
+        item,
+        layout.image_x,
+        layout.image_y,
+        layout.image_w,
+        layout.image_h,
+        color,
+        font_size,
+        font_bold,
+        line_width_pt,
+    )
     parts.append("</svg>")
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -596,17 +1026,29 @@ def generate_pptx(
     inset_x_percent: float = DEFAULTS["inset_x_percent"],
     inset_y_percent: float = DEFAULTS["inset_y_percent"],
     line_width_pt: float = DEFAULTS["line_width_pt"],
+    thickness_paths: Iterable[Path] | None = None,
+    thickness_overrides: Mapping[Path, ThicknessOverride] | None = None,
 ) -> list[SlideItem]:
     slide_w, slide_h = int(DEFAULT_SLIDE_W), int(DEFAULT_SLIDE_H)
     margin = int(Inches(margin_inches))
     fixed_scale_nm = parse_scale_nm(fixed_scale) if fixed_scale else None
     color = hex_color(bar_color)
     image_paths = find_images(input_path)
+    thickness_path_keys = {path_key(path) for path in thickness_paths or []}
+    thickness_override_map = {path_key(path): override for path, override in (thickness_overrides or {}).items()}
 
     with tempfile.TemporaryDirectory(prefix="sem_scale_ppt_") as temp:
         temp_dir = Path(temp)
         items = [
-            prepare_slide_item(path, temp_dir, index, fixed_scale_nm, auto_scale_preset)
+            prepare_slide_item(
+                path,
+                temp_dir,
+                index,
+                fixed_scale_nm,
+                auto_scale_preset,
+                path_key(path) in thickness_path_keys,
+                thickness_override_map.get(path_key(path)) if path_key(path) in thickness_path_keys else None,
+            )
             for index, path in enumerate(image_paths, start=1)
         ]
         build_pptx(
@@ -639,17 +1081,29 @@ def generate_svg(
     inset_x_percent: float = DEFAULTS["inset_x_percent"],
     inset_y_percent: float = DEFAULTS["inset_y_percent"],
     line_width_pt: float = DEFAULTS["line_width_pt"],
+    thickness_paths: Iterable[Path] | None = None,
+    thickness_overrides: Mapping[Path, ThicknessOverride] | None = None,
 ) -> list[SlideItem]:
     page_w, page_h = DEFAULT_PAGE_W_PT, DEFAULT_PAGE_H_PT
     margin = int(round(margin_inches * POINTS_PER_INCH))
     fixed_scale_nm = parse_scale_nm(fixed_scale) if fixed_scale else None
     color = hex_color(bar_color)
     image_paths = find_images(input_path)
+    thickness_path_keys = {path_key(path) for path in thickness_paths or []}
+    thickness_override_map = {path_key(path): override for path, override in (thickness_overrides or {}).items()}
 
     with tempfile.TemporaryDirectory(prefix="sem_scale_svg_") as temp:
         temp_dir = Path(temp)
         items = [
-            prepare_slide_item(path, temp_dir, index, fixed_scale_nm, auto_scale_preset)
+            prepare_slide_item(
+                path,
+                temp_dir,
+                index,
+                fixed_scale_nm,
+                auto_scale_preset,
+                path_key(path) in thickness_path_keys,
+                thickness_override_map.get(path_key(path)) if path_key(path) in thickness_path_keys else None,
+            )
             for index, path in enumerate(image_paths, start=1)
         ]
         total = len(items)

@@ -286,20 +286,28 @@ def detect_sem_content_bottom(gray: Image.Image) -> int:
     if pixels is None:
         raise ValueError("Unable to load image pixels.")
     sample_step = max(1, width // 256)
+    search_top = int(height * 0.45)
     footer_top = height
     bright_run = 0
-    for y in range(height - 1, int(height * 0.45), -1):
+    gap_run = 0
+    for y in range(height - 1, search_top, -1):
         values = [pixels[x, y] for x in range(0, width, sample_step)]
-        bright_fraction = sum(value > 245 for value in values) / len(values)
-        if bright_fraction > 0.85:
+        mean_value = sum(values) / len(values)
+        bright_fraction = sum(value > 230 for value in values) / len(values)
+        is_footer_row = mean_value > 185 and bright_fraction > 0.70
+        if is_footer_row:
             bright_run += 1
+            gap_run = 0
             footer_top = y
-        elif bright_run >= 10:
-            return max(1, footer_top)
+        elif bright_run >= 8:
+            gap_run += 1
+            if gap_run > 4:
+                return max(1, footer_top)
         else:
             bright_run = 0
+            gap_run = 0
             footer_top = height
-    return max(1, footer_top) if bright_run >= 10 else height
+    return max(1, footer_top) if bright_run >= 8 else height
 
 
 def row_profile(gray: Image.Image, x0: int, x1: int, y_end: int) -> list[float]:
@@ -347,6 +355,19 @@ def detect_thickness_candidate(
     lower_peak_start = max(lower_start, lower_edge_y - max(8, int(content_bottom * 0.025)))
     lower_peak_end = min(content_bottom, lower_edge_y + 4)
     bottom_y = max(range(lower_peak_start, lower_peak_end), key=lambda y: smooth[y])
+    rebound_start = lower_edge_y + 2
+    rebound_end = min(content_bottom - 1, lower_edge_y + max(14, int(content_bottom * 0.045)))
+    if rebound_end > rebound_start:
+        rebound_edge_y = max(range(rebound_start, rebound_end), key=lambda y: gradient[y])
+        rebound_peak_start = max(rebound_start, rebound_edge_y - 2)
+        rebound_peak_end = min(content_bottom, rebound_edge_y + 8)
+        rebound_peak_y = max(range(rebound_peak_start, rebound_peak_end), key=lambda y: smooth[y])
+        valley_start = max(lower_start, lower_edge_y - 3)
+        valley_end = min(content_bottom, rebound_edge_y + 2)
+        valley_y = min(range(valley_start, valley_end), key=lambda y: smooth[y])
+        recovery = smooth[rebound_peak_y] - smooth[valley_y]
+        if recovery >= 12.0 and smooth[rebound_peak_y] >= smooth[bottom_y] + 8.0:
+            bottom_y = rebound_peak_y
     if bottom_y <= top_y:
         return None
 

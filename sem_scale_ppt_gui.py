@@ -128,7 +128,7 @@ class FileQueueWidget(QTableWidget):
 
     def __init__(self) -> None:
         super().__init__(0, 3)
-        self.setHorizontalHeaderLabels(["生成", "文件", "厚度"])
+        self.setHorizontalHeaderLabels(["生成", "文件", "测厚"])
         self.setAcceptDrops(True)
         self.setDragEnabled(False)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
@@ -200,11 +200,12 @@ class ThicknessCellWidget(QWidget):
 
     def __init__(self, checked: bool) -> None:
         super().__init__()
-        self.checkbox = QCheckBox("测厚")
+        self.checkbox = QCheckBox()
+        self.checkbox.setToolTip("勾选后为该图片添加截面厚度标记")
         self.checkbox.setChecked(checked)
         self.preview_button = QPushButton("微调")
+        self.preview_button.setToolTip("预览并微调上下界面；点击后会自动勾选测厚")
         self.preview_button.setFixedWidth(58)
-        self.preview_button.setEnabled(checked)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 0, 4, 0)
@@ -220,14 +221,26 @@ class ThicknessCellWidget(QWidget):
 
     def set_checked(self, checked: bool) -> None:
         self.checkbox.setChecked(checked)
-        self.preview_button.setEnabled(checked)
 
     def set_adjusted(self, adjusted: bool) -> None:
-        self.preview_button.setText("已微调" if adjusted else "微调")
+        self.preview_button.setText("已调" if adjusted else "微调")
+        self.preview_button.setStyleSheet(
+            (
+                "QPushButton { "
+                "background-color: #DDF3E3; "
+                "border: 1px solid #8BC79A; "
+                "border-radius: 4px; "
+                "padding: 2px 8px; "
+                "}"
+            )
+            if adjusted
+            else ""
+        )
 
 
 class ThicknessPreviewWidget(QWidget):
     lines_changed = Signal(float, float)
+    zoom_changed = Signal(float)
 
     def __init__(self, qimage: QImage, top_y: float, bottom_y: float) -> None:
         super().__init__()
@@ -359,7 +372,15 @@ class ThicknessPreviewWidget(QWidget):
         self.pan_y = position.y() - ratio_y * base_rect.height() - base_rect.top()
         self.clamp_pan()
         self.update()
+        self.zoom_changed.emit(self.zoom_factor)
         event.accept()
+
+    def reset_zoom(self) -> None:
+        self.zoom_factor = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.update()
+        self.zoom_changed.emit(self.zoom_factor)
 
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
@@ -436,10 +457,19 @@ class ThicknessPreviewDialog(QDialog):
         layout = QVBoxLayout(self)
         self.preview = ThicknessPreviewWidget(qimage, top_y, bottom_y)
         self.preview.lines_changed.connect(self.update_label)
+        self.preview.zoom_changed.connect(self.update_zoom_label)
         layout.addWidget(self.preview, stretch=1)
 
+        info_row = QHBoxLayout()
         self.info_label = QLabel()
-        layout.addWidget(self.info_label)
+        self.zoom_label = QLabel()
+        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.reset_zoom_button = QPushButton("重置缩放")
+        self.reset_zoom_button.clicked.connect(self.preview.reset_zoom)
+        info_row.addWidget(self.info_label, stretch=1)
+        info_row.addWidget(self.zoom_label)
+        info_row.addWidget(self.reset_zoom_button)
+        layout.addLayout(info_row)
 
         button_row = QHBoxLayout()
         button_row.addStretch()
@@ -456,12 +486,16 @@ class ThicknessPreviewDialog(QDialog):
 
         self.reset_button.setEnabled(self.auto_measurement is not None)
         self.update_label(self.preview.top_y, self.preview.bottom_y)
+        self.update_zoom_label(self.preview.zoom_factor)
 
     def update_label(self, top_y: float, bottom_y: float) -> None:
         thickness_nm = abs(bottom_y - top_y) * self.nm_per_pixel
         self.info_label.setText(
             f"上界面 y={top_y:.1f}px，下界面 y={bottom_y:.1f}px，厚度 {format_thickness_label(thickness_nm)}"
         )
+
+    def update_zoom_label(self, zoom_factor: float) -> None:
+        self.zoom_label.setText(f"{zoom_factor * 100:.0f}%")
 
     def reset_to_auto(self) -> None:
         if not self.auto_measurement:
@@ -594,11 +628,13 @@ class MainWindow(QMainWindow):
         queue_buttons = QHBoxLayout()
         queue_buttons.addWidget(self._button("添加文件", self.choose_input_files))
         queue_buttons.addWidget(self._button("添加文件夹", self.choose_input_folder))
+        queue_buttons.addWidget(self._button("自然排序", self.sort_queue))
         queue_layout.addLayout(queue_buttons)
 
         queue_buttons_2 = QHBoxLayout()
+        queue_buttons_2.addWidget(self._button("全选", self.select_all_generate))
+        queue_buttons_2.addWidget(self._button("取消全选", self.unselect_all_generate))
         queue_buttons_2.addWidget(self._button("删除选中", self.remove_selected))
-        queue_buttons_2.addWidget(self._button("自然排序", self.sort_queue))
         queue_buttons_2.addWidget(self._button("清空", self.clear_queue))
         queue_layout.addLayout(queue_buttons_2)
         main_layout.addWidget(queue_box, stretch=1)
@@ -854,7 +890,6 @@ class MainWindow(QMainWindow):
             return
         path = self.item_path(row)
         cell.set_adjusted(path_key(path) in self.thickness_overrides)
-        cell.preview_button.setEnabled(cell.is_checked())
 
     def refresh_thickness_statuses(self) -> None:
         for row in range(self.file_list.rowCount()):
@@ -963,7 +998,17 @@ class MainWindow(QMainWindow):
     def clear_queue(self) -> None:
         self.file_list.setRowCount(0)
         self.thickness_overrides.clear()
-        self.file_list.setHorizontalHeaderLabels(["生成", "文件", "厚度"])
+        self.file_list.setHorizontalHeaderLabels(["生成", "文件", "测厚"])
+        self.update_count()
+
+    def select_all_generate(self) -> None:
+        for row in range(self.file_list.rowCount()):
+            self.set_row_checked(row, COL_GENERATE, True)
+        self.update_count()
+
+    def unselect_all_generate(self) -> None:
+        for row in range(self.file_list.rowCount()):
+            self.set_row_checked(row, COL_GENERATE, False)
         self.update_count()
 
     def mark_selected_thickness(self) -> None:

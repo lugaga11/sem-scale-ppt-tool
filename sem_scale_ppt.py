@@ -9,16 +9,16 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping, cast
+from typing import Iterable, Mapping, Sequence, cast
 from xml.sax.saxutils import escape
 
 from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.shapes import MSO_CONNECTOR
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.oxml.ns import qn
+from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Inches, Length, Pt
 
 
@@ -108,10 +108,23 @@ class ThicknessMeasurement:
 
 
 @dataclass(frozen=True)
-class ThicknessOverride:
-    top_y_px: float
-    bottom_y_px: float
-    x_center_px: float | None = None
+class MeasurementOverride:
+    kind: str
+    x1_px: float
+    y1_px: float
+    x2_px: float
+    y2_px: float
+
+
+@dataclass(frozen=True)
+class MeasurementSegment:
+    x1_px: float
+    y1_px: float
+    x2_px: float
+    y2_px: float
+    label: str
+    text_side: str = "normal"
+    kind: str = "distance"
 
 
 @dataclass(frozen=True)
@@ -134,7 +147,7 @@ class SlideItem:
     scale_nm: float
     scale_px: float
     label: str
-    thickness: ThicknessMeasurement | None
+    measurements: tuple[MeasurementSegment, ...]
 
 
 @dataclass(frozen=True)
@@ -243,10 +256,10 @@ def format_scale_label(scale_nm: float) -> str:
     return f"{number} {unit}"
 
 
-def format_thickness_label(thickness_nm: float) -> str:
-    if thickness_nm >= 100:
-        return f"{thickness_nm / 1000.0:.3f} \u03bcm"
-    return f"{thickness_nm:.3f} nm"
+def format_length_label(length_nm: float) -> str:
+    if length_nm >= 100:
+        return f"{length_nm / 1000.0:.3f} \u03bcm"
+    return f"{length_nm:.3f} nm"
 
 
 def moving_average(values: list[float], radius: int) -> list[float]:
@@ -440,7 +453,7 @@ def detect_thickness_measurement(
         top_y_px=top_y,
         bottom_y_px=bottom_y,
         thickness_nm=thickness_nm,
-        label=format_thickness_label(thickness_nm),
+        label=format_length_label(thickness_nm),
         x_center_px=x_center,
         band_x0_px=best.band_x0_px,
         band_x1_px=best.band_x1_px,
@@ -448,30 +461,34 @@ def detect_thickness_measurement(
     )
 
 
-def measurement_from_override(
-    override: ThicknessOverride,
+def measurement_segment_from_override(
+    override: MeasurementOverride,
     calibration: Calibration,
     width_px: int,
     height_px: int,
-) -> ThicknessMeasurement | None:
-    top_y = max(0.0, min(float(override.top_y_px), float(height_px - 1)))
-    bottom_y = max(0.0, min(float(override.bottom_y_px), float(height_px - 1)))
-    if bottom_y < top_y:
-        top_y, bottom_y = bottom_y, top_y
-    if bottom_y <= top_y:
+) -> MeasurementSegment | None:
+    kind = override.kind if override.kind in {"thickness", "distance"} else "distance"
+    x1 = max(0.0, min(float(override.x1_px), float(width_px - 1)))
+    y1 = max(0.0, min(float(override.y1_px), float(height_px - 1)))
+    x2 = max(0.0, min(float(override.x2_px), float(width_px - 1)))
+    y2 = max(0.0, min(float(override.y2_px), float(height_px - 1)))
+    if kind == "thickness":
+        x_center = max(0.0, min((x1 + x2) / 2, float(width_px - 1)))
+        top_y, bottom_y = sorted((y1, y2))
+        x1 = x2 = x_center
+        y1, y2 = top_y, bottom_y
+    length_px = math.hypot(x2 - x1, y2 - y1)
+    if length_px <= 0:
         return None
-    x_center = override.x_center_px if override.x_center_px is not None else width_px / 2
-    x_center = max(0.0, min(float(x_center), float(width_px - 1)))
-    thickness_nm = (bottom_y - top_y) * calibration.nm_per_pixel
-    return ThicknessMeasurement(
-        top_y_px=top_y,
-        bottom_y_px=bottom_y,
-        thickness_nm=thickness_nm,
-        label=format_thickness_label(thickness_nm),
-        x_center_px=x_center,
-        band_x0_px=0,
-        band_x1_px=width_px,
-        confidence=1.0,
+    length_nm = length_px * calibration.nm_per_pixel
+    return MeasurementSegment(
+        x1_px=x1,
+        y1_px=y1,
+        x2_px=x2,
+        y2_px=y2,
+        label=format_length_label(length_nm),
+        text_side="right" if kind == "thickness" else "normal",
+        kind=kind,
     )
 
 
@@ -540,8 +557,7 @@ def prepare_slide_item(
     index: int,
     fixed_scale_nm: float | None,
     auto_scale_preset: str,
-    detect_thickness: bool,
-    thickness_override: ThicknessOverride | None = None,
+    measurement_overrides: Sequence[MeasurementOverride] | None = None,
 ) -> SlideItem:
     with Image.open(path) as image:
         width_px, height_px = image.size
@@ -555,12 +571,13 @@ def prepare_slide_item(
         convert_image_to_png(image, png_path)
         scale_nm = choose_scale_nm(width_px, calibration.nm_per_pixel, fixed_scale_nm, auto_scale_preset)
         scale_px = scale_nm / calibration.nm_per_pixel
-        if thickness_override is not None:
-            thickness = measurement_from_override(thickness_override, calibration, width_px, height_px)
-        elif detect_thickness:
-            thickness = detect_thickness_measurement(image, calibration)
-        else:
-            thickness = None
+        measurement_inputs = list(measurement_overrides or [])
+        measurements = tuple(
+            segment
+            for override in measurement_inputs
+            for segment in [measurement_segment_from_override(override, calibration, width_px, height_px)]
+            if segment is not None
+        )
     return SlideItem(
         source_path=path,
         png_path=png_path,
@@ -570,7 +587,7 @@ def prepare_slide_item(
         scale_nm=scale_nm,
         scale_px=scale_px,
         label=format_scale_label(scale_nm),
-        thickness=thickness,
+        measurements=measurements,
     )
 
 
@@ -684,68 +701,108 @@ def add_scale_bar(
     run.font.color.rgb = rgb
 
 
-def add_filled_triangle(slide, x: int, tip_y: int, arrow_w: int, arrow_h: int, points_down: bool, rgb: RGBColor) -> None:
-    left = int(round(x - arrow_w / 2))
-    top = int(round(tip_y - arrow_h if points_down else tip_y))
-    triangle = slide.shapes.add_shape(MSO_SHAPE.ISOSCELES_TRIANGLE, Emu(left), Emu(top), Emu(arrow_w), Emu(arrow_h))
-    if points_down:
-        triangle.rotation = 180
-    triangle.fill.solid()
-    triangle.fill.fore_color.rgb = rgb
-    triangle.line.fill.background()
-    remove_shape_effects(triangle)
+def measurement_segments(item: SlideItem) -> tuple[MeasurementSegment, ...]:
+    return item.measurements
 
 
-def add_thickness_marker(
-    slide,
+def scale_measurement_segment(
+    segment: MeasurementSegment,
     item: SlideItem,
     image_x: int,
     image_y: int,
     image_w: int,
     image_h: int,
-    color: str,
-    font_size: int | None,
+) -> MeasurementSegment:
+    return MeasurementSegment(
+        x1_px=image_x + segment.x1_px / item.width_px * image_w,
+        y1_px=image_y + segment.y1_px / item.height_px * image_h,
+        x2_px=image_x + segment.x2_px / item.width_px * image_w,
+        y2_px=image_y + segment.y2_px / item.height_px * image_h,
+        label=segment.label,
+        text_side=segment.text_side,
+        kind=segment.kind,
+    )
+
+
+def measurement_text_candidates(
+    segment: MeasurementSegment,
+    center_x: float,
+    center_y: float,
+    ux: float,
+    uy: float,
+    offset: float,
+) -> list[tuple[float, float]]:
+    if segment.text_side == "right":
+        return [
+            (center_x + offset, center_y),
+            (center_x - offset, center_y),
+            (center_x, center_y),
+        ]
+    return [
+        (center_x - uy * offset, center_y + ux * offset),
+        (center_x + uy * offset, center_y - ux * offset),
+        (center_x, center_y),
+    ]
+
+
+def fit_text_top_left(
+    candidates: list[tuple[float, float]],
+    text_w: float,
+    text_h: float,
+    image_x: float,
+    image_y: float,
+    image_w: float,
+    image_h: float,
+) -> tuple[float, float]:
+    for candidate_x, candidate_y in candidates:
+        proposed_x = candidate_x - text_w / 2
+        proposed_y = candidate_y - text_h / 2
+        if (
+            proposed_x >= image_x
+            and proposed_y >= image_y
+            and proposed_x + text_w <= image_x + image_w
+            and proposed_y + text_h <= image_y + image_h
+        ):
+            return proposed_x, proposed_y
+    center_x, center_y = candidates[-1]
+    return (
+        max(image_x, min(center_x - text_w / 2, image_x + image_w - text_w)),
+        max(image_y, min(center_y - text_h / 2, image_y + image_h - text_h)),
+    )
+
+
+def set_pptx_line_arrowheads(shape) -> None:
+    line = shape._element.spPr.get_or_add_ln()
+    for tag, attrs in (
+        ("a:headEnd", {"type": "triangle"}),
+        ("a:tailEnd", {"type": "triangle"}),
+    ):
+        existing = line.find(qn(tag))
+        if existing is not None:
+            line.remove(existing)
+        arrow = OxmlElement(tag)
+        for key, value in attrs.items():
+            arrow.set(key, value)
+        line.append(arrow)
+
+
+def add_pptx_measurement_textbox(
+    slide,
+    label: str,
+    text_x: float,
+    text_y: float,
+    text_w: float,
+    text_h: float,
+    rgb: RGBColor,
+    font_pt: int,
     font_bold: bool,
-    line_width_pt: float,
 ) -> None:
-    measurement = item.thickness
-    if measurement is None:
-        return
-
-    x = int(round(image_x + measurement.x_center_px / item.width_px * image_w))
-    top_y = int(round(image_y + measurement.top_y_px / item.height_px * image_h))
-    bottom_y = int(round(image_y + measurement.bottom_y_px / item.height_px * image_h))
-    span = bottom_y - top_y
-    if span <= 0:
-        return
-
-    rgb = RGBColor.from_string(color)
-    font_pt = font_size or max(10, min(24, int(round(image_w / int(Inches(1)) * 1.4))))
-    arrow_h = max(int(Pt(4)), min(int(Pt(font_pt * 0.75)), int(span * 0.35)))
-    arrow_w = int(round(arrow_h * 0.72))
-    line_start = top_y + int(round(arrow_h * 0.72))
-    line_end = bottom_y - int(round(arrow_h * 0.72))
-    if line_end <= line_start:
-        line_start, line_end = top_y, bottom_y
-
-    line = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Emu(x), Emu(line_start), Emu(x), Emu(line_end))
-    line.line.color.rgb = rgb
-    line.line.width = Pt(line_width_pt)
-    remove_shape_effects(line)
-    add_filled_triangle(slide, x, top_y, arrow_w, arrow_h, False, rgb)
-    add_filled_triangle(slide, x, bottom_y, arrow_w, arrow_h, True, rgb)
-
-    gap = int(Pt(font_pt * 0.35))
-    text_h = int(Pt(font_pt * 1.45))
-    text_w = int(max(Pt(font_pt * 3.4), Pt(font_pt * max(3.0, len(measurement.label) * 0.66))))
-    text_y = int(round((top_y + bottom_y) / 2 - text_h / 2))
-    text_x = x + arrow_w + gap
-    if text_x + text_w > image_x + image_w:
-        text_x = x - arrow_w - gap - text_w
-    text_x = max(image_x, min(text_x, image_x + image_w - text_w))
-    text_y = max(image_y, min(text_y, image_y + image_h - text_h))
-
-    box = slide.shapes.add_textbox(Emu(text_x), Emu(text_y), Emu(text_w), Emu(text_h))
+    box = slide.shapes.add_textbox(
+        Emu(int(round(text_x))),
+        Emu(int(round(text_y))),
+        Emu(int(round(text_w))),
+        Emu(int(round(text_h))),
+    )
     box.fill.background()
     box.line.fill.background()
     remove_shape_effects(box)
@@ -757,13 +814,94 @@ def add_thickness_marker(
     frame.margin_bottom = 0
     frame.vertical_anchor = MSO_ANCHOR.MIDDLE
     paragraph = frame.paragraphs[0]
-    paragraph.alignment = PP_ALIGN.LEFT
+    paragraph.alignment = PP_ALIGN.CENTER
     run = paragraph.add_run()
-    run.text = measurement.label
+    run.text = label
     run.font.bold = font_bold
     run.font.name = "Arial"
     run.font.size = Pt(font_pt)
     run.font.color.rgb = rgb
+
+
+def add_pptx_measurement_segment(
+    slide,
+    segment: MeasurementSegment,
+    image_x: int,
+    image_y: int,
+    image_w: int,
+    image_h: int,
+    color: str,
+    font_size: int | None,
+    font_bold: bool,
+    line_width_pt: float,
+) -> None:
+    dx = segment.x2_px - segment.x1_px
+    dy = segment.y2_px - segment.y1_px
+    span = math.hypot(dx, dy)
+    if span <= 0:
+        return
+
+    rgb = RGBColor.from_string(color)
+    font_pt = font_size or max(10, min(24, int(round(image_w / int(Inches(1)) * 1.4))))
+    ux = dx / span
+    uy = dy / span
+
+    line = slide.shapes.add_connector(
+        MSO_CONNECTOR.STRAIGHT,
+        Emu(int(round(segment.x1_px))),
+        Emu(int(round(segment.y1_px))),
+        Emu(int(round(segment.x2_px))),
+        Emu(int(round(segment.y2_px))),
+    )
+    line.line.color.rgb = rgb
+    line.line.width = Pt(line_width_pt)
+    set_pptx_line_arrowheads(line)
+    remove_shape_effects(line)
+
+    text_h = int(Pt(font_pt * 1.45))
+    text_w = int(max(Pt(font_pt * 3.4), Pt(font_pt * max(3.0, len(segment.label) * 0.66))))
+    center_x = (segment.x1_px + segment.x2_px) / 2
+    center_y = (segment.y1_px + segment.y2_px) / 2
+    candidates = measurement_text_candidates(segment, center_x, center_y, ux, uy, int(Pt(font_pt * 0.85)))
+    text_x, text_y = fit_text_top_left(candidates, text_w, text_h, image_x, image_y, image_w, image_h)
+    add_pptx_measurement_textbox(
+        slide,
+        segment.label,
+        text_x,
+        text_y,
+        text_w,
+        text_h,
+        rgb,
+        font_pt,
+        font_bold,
+    )
+
+
+def add_pptx_measurement_markers(
+    slide,
+    item: SlideItem,
+    image_x: int,
+    image_y: int,
+    image_w: int,
+    image_h: int,
+    color: str,
+    font_size: int | None,
+    font_bold: bool,
+    line_width_pt: float,
+) -> None:
+    for segment in measurement_segments(item):
+        add_pptx_measurement_segment(
+            slide,
+            scale_measurement_segment(segment, item, image_x, image_y, image_w, image_h),
+            image_x,
+            image_y,
+            image_w,
+            image_h,
+            color,
+            font_size,
+            font_bold,
+            line_width_pt,
+        )
 
 
 def build_pptx(
@@ -804,7 +942,7 @@ def build_pptx(
             inset_y_percent,
             line_width_pt,
         )
-        add_thickness_marker(
+        add_pptx_measurement_markers(
             slide,
             item,
             image_x,
@@ -902,7 +1040,59 @@ def add_svg_scale_bar(
     )
 
 
-def add_svg_thickness_marker(
+def add_svg_measurement_segment(
+    parts: list[str],
+    segment: MeasurementSegment,
+    image_x: int,
+    image_y: int,
+    image_w: int,
+    image_h: int,
+    color: str,
+    font_size: int | None,
+    font_bold: bool,
+    line_width_pt: float,
+) -> None:
+    dx = segment.x2_px - segment.x1_px
+    dy = segment.y2_px - segment.y1_px
+    span = math.hypot(dx, dy)
+    if span <= 0:
+        return
+
+    font_pt = font_size or max(10, min(24, int(round(image_w / POINTS_PER_INCH * 1.4))))
+    svg_color = f"#{color}"
+    font_weight = "700" if font_bold else "400"
+    ux = dx / span
+    uy = dy / span
+
+    parts.append(
+        f'  <line x1="{svg_num(segment.x1_px)}" y1="{svg_num(segment.y1_px)}" '
+        f'x2="{svg_num(segment.x2_px)}" y2="{svg_num(segment.y2_px)}" '
+        f'stroke="{svg_color}" stroke-width="{svg_num(line_width_pt)}" '
+        'stroke-linecap="butt" />'
+    )
+
+    text_w = font_pt * max(3.4, len(segment.label) * 0.66)
+    text_h = font_pt * 1.45
+    center_x = (segment.x1_px + segment.x2_px) / 2
+    center_y = (segment.y1_px + segment.y2_px) / 2
+    text_left, text_top = fit_text_top_left(
+        measurement_text_candidates(segment, center_x, center_y, ux, uy, font_pt * 0.85),
+        text_w,
+        text_h,
+        image_x,
+        image_y,
+        image_w,
+        image_h,
+    )
+    parts.append(
+        f'  <text x="{svg_num(text_left + text_w / 2)}" y="{svg_num(text_top + font_pt)}" '
+        f'fill="{svg_color}" font-family="Arial, Helvetica, sans-serif" '
+        f'font-size="{svg_num(font_pt)}" font-weight="{font_weight}" '
+        f'text-anchor="middle">{svg_attr(segment.label)}</text>'
+    )
+
+
+def add_svg_measurement_markers(
     parts: list[str],
     item: SlideItem,
     image_x: int,
@@ -914,59 +1104,19 @@ def add_svg_thickness_marker(
     font_bold: bool,
     line_width_pt: float,
 ) -> None:
-    measurement = item.thickness
-    if measurement is None:
-        return
-
-    x = image_x + measurement.x_center_px / item.width_px * image_w
-    top_y = image_y + measurement.top_y_px / item.height_px * image_h
-    bottom_y = image_y + measurement.bottom_y_px / item.height_px * image_h
-    span = bottom_y - top_y
-    if span <= 0:
-        return
-
-    font_pt = font_size or max(10, min(24, int(round(image_w / POINTS_PER_INCH * 1.4))))
-    arrow_h = max(4.0, min(font_pt * 0.75, span * 0.35))
-    arrow_w = arrow_h * 0.72
-    line_start = top_y + arrow_h * 0.72
-    line_end = bottom_y - arrow_h * 0.72
-    if line_end <= line_start:
-        line_start, line_end = top_y, bottom_y
-
-    svg_color = f"#{color}"
-    font_weight = "700" if font_bold else "400"
-    label = svg_attr(measurement.label)
-    text_x = x + arrow_w + font_pt * 0.35
-    text_anchor = "start"
-    if text_x + font_pt * max(3.4, len(measurement.label) * 0.66) > image_x + image_w:
-        text_x = x - arrow_w - font_pt * 0.35
-        text_anchor = "end"
-    text_y = (top_y + bottom_y) / 2 + font_pt * 0.35
-
-    parts.append(
-        f'  <line x1="{svg_num(x)}" y1="{svg_num(line_start)}" '
-        f'x2="{svg_num(x)}" y2="{svg_num(line_end)}" '
-        f'stroke="{svg_color}" stroke-width="{svg_num(line_width_pt)}" '
-        'stroke-linecap="butt" />'
-    )
-    parts.append(
-        f'  <polygon points="{svg_num(x)},{svg_num(top_y)} '
-        f'{svg_num(x - arrow_w / 2)},{svg_num(top_y + arrow_h)} '
-        f'{svg_num(x + arrow_w / 2)},{svg_num(top_y + arrow_h)}" '
-        f'fill="{svg_color}" />'
-    )
-    parts.append(
-        f'  <polygon points="{svg_num(x)},{svg_num(bottom_y)} '
-        f'{svg_num(x - arrow_w / 2)},{svg_num(bottom_y - arrow_h)} '
-        f'{svg_num(x + arrow_w / 2)},{svg_num(bottom_y - arrow_h)}" '
-        f'fill="{svg_color}" />'
-    )
-    parts.append(
-        f'  <text x="{svg_num(text_x)}" y="{svg_num(text_y)}" '
-        f'fill="{svg_color}" font-family="Arial, Helvetica, sans-serif" '
-        f'font-size="{svg_num(font_pt)}" font-weight="{font_weight}" '
-        f'text-anchor="{text_anchor}">{label}</text>'
-    )
+    for segment in measurement_segments(item):
+        add_svg_measurement_segment(
+            parts,
+            scale_measurement_segment(segment, item, image_x, image_y, image_w, image_h),
+            image_x,
+            image_y,
+            image_w,
+            image_h,
+            color,
+            font_size,
+            font_bold,
+            line_width_pt,
+        )
 
 
 def build_svg(
@@ -995,12 +1145,12 @@ def build_svg(
             f'width="{svg_num(layout.page_w)}pt" height="{svg_num(layout.page_h)}pt" '
             f'viewBox="0 0 {svg_num(layout.page_w)} {svg_num(layout.page_h)}">'
         ),
-        (
-            f'  <image x="{svg_num(layout.image_x)}" y="{svg_num(layout.image_y)}" '
-            f'width="{svg_num(layout.image_w)}" height="{svg_num(layout.image_h)}" '
-            f'href="{image_href}" xlink:href="{image_href}" preserveAspectRatio="none" />'
-        ),
     ]
+    parts.append(
+        f'  <image x="{svg_num(layout.image_x)}" y="{svg_num(layout.image_y)}" '
+        f'width="{svg_num(layout.image_w)}" height="{svg_num(layout.image_h)}" '
+        f'href="{image_href}" xlink:href="{image_href}" preserveAspectRatio="none" />'
+    )
     add_svg_scale_bar(
         parts,
         item,
@@ -1016,7 +1166,7 @@ def build_svg(
         inset_y_percent,
         line_width_pt,
     )
-    add_svg_thickness_marker(
+    add_svg_measurement_markers(
         parts,
         item,
         layout.image_x,
@@ -1047,16 +1197,14 @@ def generate_pptx(
     inset_x_percent: float = DEFAULTS["inset_x_percent"],
     inset_y_percent: float = DEFAULTS["inset_y_percent"],
     line_width_pt: float = DEFAULTS["line_width_pt"],
-    thickness_paths: Iterable[Path] | None = None,
-    thickness_overrides: Mapping[Path, ThicknessOverride] | None = None,
+    measurement_overrides: Mapping[Path, Sequence[MeasurementOverride]] | None = None,
 ) -> list[SlideItem]:
     slide_w, slide_h = int(DEFAULT_SLIDE_W), int(DEFAULT_SLIDE_H)
     margin = int(Inches(margin_inches))
     fixed_scale_nm = parse_scale_nm(fixed_scale) if fixed_scale else None
     color = hex_color(bar_color)
     image_paths = find_images(input_path)
-    thickness_path_keys = {path_key(path) for path in thickness_paths or []}
-    thickness_override_map = {path_key(path): override for path, override in (thickness_overrides or {}).items()}
+    measurement_override_map = {path_key(path): tuple(overrides) for path, overrides in (measurement_overrides or {}).items()}
 
     with tempfile.TemporaryDirectory(prefix="sem_scale_ppt_") as temp:
         temp_dir = Path(temp)
@@ -1067,8 +1215,7 @@ def generate_pptx(
                 index,
                 fixed_scale_nm,
                 auto_scale_preset,
-                path_key(path) in thickness_path_keys,
-                thickness_override_map.get(path_key(path)) if path_key(path) in thickness_path_keys else None,
+                measurement_override_map.get(path_key(path), ()),
             )
             for index, path in enumerate(image_paths, start=1)
         ]
@@ -1102,16 +1249,14 @@ def generate_svg(
     inset_x_percent: float = DEFAULTS["inset_x_percent"],
     inset_y_percent: float = DEFAULTS["inset_y_percent"],
     line_width_pt: float = DEFAULTS["line_width_pt"],
-    thickness_paths: Iterable[Path] | None = None,
-    thickness_overrides: Mapping[Path, ThicknessOverride] | None = None,
+    measurement_overrides: Mapping[Path, Sequence[MeasurementOverride]] | None = None,
 ) -> list[SlideItem]:
     page_w, page_h = DEFAULT_PAGE_W_PT, DEFAULT_PAGE_H_PT
     margin = int(round(margin_inches * POINTS_PER_INCH))
     fixed_scale_nm = parse_scale_nm(fixed_scale) if fixed_scale else None
     color = hex_color(bar_color)
     image_paths = find_images(input_path)
-    thickness_path_keys = {path_key(path) for path in thickness_paths or []}
-    thickness_override_map = {path_key(path): override for path, override in (thickness_overrides or {}).items()}
+    measurement_override_map = {path_key(path): tuple(overrides) for path, overrides in (measurement_overrides or {}).items()}
 
     with tempfile.TemporaryDirectory(prefix="sem_scale_svg_") as temp:
         temp_dir = Path(temp)
@@ -1122,8 +1267,7 @@ def generate_svg(
                 index,
                 fixed_scale_nm,
                 auto_scale_preset,
-                path_key(path) in thickness_path_keys,
-                thickness_override_map.get(path_key(path)) if path_key(path) in thickness_path_keys else None,
+                measurement_override_map.get(path_key(path), ()),
             )
             for index, path in enumerate(image_paths, start=1)
         ]

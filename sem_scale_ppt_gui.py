@@ -7,12 +7,13 @@ import re
 import sys
 import os
 import tempfile
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict
 
 from PIL import Image
-from PySide6.QtCore import QObject, QRectF, Qt, QThread, Signal
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -48,9 +49,9 @@ from sem_scale_ppt import (
     DEFAULTS,
     DEFAULT_MARGIN_INCHES,
     IMAGE_EXTENSIONS,
-    ThicknessOverride,
+    MeasurementOverride,
     detect_thickness_measurement,
-    format_thickness_label,
+    format_length_label,
     generate_pptx,
     generate_svg,
     parse_sem_metadata,
@@ -73,8 +74,7 @@ class GenerateOptions(TypedDict):
     inset_x_percent: float
     inset_y_percent: float
     line_width_pt: float
-    thickness_paths: list[Path]
-    thickness_overrides: dict[Path, ThicknessOverride]
+    measurement_overrides: dict[Path, list[MeasurementOverride]]
 
 
 POSITIONS = {
@@ -94,7 +94,7 @@ OUTPUT_FORMATS = {
 }
 COL_GENERATE = 0
 COL_NAME = 1
-COL_THICKNESS = 2
+COL_MEASUREMENT = 2
 
 
 def natural_key(path: Path) -> list[object]:
@@ -128,7 +128,7 @@ class FileQueueWidget(QTableWidget):
 
     def __init__(self) -> None:
         super().__init__(0, 3)
-        self.setHorizontalHeaderLabels(["生成", "文件", "测厚"])
+        self.setHorizontalHeaderLabels(["生成", "文件", "测量"])
         self.setAcceptDrops(True)
         self.setDragEnabled(False)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
@@ -142,7 +142,7 @@ class FileQueueWidget(QTableWidget):
         header = self.horizontalHeader()
         header.setSectionResizeMode(COL_GENERATE, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(COL_THICKNESS, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_MEASUREMENT, QHeaderView.ResizeMode.ResizeToContents)
         self.setStyleSheet(
             """
             QTableWidget {
@@ -194,37 +194,27 @@ class NoWheelDoubleSpinBox(QDoubleSpinBox):
         event.ignore()
 
 
-class ThicknessCellWidget(QWidget):
-    toggled = Signal(object, bool)
-    preview_requested = Signal(object)
+class MeasurementCellWidget(QWidget):
+    edit_requested = Signal(object)
 
-    def __init__(self, checked: bool) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.checkbox = QCheckBox()
-        self.checkbox.setToolTip("勾选后为该图片添加截面厚度标记")
-        self.checkbox.setChecked(checked)
-        self.preview_button = QPushButton("微调")
-        self.preview_button.setToolTip("预览并微调上下界面；点击后会自动勾选测厚")
-        self.preview_button.setFixedWidth(58)
+        self.edit_button = QPushButton("编辑")
+        self.edit_button.setToolTip("编辑测膜厚和测距标注；已标状态会在生成时自动导出")
+        self.edit_button.setMinimumWidth(58)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 0, 4, 0)
-        layout.setSpacing(6)
-        layout.addWidget(self.checkbox)
-        layout.addWidget(self.preview_button)
+        layout.setSpacing(0)
+        layout.addWidget(self.edit_button)
 
-        self.checkbox.toggled.connect(lambda value: self.toggled.emit(self, value))
-        self.preview_button.clicked.connect(lambda: self.preview_requested.emit(self))
+        self.edit_button.clicked.connect(lambda: self.edit_requested.emit(self))
 
-    def is_checked(self) -> bool:
-        return self.checkbox.isChecked()
-
-    def set_checked(self, checked: bool) -> None:
-        self.checkbox.setChecked(checked)
-
-    def set_adjusted(self, adjusted: bool) -> None:
-        self.preview_button.setText("已调" if adjusted else "微调")
-        self.preview_button.setStyleSheet(
+    def set_summary(self, summary: str) -> None:
+        marked = summary != "编辑"
+        self.edit_button.setText(summary)
+        self.edit_button.setMinimumWidth(58 if not marked else 92)
+        self.edit_button.setStyleSheet(
             (
                 "QPushButton { "
                 "background-color: #DDF3E3; "
@@ -233,29 +223,143 @@ class ThicknessCellWidget(QWidget):
                 "padding: 2px 8px; "
                 "}"
             )
-            if adjusted
+            if marked
             else ""
         )
 
+    def set_marked(self, marked: bool) -> None:
+        self.set_summary("已标" if marked else "编辑")
 
-class ThicknessPreviewWidget(QWidget):
-    lines_changed = Signal(float, float)
+
+class MeasurementPreviewWidget(QWidget):
+    annotations_changed = Signal()
+    selection_changed = Signal()
+    tool_changed = Signal(str)
     zoom_changed = Signal(float)
 
-    def __init__(self, qimage: QImage, top_y: float, bottom_y: float) -> None:
+    def __init__(
+        self,
+        qimage: QImage,
+        nm_per_pixel: float,
+        annotations: list[MeasurementOverride],
+        auto_thickness: MeasurementOverride | None,
+    ) -> None:
         super().__init__()
         self.pixmap = QPixmap.fromImage(qimage)
         self.image_w = qimage.width()
         self.image_h = qimage.height()
-        self.top_y = top_y
-        self.bottom_y = bottom_y
-        self.dragging: str | None = None
+        self.nm_per_pixel = nm_per_pixel
+        self.annotations = [
+            annotation
+            for annotation in (self.clamped_annotation(annotation) for annotation in annotations)
+            if annotation is not None
+        ]
+        self.auto_thickness = self.clamped_annotation(auto_thickness) if auto_thickness else None
+        self.current_tool = "distance"
+        self.selected_index = -1
+        self.dragging_thickness: str | None = None
+        self.dragging_distance: tuple[int, str] | None = None
+        self.creating_start: tuple[float, float] | None = None
+        self.creating_end: tuple[float, float] | None = None
         self.zoom_factor = 1.0
         self.max_zoom_factor = 10.0
         self.pan_x = 0.0
         self.pan_y = 0.0
         self.setMinimumSize(640, 420)
         self.setMouseTracking(True)
+
+    def clamped_annotation(self, annotation: MeasurementOverride | None) -> MeasurementOverride | None:
+        if annotation is None:
+            return None
+        kind = annotation.kind if annotation.kind in {"thickness", "distance"} else "distance"
+        x1 = max(0.0, min(float(annotation.x1_px), float(self.image_w - 1)))
+        y1 = max(0.0, min(float(annotation.y1_px), float(self.image_h - 1)))
+        x2 = max(0.0, min(float(annotation.x2_px), float(self.image_w - 1)))
+        y2 = max(0.0, min(float(annotation.y2_px), float(self.image_h - 1)))
+        if kind == "thickness":
+            x_center = max(0.0, min((x1 + x2) / 2, float(self.image_w - 1)))
+            y1, y2 = sorted((y1, y2))
+            if y2 <= y1:
+                y2 = min(float(self.image_h - 1), y1 + 1)
+                if y2 <= y1:
+                    y1 = max(0.0, y2 - 1)
+            x1 = x2 = x_center
+        elif math.hypot(x2 - x1, y2 - y1) <= 0:
+            return None
+        return MeasurementOverride(kind=kind, x1_px=x1, y1_px=y1, x2_px=x2, y2_px=y2)
+
+    def fallback_thickness(self) -> MeasurementOverride:
+        x_center = self.image_w / 2
+        return MeasurementOverride(
+            kind="thickness",
+            x1_px=x_center,
+            y1_px=self.image_h * 0.4,
+            x2_px=x_center,
+            y2_px=self.image_h * 0.6,
+        )
+
+    def thickness_index(self) -> int:
+        for index, annotation in enumerate(self.annotations):
+            if annotation.kind == "thickness":
+                return index
+        return -1
+
+    def distance_count(self) -> int:
+        return sum(1 for annotation in self.annotations if annotation.kind == "distance")
+
+    def distance_number(self, annotation_index: int) -> int:
+        return sum(1 for annotation in self.annotations[: annotation_index + 1] if annotation.kind == "distance")
+
+    def selected_annotation(self) -> MeasurementOverride | None:
+        if 0 <= self.selected_index < len(self.annotations):
+            return self.annotations[self.selected_index]
+        return None
+
+    def has_annotations(self) -> bool:
+        return bool(self.annotations)
+
+    def set_tool(self, tool: str) -> None:
+        if tool not in {"thickness", "distance"}:
+            return
+        if self.current_tool != tool:
+            self.current_tool = tool
+            self.tool_changed.emit(tool)
+        self.dragging_thickness = None
+        self.dragging_distance = None
+        self.creating_start = None
+        self.creating_end = None
+        self.update()
+
+    def select_annotation(self, index: int) -> None:
+        if not 0 <= index < len(self.annotations):
+            self.select_none()
+            return
+        self.selected_index = index
+        self.set_tool(self.annotations[index].kind)
+        self.selection_changed.emit()
+        self.update()
+
+    def select_none(self) -> None:
+        if self.selected_index == -1:
+            return
+        self.selected_index = -1
+        self.selection_changed.emit()
+        self.update()
+
+    def add_or_select_thickness(self) -> None:
+        index = self.thickness_index()
+        if index < 0:
+            thickness = self.auto_thickness or self.fallback_thickness()
+            self.annotations.append(thickness)
+            index = len(self.annotations) - 1
+            self.annotations_changed.emit()
+        self.select_annotation(index)
+
+    def use_distance_tool(self) -> None:
+        self.set_tool("distance")
+        selected = self.selected_annotation()
+        if selected is not None and selected.kind != "distance":
+            self.select_none()
 
     def base_image_rect(self) -> QRectF:
         width = max(1, self.width())
@@ -301,6 +405,20 @@ class ThicknessPreviewWidget(QWidget):
         ratio_y = (widget_y - rect.top()) / rect.height()
         return max(0.0, min(1.0, ratio_x)), max(0.0, min(1.0, ratio_y))
 
+    def widget_to_image(self, widget_x: float, widget_y: float) -> tuple[float, float]:
+        ratio_x, ratio_y = self.widget_to_image_ratio(widget_x, widget_y)
+        return (
+            max(0.0, min(ratio_x * self.image_w, float(self.image_w - 1))),
+            max(0.0, min(ratio_y * self.image_h, float(self.image_h - 1))),
+        )
+
+    def image_to_widget(self, image_x: float, image_y: float) -> QPointF:
+        rect = self.image_rect()
+        return QPointF(
+            rect.left() + image_x / self.image_w * rect.width(),
+            rect.top() + image_y / self.image_h * rect.height(),
+        )
+
     def image_y_to_widget(self, image_y: float) -> float:
         rect = self.image_rect()
         return rect.top() + image_y / self.image_h * rect.height()
@@ -309,23 +427,186 @@ class ThicknessPreviewWidget(QWidget):
         _ratio_x, ratio = self.widget_to_image_ratio(0.0, widget_y)
         return max(0.0, min(ratio * self.image_h, float(self.image_h - 1)))
 
-    def set_lines(self, top_y: float, bottom_y: float) -> None:
-        self.top_y = max(0.0, min(float(top_y), float(self.image_h - 1)))
-        self.bottom_y = max(0.0, min(float(bottom_y), float(self.image_h - 1)))
-        if self.bottom_y < self.top_y:
-            self.top_y, self.bottom_y = self.bottom_y, self.top_y
-        if self.bottom_y <= self.top_y:
-            self.bottom_y = min(float(self.image_h - 1), self.top_y + 1)
-        self.lines_changed.emit(self.top_y, self.bottom_y)
+    def snap_distance_endpoint(
+        self,
+        anchor_x: float,
+        anchor_y: float,
+        target_x: float,
+        target_y: float,
+        locked: bool,
+    ) -> tuple[float, float]:
+        if not locked:
+            return target_x, target_y
+        dx = target_x - anchor_x
+        dy = target_y - anchor_y
+        length = math.hypot(dx, dy)
+        if length <= 0:
+            return target_x, target_y
+        angle = math.atan2(dy, dx)
+        snapped_angle = round(angle / (math.pi / 4)) * (math.pi / 4)
+        unit_x = math.cos(snapped_angle)
+        unit_y = math.sin(snapped_angle)
+        max_length = length
+        if unit_x > 0:
+            max_length = min(max_length, (self.image_w - 1 - anchor_x) / unit_x)
+        elif unit_x < 0:
+            max_length = min(max_length, (0.0 - anchor_x) / unit_x)
+        if unit_y > 0:
+            max_length = min(max_length, (self.image_h - 1 - anchor_y) / unit_y)
+        elif unit_y < 0:
+            max_length = min(max_length, (0.0 - anchor_y) / unit_y)
+        length = max(0.0, max_length)
+        snapped_x = anchor_x + unit_x * length
+        snapped_y = anchor_y + unit_y * length
+        return (
+            max(0.0, min(snapped_x, float(self.image_w - 1))),
+            max(0.0, min(snapped_y, float(self.image_h - 1))),
+        )
+
+    def update_annotation(self, index: int, annotation: MeasurementOverride) -> None:
+        clamped = self.clamped_annotation(annotation)
+        if clamped is None or not 0 <= index < len(self.annotations):
+            return
+        self.annotations[index] = clamped
+        self.annotations_changed.emit()
         self.update()
 
-    def nearest_line(self, widget_y: float) -> str | None:
-        top_distance = abs(widget_y - self.image_y_to_widget(self.top_y))
-        bottom_distance = abs(widget_y - self.image_y_to_widget(self.bottom_y))
-        nearest = "top" if top_distance <= bottom_distance else "bottom"
-        if min(top_distance, bottom_distance) <= 10:
-            return nearest
+    def nearest_thickness_handle(self, annotation: MeasurementOverride, widget_x: float, widget_y: float) -> str | None:
+        rect = self.image_rect()
+        top_line_y = self.image_y_to_widget(annotation.y1_px)
+        bottom_line_y = self.image_y_to_widget(annotation.y2_px)
+        top_point = self.image_to_widget(annotation.x1_px, annotation.y1_px)
+        bottom_point = self.image_to_widget(annotation.x2_px, annotation.y2_px)
+
+        if rect.left() <= widget_x <= rect.right():
+            top_distance = abs(widget_y - top_line_y)
+            bottom_distance = abs(widget_y - bottom_line_y)
+            nearest = "top" if top_distance <= bottom_distance else "bottom"
+            if min(top_distance, bottom_distance) <= 10:
+                return nearest
+
+        if self.point_segment_distance(widget_x, widget_y, top_point, bottom_point) <= 10:
+            return "center"
         return None
+
+    def nearest_distance_handle(self, annotation: MeasurementOverride, widget_x: float, widget_y: float) -> str | None:
+        start = self.image_to_widget(annotation.x1_px, annotation.y1_px)
+        end = self.image_to_widget(annotation.x2_px, annotation.y2_px)
+        if math.hypot(widget_x - start.x(), widget_y - start.y()) <= 14:
+            return "start"
+        if math.hypot(widget_x - end.x(), widget_y - end.y()) <= 14:
+            return "end"
+        if self.point_segment_distance(widget_x, widget_y, start, end) <= 10:
+            return "line"
+        return None
+
+    def nearest_annotation_handle(self, widget_x: float, widget_y: float) -> tuple[int, str] | None:
+        kinds = (self.current_tool, "distance" if self.current_tool == "thickness" else "thickness")
+        for kind in kinds:
+            for index in range(len(self.annotations) - 1, -1, -1):
+                annotation = self.annotations[index]
+                if annotation.kind != kind:
+                    continue
+                if kind == "thickness":
+                    handle = self.nearest_thickness_handle(annotation, widget_x, widget_y)
+                else:
+                    handle = self.nearest_distance_handle(annotation, widget_x, widget_y)
+                if handle:
+                    return index, handle
+        return None
+
+    @staticmethod
+    def point_segment_distance(px: float, py: float, a: QPointF, b: QPointF) -> float:
+        dx = b.x() - a.x()
+        dy = b.y() - a.y()
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 0:
+            return math.hypot(px - a.x(), py - a.y())
+        t = max(0.0, min(1.0, ((px - a.x()) * dx + (py - a.y()) * dy) / length_sq))
+        closest_x = a.x() + dx * t
+        closest_y = a.y() + dy * t
+        return math.hypot(px - closest_x, py - closest_y)
+
+    def measurement_label(self, annotation: MeasurementOverride) -> str:
+        length_px = math.hypot(annotation.x2_px - annotation.x1_px, annotation.y2_px - annotation.y1_px)
+        return format_length_label(length_px * self.nm_per_pixel)
+
+    def draw_endpoint_handle(self, painter: QPainter, point: QPointF, color: QColor, selected: bool) -> None:
+        size = 7 if selected else 6
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(color, 1.5))
+        painter.drawLine(QPointF(point.x() - size, point.y()), QPointF(point.x() + size, point.y()))
+        painter.drawLine(QPointF(point.x(), point.y() - size), QPointF(point.x(), point.y() + size))
+
+    @staticmethod
+    def color_with_alpha(color: QColor, selected: bool) -> QColor:
+        result = QColor(color)
+        result.setAlpha(255 if selected else 170)
+        return result
+
+    def draw_distance(self, painter: QPainter, annotation: MeasurementOverride, selected: bool, temporary: bool = False) -> None:
+        start = self.image_to_widget(annotation.x1_px, annotation.y1_px)
+        end = self.image_to_widget(annotation.x2_px, annotation.y2_px)
+        dx = end.x() - start.x()
+        dy = end.y() - start.y()
+        span = math.hypot(dx, dy)
+        if span <= 0:
+            return
+        color = self.color_with_alpha(QColor("#7CFF8E" if selected else "#FFE66D"), selected)
+        if temporary:
+            color = QColor("#FFFFFF")
+        pen = QPen(color, 3 if selected else 2)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawLine(start, end)
+        self.draw_endpoint_handle(painter, start, color, selected)
+        self.draw_endpoint_handle(painter, end, color, selected)
+
+        mid_x = (start.x() + end.x()) / 2
+        mid_y = (start.y() + end.y()) / 2
+        label_offset = 16.0
+        label_x = mid_x + dy / span * label_offset
+        label_y = mid_y - dx / span * label_offset
+        label = self.measurement_label(annotation)
+        old_font = painter.font()
+        font = painter.font()
+        font.setPointSize((font.pointSize() if font.pointSize() > 0 else 10) + 1)
+        painter.setFont(font)
+        painter.setPen(QPen(color, 2))
+        painter.drawText(int(label_x), int(label_y), label)
+        painter.setFont(old_font)
+
+    def draw_thickness(self, painter: QPainter, annotation: MeasurementOverride, selected: bool) -> None:
+        rect = self.image_rect()
+        top_line_y = self.image_y_to_widget(annotation.y1_px)
+        bottom_line_y = self.image_y_to_widget(annotation.y2_px)
+        top_point = self.image_to_widget(annotation.x1_px, annotation.y1_px)
+        bottom_point = self.image_to_widget(annotation.x2_px, annotation.y2_px)
+        top_color = self.color_with_alpha(QColor("#00D1FF"), selected)
+        bottom_color = self.color_with_alpha(QColor("#FF4D4D"), selected)
+        measure_color = self.color_with_alpha(QColor("#7CFF8E"), selected)
+        width = 3 if selected else 2
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(top_color, width))
+        painter.drawLine(int(rect.left()), int(top_line_y), int(rect.right()), int(top_line_y))
+        painter.setPen(QPen(bottom_color, width))
+        painter.drawLine(int(rect.left()), int(bottom_line_y), int(rect.right()), int(bottom_line_y))
+        painter.setPen(QPen(measure_color, width))
+        painter.drawLine(top_point, bottom_point)
+        self.draw_endpoint_handle(painter, top_point, measure_color, selected)
+        self.draw_endpoint_handle(painter, bottom_point, measure_color, selected)
+
+        mid_y = (top_line_y + bottom_line_y) / 2
+        label_x = min(max(int(top_point.x() + 8), int(rect.left()) + 8), int(rect.right()) - 80)
+        painter.setPen(QPen(measure_color, 2))
+        painter.drawText(label_x, int(mid_y - 8), self.measurement_label(annotation))
+        if selected:
+            guide_x = max(8, int(rect.left()) + 8)
+            painter.setPen(QPen(top_color, 2))
+            painter.drawText(guide_x, int(top_line_y) - 8, "上界面")
+            painter.setPen(QPen(bottom_color, 2))
+            painter.drawText(guide_x, int(bottom_line_y) - 8, "下界面")
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
@@ -333,18 +614,21 @@ class ThicknessPreviewWidget(QWidget):
         rect = self.image_rect()
         painter.drawPixmap(rect.toRect(), self.pixmap)
 
-        top_line_y = self.image_y_to_widget(self.top_y)
-        bottom_line_y = self.image_y_to_widget(self.bottom_y)
-        top_pen = QPen(QColor("#00D1FF"), 3)
-        bottom_pen = QPen(QColor("#FF4D4D"), 3)
-
-        painter.setPen(top_pen)
-        painter.drawLine(int(rect.left()), int(top_line_y), int(rect.right()), int(top_line_y))
-        label_x = max(8, int(rect.left()) + 8)
-        painter.drawText(label_x, int(top_line_y) - 8, "上界面")
-        painter.setPen(bottom_pen)
-        painter.drawLine(int(rect.left()), int(bottom_line_y), int(rect.right()), int(bottom_line_y))
-        painter.drawText(label_x, int(bottom_line_y) - 8, "下界面")
+        for index, annotation in enumerate(self.annotations):
+            selected = index == self.selected_index
+            if annotation.kind == "thickness":
+                self.draw_thickness(painter, annotation, selected)
+            else:
+                self.draw_distance(painter, annotation, selected)
+        if self.creating_start and self.creating_end:
+            preview_distance = MeasurementOverride(
+                kind="distance",
+                x1_px=self.creating_start[0],
+                y1_px=self.creating_start[1],
+                x2_px=self.creating_end[0],
+                y2_px=self.creating_end[1],
+            )
+            self.draw_distance(painter, preview_distance, selected=True, temporary=True)
         painter.end()
 
     def wheelEvent(self, event) -> None:
@@ -385,38 +669,190 @@ class ThicknessPreviewWidget(QWidget):
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
             return
-        line = self.nearest_line(event.position().y())
-        if line:
-            self.dragging = line
-            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        widget_x = event.position().x()
+        widget_y = event.position().y()
+        image_x, image_y = self.widget_to_image(widget_x, widget_y)
+        handle = self.nearest_annotation_handle(widget_x, widget_y)
+        if handle:
+            index, endpoint = handle
+            annotation = self.annotations[index]
+            self.select_annotation(index)
+            if annotation.kind == "thickness":
+                self.dragging_thickness = endpoint
+                self.setCursor(Qt.CursorShape.SizeHorCursor if endpoint == "center" else Qt.CursorShape.SizeVerCursor)
+            elif endpoint in {"start", "end"}:
+                self.dragging_distance = (index, endpoint)
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            return
+
+        if self.current_tool == "distance":
+            self.select_none()
+            self.creating_start = (image_x, image_y)
+            self.creating_end = (image_x, image_y)
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            self.update()
+        else:
+            self.select_none()
 
     def mouseMoveEvent(self, event) -> None:
-        if self.dragging:
-            image_y = self.widget_y_to_image(event.position().y())
-            if self.dragging == "top":
-                self.top_y = min(image_y, self.bottom_y - 1)
-            else:
-                self.bottom_y = max(image_y, self.top_y + 1)
-            self.lines_changed.emit(self.top_y, self.bottom_y)
+        widget_x = event.position().x()
+        widget_y = event.position().y()
+        image_x, image_y = self.widget_to_image(widget_x, widget_y)
+        shift_locked = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        if self.creating_start:
+            self.creating_end = self.snap_distance_endpoint(
+                self.creating_start[0],
+                self.creating_start[1],
+                image_x,
+                image_y,
+                shift_locked,
+            )
             self.update()
             return
-        self.setCursor(Qt.CursorShape.SizeVerCursor if self.nearest_line(event.position().y()) else Qt.CursorShape.ArrowCursor)
+        if self.dragging_distance:
+            index, endpoint = self.dragging_distance
+            if 0 <= index < len(self.annotations):
+                current = self.annotations[index]
+                if endpoint == "start":
+                    image_x, image_y = self.snap_distance_endpoint(
+                        current.x2_px,
+                        current.y2_px,
+                        image_x,
+                        image_y,
+                        shift_locked,
+                    )
+                    updated = MeasurementOverride(current.kind, image_x, image_y, current.x2_px, current.y2_px)
+                else:
+                    image_x, image_y = self.snap_distance_endpoint(
+                        current.x1_px,
+                        current.y1_px,
+                        image_x,
+                        image_y,
+                        shift_locked,
+                    )
+                    updated = MeasurementOverride(current.kind, current.x1_px, current.y1_px, image_x, image_y)
+                self.update_annotation(index, updated)
+            return
+        if self.dragging_thickness and 0 <= self.selected_index < len(self.annotations):
+            current = self.annotations[self.selected_index]
+            if current.kind == "thickness":
+                if self.dragging_thickness == "top":
+                    updated = MeasurementOverride(current.kind, current.x1_px, image_y, current.x2_px, current.y2_px)
+                elif self.dragging_thickness == "bottom":
+                    updated = MeasurementOverride(current.kind, current.x1_px, current.y1_px, current.x2_px, image_y)
+                else:
+                    updated = MeasurementOverride(current.kind, image_x, current.y1_px, image_x, current.y2_px)
+                self.update_annotation(self.selected_index, updated)
+            return
+
+        handle = self.nearest_annotation_handle(widget_x, widget_y)
+        if handle:
+            index, endpoint = handle
+            annotation = self.annotations[index]
+            if annotation.kind == "thickness":
+                self.setCursor(Qt.CursorShape.SizeHorCursor if endpoint == "center" else Qt.CursorShape.SizeVerCursor)
+            elif endpoint in {"start", "end"}:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+        elif self.current_tool == "distance":
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, _event) -> None:
-        self.dragging = None
-        self.setCursor(Qt.CursorShape.ArrowCursor)
+        if self.creating_start and self.creating_end:
+            length_px = math.hypot(
+                self.creating_end[0] - self.creating_start[0],
+                self.creating_end[1] - self.creating_start[1],
+            )
+            if length_px >= 3:
+                self.annotations.append(
+                    MeasurementOverride(
+                        kind="distance",
+                        x1_px=self.creating_start[0],
+                        y1_px=self.creating_start[1],
+                        x2_px=self.creating_end[0],
+                        y2_px=self.creating_end[1],
+                    )
+                )
+                self.selected_index = len(self.annotations) - 1
+                self.annotations_changed.emit()
+                self.selection_changed.emit()
+            self.update()
+        self.creating_start = None
+        self.creating_end = None
+        self.dragging_distance = None
+        self.dragging_thickness = None
+        self.setCursor(Qt.CursorShape.CrossCursor if self.current_tool == "distance" else Qt.CursorShape.ArrowCursor)
+
+    def delete_selected_annotation(self) -> None:
+        if not 0 <= self.selected_index < len(self.annotations):
+            return
+        del self.annotations[self.selected_index]
+        self.selected_index = -1
+        self.annotations_changed.emit()
+        self.selection_changed.emit()
+        self.update()
+
+    def clear_annotations(self) -> None:
+        if not self.annotations:
+            return
+        self.annotations.clear()
+        self.selected_index = -1
+        self.annotations_changed.emit()
+        self.selection_changed.emit()
+        self.set_tool("distance")
+        self.update()
+
+    def reset_selected_annotation(self) -> None:
+        if not self.can_reset_selected():
+            return
+        self.annotations[self.selected_index] = self.auto_thickness or self.fallback_thickness()
+        self.annotations_changed.emit()
+        self.selection_changed.emit()
+        self.update()
+
+    def can_reset_selected(self) -> bool:
+        annotation = self.selected_annotation()
+        return annotation is not None and annotation.kind == "thickness" and self.auto_thickness is not None
+
+    def info_text(self) -> str:
+        annotation = self.selected_annotation()
+        thickness_count = 1 if self.thickness_index() >= 0 else 0
+        distance_count = self.distance_count()
+        if annotation and annotation.kind == "thickness":
+            return (
+                f"膜厚：上界面 y={annotation.y1_px:.1f}px，"
+                f"下界面 y={annotation.y2_px:.1f}px，"
+                f"x={annotation.x1_px:.1f}px，厚度 {self.measurement_label(annotation)}"
+            )
+        if annotation and annotation.kind == "distance":
+            return (
+                f"测距 {distance_count} 条，当前 {self.distance_number(self.selected_index)}: "
+                f"{self.measurement_label(annotation)}"
+            )
+        if self.current_tool == "thickness":
+            return "膜厚工具：点击膜厚可新增或选中膜厚标注；拖动红/蓝线或中间竖线调整"
+        return f"测距工具：拖拽新增距离标注；当前膜厚 {thickness_count} 条，测距 {distance_count} 条"
 
     def resizeEvent(self, _event) -> None:
         super().resizeEvent(_event)
         self.clamp_pan()
 
 
-class ThicknessPreviewDialog(QDialog):
-    def __init__(self, path: Path, override: ThicknessOverride | None, parent: QWidget | None = None) -> None:
+class MeasurementPreviewDialog(QDialog):
+    def __init__(
+        self,
+        path: Path,
+        measurement_overrides: list[MeasurementOverride],
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.path = path
-        self.override = override
-        self.setWindowTitle(f"预览/微调厚度 - {path.name}")
+        self.setWindowTitle(f"测量标注 - {path.name}")
         self.resize(900, 650)
 
         with Image.open(path) as image:
@@ -437,26 +873,43 @@ class ThicknessPreviewDialog(QDialog):
             ).copy()
 
         self.auto_measurement = auto_measurement
-        self.x_center_px = (
-            override.x_center_px
-            if override and override.x_center_px is not None
-            else auto_measurement.x_center_px
+        auto_thickness = (
+            MeasurementOverride(
+                kind="thickness",
+                x1_px=auto_measurement.x_center_px,
+                y1_px=auto_measurement.top_y_px,
+                x2_px=auto_measurement.x_center_px,
+                y2_px=auto_measurement.bottom_y_px,
+            )
             if auto_measurement
-            else self.image_w / 2
+            else None
         )
-        if override:
-            top_y = override.top_y_px
-            bottom_y = override.bottom_y_px
-        elif auto_measurement:
-            top_y = auto_measurement.top_y_px
-            bottom_y = auto_measurement.bottom_y_px
-        else:
-            top_y = self.image_h * 0.4
-            bottom_y = self.image_h * 0.6
 
         layout = QVBoxLayout(self)
-        self.preview = ThicknessPreviewWidget(qimage, top_y, bottom_y)
-        self.preview.lines_changed.connect(self.update_label)
+        tool_row = QHBoxLayout()
+        tool_row.addWidget(QLabel("添加/编辑"))
+        self.thickness_tool_button = QPushButton("膜厚")
+        self.thickness_tool_button.setCheckable(True)
+        self.distance_tool_button = QPushButton("测距")
+        self.distance_tool_button.setCheckable(True)
+        self.tool_group = QButtonGroup(self)
+        self.tool_group.setExclusive(True)
+        self.tool_group.addButton(self.thickness_tool_button)
+        self.tool_group.addButton(self.distance_tool_button)
+        tool_row.addWidget(self.thickness_tool_button)
+        tool_row.addWidget(self.distance_tool_button)
+        tool_row.addStretch()
+        layout.addLayout(tool_row)
+
+        self.preview = MeasurementPreviewWidget(
+            qimage,
+            self.nm_per_pixel,
+            list(measurement_overrides),
+            auto_thickness,
+        )
+        self.preview.annotations_changed.connect(self.update_info)
+        self.preview.selection_changed.connect(self.update_info)
+        self.preview.tool_changed.connect(self.update_tool_buttons)
         self.preview.zoom_changed.connect(self.update_zoom_label)
         layout.addWidget(self.preview, stretch=1)
 
@@ -472,43 +925,68 @@ class ThicknessPreviewDialog(QDialog):
         layout.addLayout(info_row)
 
         button_row = QHBoxLayout()
-        button_row.addStretch()
-        self.reset_button = QPushButton("重置为自动识别")
-        self.reset_button.clicked.connect(self.reset_to_auto)
+        self.reset_selected_button = QPushButton("重置选中")
+        self.reset_selected_button.clicked.connect(self.preview.reset_selected_annotation)
+        self.delete_selected_button = QPushButton("删除选中")
+        self.delete_selected_button.clicked.connect(self.preview.delete_selected_annotation)
+        self.clear_button = QPushButton("清空标注")
+        self.clear_button.clicked.connect(self.preview.clear_annotations)
         self.apply_button = QPushButton("应用")
         self.apply_button.clicked.connect(self.accept)
         self.cancel_button = QPushButton("取消")
         self.cancel_button.clicked.connect(self.reject)
-        button_row.addWidget(self.reset_button)
+        button_row.addWidget(self.reset_selected_button)
+        button_row.addWidget(self.delete_selected_button)
+        button_row.addWidget(self.clear_button)
+        button_row.addStretch()
         button_row.addWidget(self.apply_button)
         button_row.addWidget(self.cancel_button)
         layout.addLayout(button_row)
 
-        self.reset_button.setEnabled(self.auto_measurement is not None)
-        self.update_label(self.preview.top_y, self.preview.bottom_y)
+        self.thickness_tool_button.clicked.connect(self.on_thickness_tool_clicked)
+        self.distance_tool_button.clicked.connect(self.on_distance_tool_clicked)
+        if self.preview.thickness_index() >= 0 and self.preview.distance_count() == 0:
+            self.preview.select_annotation(self.preview.thickness_index())
+        else:
+            self.preview.use_distance_tool()
+        self.update_tool_buttons(self.preview.current_tool)
         self.update_zoom_label(self.preview.zoom_factor)
-
-    def update_label(self, top_y: float, bottom_y: float) -> None:
-        thickness_nm = abs(bottom_y - top_y) * self.nm_per_pixel
-        self.info_label.setText(
-            f"上界面 y={top_y:.1f}px，下界面 y={bottom_y:.1f}px，厚度 {format_thickness_label(thickness_nm)}"
-        )
+        self.update_info()
 
     def update_zoom_label(self, zoom_factor: float) -> None:
         self.zoom_label.setText(f"{zoom_factor * 100:.0f}%")
 
-    def reset_to_auto(self) -> None:
-        if not self.auto_measurement:
-            return
-        self.x_center_px = self.auto_measurement.x_center_px
-        self.preview.set_lines(self.auto_measurement.top_y_px, self.auto_measurement.bottom_y_px)
+    def update_tool_buttons(self, tool: str) -> None:
+        was_thickness_blocked = self.thickness_tool_button.blockSignals(True)
+        was_distance_blocked = self.distance_tool_button.blockSignals(True)
+        try:
+            self.thickness_tool_button.setChecked(tool == "thickness")
+            self.distance_tool_button.setChecked(tool == "distance")
+        finally:
+            self.thickness_tool_button.blockSignals(was_thickness_blocked)
+            self.distance_tool_button.blockSignals(was_distance_blocked)
 
-    def result_override(self) -> ThicknessOverride:
-        return ThicknessOverride(
-            top_y_px=self.preview.top_y,
-            bottom_y_px=self.preview.bottom_y,
-            x_center_px=self.x_center_px,
-        )
+    def update_info(self) -> None:
+        self.info_label.setText(self.preview.info_text())
+        self.update_mode_controls()
+
+    def on_thickness_tool_clicked(self) -> None:
+        self.preview.add_or_select_thickness()
+        self.update_tool_buttons(self.preview.current_tool)
+        self.update_info()
+
+    def on_distance_tool_clicked(self) -> None:
+        self.preview.use_distance_tool()
+        self.update_tool_buttons(self.preview.current_tool)
+        self.update_info()
+
+    def update_mode_controls(self) -> None:
+        self.reset_selected_button.setEnabled(self.preview.can_reset_selected())
+        self.delete_selected_button.setEnabled(self.preview.selected_annotation() is not None)
+        self.clear_button.setEnabled(self.preview.has_annotations())
+
+    def result_measurement_overrides(self) -> list[MeasurementOverride]:
+        return list(self.preview.annotations)
 
 
 class GeneratorWorker(QObject):
@@ -539,8 +1017,7 @@ class GeneratorWorker(QObject):
                     inset_x_percent=self.options["inset_x_percent"],
                     inset_y_percent=self.options["inset_y_percent"],
                     line_width_pt=self.options["line_width_pt"],
-                    thickness_paths=self.options["thickness_paths"],
-                    thickness_overrides=self.options["thickness_overrides"],
+                    measurement_overrides=self.options["measurement_overrides"],
                 )
                 total = len(items)
                 output_paths = [
@@ -561,8 +1038,7 @@ class GeneratorWorker(QObject):
                     inset_x_percent=self.options["inset_x_percent"],
                     inset_y_percent=self.options["inset_y_percent"],
                     line_width_pt=self.options["line_width_pt"],
-                    thickness_paths=self.options["thickness_paths"],
-                    thickness_overrides=self.options["thickness_overrides"],
+                    measurement_overrides=self.options["measurement_overrides"],
                 )
                 output_paths = [self.options["output_path"]]
             if len(output_paths) == 1:
@@ -571,21 +1047,22 @@ class GeneratorWorker(QObject):
                 self.log.emit(f"已生成 {len(output_paths)} 个 {output_format.upper()}:")
                 for path in output_paths:
                     self.log.emit(f"  {path}")
-            thickness_requested = {path.resolve() for path in self.options["thickness_paths"]}
             for item in items:
                 self.log.emit(
                     f"{item.source_path.name}: {item.calibration.nm_per_pixel:g} nm/px, "
                     f"标尺 {item.label} = {item.scale_px:.1f} px"
                 )
-                if item.source_path.resolve() in thickness_requested:
-                    if item.thickness:
-                        self.log.emit(
-                            f"  截面厚度 {item.thickness.label} = "
-                            f"{item.thickness.bottom_y_px - item.thickness.top_y_px:.1f} px, "
-                            f"置信度 {item.thickness.confidence:.2f}"
-                        )
+                distance_index = 0
+                for measurement in item.measurements:
+                    length_px = math.hypot(
+                        measurement.x2_px - measurement.x1_px,
+                        measurement.y2_px - measurement.y1_px,
+                    )
+                    if measurement.kind == "thickness":
+                        self.log.emit(f"  膜厚: {measurement.label} = {length_px:.1f} px")
                     else:
-                        self.log.emit("  未识别到可靠的截面厚度界面。")
+                        distance_index += 1
+                        self.log.emit(f"  测距 {distance_index}: {measurement.label} = {length_px:.1f} px")
             self.finished.emit([str(path) for path in output_paths])
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -597,7 +1074,7 @@ class MainWindow(QMainWindow):
         self.thread: QThread | None = None
         self.worker: GeneratorWorker | None = None
         self.open_after_generate = False
-        self.thickness_overrides: dict[str, ThicknessOverride] = {}
+        self.measurement_overrides: dict[str, list[MeasurementOverride]] = {}
         self.setWindowTitle("SEM 标尺 PPT 生成器")
         self.resize(DEFAULTS["window_width"], DEFAULTS["window_height"])
         self._build_ui()
@@ -809,7 +1286,7 @@ class MainWindow(QMainWindow):
             if resolved in existing:
                 continue
             existing.add(resolved)
-            self.add_queue_row(resolved, generate=True, thickness=False)
+            self.add_queue_row(resolved, generate=True)
             added = True
         if added:
             self.refresh_item_labels()
@@ -833,20 +1310,19 @@ class MainWindow(QMainWindow):
         item.setToolTip(str(path))
         return item
 
-    def add_queue_row(self, path: Path, generate: bool, thickness: bool) -> None:
+    def add_queue_row(self, path: Path, generate: bool) -> None:
         row = self.file_list.rowCount()
         was_blocked = self.file_list.blockSignals(True)
         try:
             self.file_list.insertRow(row)
             self.file_list.setItem(row, COL_GENERATE, self.checkbox_item(generate))
             self.file_list.setItem(row, COL_NAME, self.text_item(path.name, path))
-            thickness_cell = ThicknessCellWidget(thickness)
-            thickness_cell.toggled.connect(self.on_thickness_cell_toggled)
-            thickness_cell.preview_requested.connect(self.on_thickness_preview_requested)
-            self.file_list.setCellWidget(row, COL_THICKNESS, thickness_cell)
+            measurement_cell = MeasurementCellWidget()
+            measurement_cell.edit_requested.connect(self.on_measurement_edit_requested)
+            self.file_list.setCellWidget(row, COL_MEASUREMENT, measurement_cell)
         finally:
             self.file_list.blockSignals(was_blocked)
-        self.update_thickness_status(row)
+        self.update_measurement_status(row)
 
     def item_path(self, row: int) -> Path:
         item = self.file_list.item(row, COL_NAME)
@@ -854,46 +1330,49 @@ class MainWindow(QMainWindow):
             raise ValueError(f"Queue row {row} has no file item.")
         return Path(item.data(Qt.ItemDataRole.UserRole))
 
-    def thickness_cell(self, row: int) -> ThicknessCellWidget | None:
-        widget = self.file_list.cellWidget(row, COL_THICKNESS)
-        return widget if isinstance(widget, ThicknessCellWidget) else None
+    def measurement_cell(self, row: int) -> MeasurementCellWidget | None:
+        widget = self.file_list.cellWidget(row, COL_MEASUREMENT)
+        return widget if isinstance(widget, MeasurementCellWidget) else None
 
-    def row_for_thickness_cell(self, cell: ThicknessCellWidget) -> int:
+    def row_for_measurement_cell(self, cell: MeasurementCellWidget) -> int:
         for row in range(self.file_list.rowCount()):
-            if self.file_list.cellWidget(row, COL_THICKNESS) is cell:
+            if self.file_list.cellWidget(row, COL_MEASUREMENT) is cell:
                 return row
         return -1
 
     def row_checked(self, row: int, column: int) -> bool:
-        if column == COL_THICKNESS:
-            cell = self.thickness_cell(row)
-            return cell.is_checked() if cell else False
         item = self.file_list.item(row, column)
         return item is not None and item.checkState() == Qt.CheckState.Checked
 
     def set_row_checked(self, row: int, column: int, checked: bool) -> None:
-        if column == COL_THICKNESS:
-            cell = self.thickness_cell(row)
-            if cell is not None:
-                cell.set_checked(checked)
-                self.update_thickness_status(row)
-            return
         item = self.file_list.item(row, column)
         if item is not None:
             item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
 
-    def update_thickness_status(self, row: int) -> None:
+    def update_measurement_status(self, row: int) -> None:
         if row < 0 or row >= self.file_list.rowCount():
             return
-        cell = self.thickness_cell(row)
+        cell = self.measurement_cell(row)
         if cell is None:
             return
         path = self.item_path(row)
-        cell.set_adjusted(path_key(path) in self.thickness_overrides)
+        key = path_key(path)
+        cell.set_summary(self.measurement_summary(key))
 
-    def refresh_thickness_statuses(self) -> None:
+    def measurement_summary(self, key: str) -> str:
+        annotations = self.measurement_overrides.get(key, [])
+        has_thickness = any(annotation.kind == "thickness" for annotation in annotations)
+        distance_count = sum(1 for annotation in annotations if annotation.kind == "distance")
+        parts: list[str] = []
+        if has_thickness:
+            parts.append("膜厚")
+        if distance_count:
+            parts.append(f"测距 {distance_count}")
+        return "+".join(parts) if parts else "编辑"
+
+    def refresh_measurement_statuses(self) -> None:
         for row in range(self.file_list.rowCount()):
-            self.update_thickness_status(row)
+            self.update_measurement_status(row)
 
     def checked_paths(self) -> list[Path]:
         paths: list[Path] = []
@@ -902,11 +1381,15 @@ class MainWindow(QMainWindow):
                 paths.append(self.item_path(row))
         return paths
 
-    def thickness_paths(self) -> list[Path]:
+    def marked_measurement_paths(self) -> list[Path]:
         paths: list[Path] = []
         for row in range(self.file_list.rowCount()):
-            if self.row_checked(row, COL_GENERATE) and self.row_checked(row, COL_THICKNESS):
-                paths.append(self.item_path(row))
+            if not self.row_checked(row, COL_GENERATE):
+                continue
+            path = self.item_path(row)
+            key = path_key(path)
+            if self.measurement_overrides.get(key):
+                paths.append(path)
         return paths
 
     def selected_rows(self) -> list[int]:
@@ -930,22 +1413,23 @@ class MainWindow(QMainWindow):
     def update_count(self, *_args) -> None:
         total = self.file_list.rowCount()
         selected = len(self.checked_paths())
-        thickness = len(self.thickness_paths())
-        self.count_label.setText(f"生成 {selected} / 共 {total}，测厚 {thickness}")
+        measurement = len(self.marked_measurement_paths())
+        marked_annotations = [
+            annotation
+            for path in self.marked_measurement_paths()
+            for annotation in self.measurement_overrides.get(path_key(path), [])
+        ]
+        thickness = sum(1 for annotation in marked_annotations if annotation.kind == "thickness")
+        distance = sum(1 for annotation in marked_annotations if annotation.kind == "distance")
+        self.count_label.setText(f"生成 {selected} / 共 {total}，已标 {measurement}，膜厚 {thickness}，测距 {distance}")
 
     def on_queue_item_changed(self, item: QTableWidgetItem) -> None:
         self.update_count()
 
-    def on_thickness_cell_toggled(self, cell: ThicknessCellWidget, _checked: bool) -> None:
-        row = self.row_for_thickness_cell(cell)
+    def on_measurement_edit_requested(self, cell: MeasurementCellWidget) -> None:
+        row = self.row_for_measurement_cell(cell)
         if row >= 0:
-            self.update_thickness_status(row)
-            self.update_count()
-
-    def on_thickness_preview_requested(self, cell: ThicknessCellWidget) -> None:
-        row = self.row_for_thickness_cell(cell)
-        if row >= 0:
-            self.preview_selected_thickness(row)
+            self.preview_selected_measurement(row)
 
     def show_queue_context_menu(self, position) -> None:
         row = self.file_list.rowAt(position.y())
@@ -953,30 +1437,24 @@ class MainWindow(QMainWindow):
             self.file_list.selectRow(row)
 
         menu = QMenu(self)
-        mark_action = menu.addAction("选中设为测厚")
-        unmark_action = menu.addAction("选中取消测厚")
-        clear_thickness_action = menu.addAction("全部取消测厚")
+        clear_measurement_action = menu.addAction("清除选中测量标注")
         menu.addSeparator()
         remove_action = menu.addAction("删除选中")
 
         has_selection = bool(self.selected_rows())
-        mark_action.setEnabled(has_selection)
-        unmark_action.setEnabled(has_selection)
+        clear_measurement_action.setEnabled(has_selection)
         remove_action.setEnabled(has_selection)
 
         action = menu.exec(self.file_list.viewport().mapToGlobal(position))
-        if action == mark_action:
-            self.mark_selected_thickness()
-        elif action == unmark_action:
-            self.unmark_selected_thickness()
-        elif action == clear_thickness_action:
-            self.clear_all_thickness()
+        if action == clear_measurement_action:
+            self.clear_selected_measurements()
         elif action == remove_action:
             self.remove_selected()
 
     def remove_selected(self) -> None:
         for row in self.selected_rows():
-            self.thickness_overrides.pop(path_key(self.item_path(row)), None)
+            key = path_key(self.item_path(row))
+            self.measurement_overrides.pop(key, None)
         for row in self.selected_rows():
             self.file_list.removeRow(row)
         self.refresh_item_labels()
@@ -984,21 +1462,21 @@ class MainWindow(QMainWindow):
 
     def sort_queue(self) -> None:
         rows = [
-            (self.item_path(row), self.row_checked(row, COL_GENERATE), self.row_checked(row, COL_THICKNESS))
+            (self.item_path(row), self.row_checked(row, COL_GENERATE))
             for row in range(self.file_list.rowCount())
         ]
         rows.sort(key=lambda row: natural_key(row[0]))
         self.file_list.setRowCount(0)
-        for path, generate, thickness in rows:
-            self.add_queue_row(path, generate=generate, thickness=thickness)
+        for path, generate in rows:
+            self.add_queue_row(path, generate=generate)
         self.refresh_item_labels()
-        self.refresh_thickness_statuses()
+        self.refresh_measurement_statuses()
         self.update_count()
 
     def clear_queue(self) -> None:
         self.file_list.setRowCount(0)
-        self.thickness_overrides.clear()
-        self.file_list.setHorizontalHeaderLabels(["生成", "文件", "测厚"])
+        self.measurement_overrides.clear()
+        self.file_list.setHorizontalHeaderLabels(["生成", "文件", "测量"])
         self.update_count()
 
     def select_all_generate(self) -> None:
@@ -1011,47 +1489,46 @@ class MainWindow(QMainWindow):
             self.set_row_checked(row, COL_GENERATE, False)
         self.update_count()
 
-    def mark_selected_thickness(self) -> None:
+    def clear_selected_measurements(self) -> None:
         for row in self.selected_rows():
-            self.set_row_checked(row, COL_THICKNESS, True)
+            key = path_key(self.item_path(row))
+            self.measurement_overrides.pop(key, None)
+            self.update_measurement_status(row)
         self.update_count()
 
-    def unmark_selected_thickness(self) -> None:
-        for row in self.selected_rows():
-            self.set_row_checked(row, COL_THICKNESS, False)
-        self.update_count()
-
-    def clear_all_thickness(self) -> None:
-        for row in range(self.file_list.rowCount()):
-            self.set_row_checked(row, COL_THICKNESS, False)
-        self.update_count()
-
-    def thickness_overrides_for_generation(self) -> dict[Path, ThicknessOverride]:
-        overrides: dict[Path, ThicknessOverride] = {}
-        for path in self.thickness_paths():
-            override = self.thickness_overrides.get(path_key(path))
-            if override is not None:
-                overrides[path] = override
+    def measurement_overrides_for_generation(self) -> dict[Path, list[MeasurementOverride]]:
+        overrides: dict[Path, list[MeasurementOverride]] = {}
+        for path in self.marked_measurement_paths():
+            annotations = self.measurement_overrides.get(path_key(path))
+            if annotations:
+                overrides[path] = list(annotations)
         return overrides
 
-    def preview_selected_thickness(self, row: int | None = None) -> None:
+    def preview_selected_measurement(self, row: int | None = None) -> None:
         if row is None:
             selected_rows = list(reversed(self.selected_rows()))
             if len(selected_rows) != 1:
-                QMessageBox.warning(self, "选择图片", "请在队列中只选中一张需要微调厚度的图片。")
+                QMessageBox.warning(self, "选择图片", "请在队列中只选中一张需要编辑测量标注的图片。")
                 return
             row = selected_rows[0]
         path = self.item_path(row)
         key = path_key(path)
-        self.set_row_checked(row, COL_THICKNESS, True)
         try:
-            dialog = ThicknessPreviewDialog(path, self.thickness_overrides.get(key), self)
+            dialog = MeasurementPreviewDialog(
+                path,
+                self.measurement_overrides.get(key, []),
+                self,
+            )
         except Exception as exc:
-            QMessageBox.warning(self, "无法预览厚度", str(exc))
+            QMessageBox.warning(self, "无法编辑测量", str(exc))
             return
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.thickness_overrides[key] = dialog.result_override()
-            self.update_thickness_status(row)
+            annotations = dialog.result_measurement_overrides()
+            if annotations:
+                self.measurement_overrides[key] = annotations
+            else:
+                self.measurement_overrides.pop(key, None)
+            self.update_measurement_status(row)
             self.update_count()
 
     def on_auto_scale_toggled(self, checked: bool) -> None:
@@ -1069,8 +1546,7 @@ class MainWindow(QMainWindow):
             input_paths = self.checked_paths()
             if not input_paths:
                 raise ValueError("请至少添加并勾选一张 SEM 图片。")
-            thickness_paths = self.thickness_paths()
-            thickness_overrides = self.thickness_overrides_for_generation()
+            measurement_overrides = self.measurement_overrides_for_generation()
             output_format = self.current_output_format()
             suffix = f".{output_format}"
             if open_after:
@@ -1102,8 +1578,7 @@ class MainWindow(QMainWindow):
                 "inset_x_percent": float(self.inset_x_spin.value()),
                 "inset_y_percent": float(self.inset_y_spin.value()),
                 "line_width_pt": float(self.line_width_spin.value()),
-                "thickness_paths": thickness_paths,
-                "thickness_overrides": thickness_overrides,
+                "measurement_overrides": measurement_overrides,
             }
         except Exception as exc:
             QMessageBox.warning(self, "参数错误", str(exc))

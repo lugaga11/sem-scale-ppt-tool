@@ -6,9 +6,7 @@ from __future__ import annotations
 import re
 import sys
 import os
-import tempfile
 import math
-from datetime import datetime
 from pathlib import Path
 from typing import TypedDict
 
@@ -1073,7 +1071,6 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.thread: QThread | None = None
         self.worker: GeneratorWorker | None = None
-        self.open_after_generate = False
         self.measurement_overrides: dict[str, list[MeasurementOverride]] = {}
         self.setWindowTitle("SEM 标尺 PPT 生成器")
         self.resize(DEFAULTS["window_width"], DEFAULTS["window_height"])
@@ -1196,11 +1193,8 @@ class MainWindow(QMainWindow):
         action_row = QHBoxLayout()
         action_row.addStretch()
         self.generate_button = QPushButton("生成 PPTX")
-        self.generate_button.clicked.connect(lambda: self.generate(open_after=False))
-        self.generate_open_button = QPushButton("生成并打开")
-        self.generate_open_button.clicked.connect(lambda: self.generate(open_after=True))
+        self.generate_button.clicked.connect(self.generate)
         action_row.addWidget(self.generate_button)
-        action_row.addWidget(self.generate_open_button)
         right_layout.addLayout(action_row)
 
         right_layout.addStretch()
@@ -1535,13 +1529,7 @@ class MainWindow(QMainWindow):
         self.auto_scale_combo.setEnabled(checked)
         self.fixed_scale_edit.setEnabled(not checked)
 
-    def temporary_output_path(self, output_format: str) -> Path:
-        output_dir = Path(tempfile.gettempdir()) / "sem_scale_ppt"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return output_dir / f"sem_scale_{timestamp}.{output_format}"
-
-    def generate(self, open_after: bool = False) -> None:
+    def generate(self) -> None:
         try:
             input_paths = self.checked_paths()
             if not input_paths:
@@ -1549,15 +1537,12 @@ class MainWindow(QMainWindow):
             measurement_overrides = self.measurement_overrides_for_generation()
             output_format = self.current_output_format()
             suffix = f".{output_format}"
-            if open_after:
-                output_path = self.temporary_output_path(output_format)
-            else:
-                output_text = self.output_edit.text().strip()
-                if not output_text:
-                    raise ValueError("请选择输出文件路径。")
-                output_path = Path(output_text)
-                if output_path.suffix.lower() != suffix:
-                    output_path = output_path.with_suffix(suffix)
+            output_text = self.output_edit.text().strip()
+            if not output_text:
+                raise ValueError("请选择输出文件路径。")
+            output_path = Path(output_text)
+            if output_path.suffix.lower() != suffix:
+                output_path = output_path.with_suffix(suffix)
 
             margin = float(self.margin_edit.text().strip())
             fixed_scale = None if self.auto_scale_check.isChecked() else self.fixed_scale_edit.text().strip()
@@ -1586,8 +1571,6 @@ class MainWindow(QMainWindow):
 
         self.log_edit.clear()
         self.generate_button.setEnabled(False)
-        self.generate_open_button.setEnabled(False)
-        self.open_after_generate = open_after
         self.thread = QThread()
         self.worker = GeneratorWorker(options)
         self.worker.moveToThread(self.thread)
@@ -1605,39 +1588,23 @@ class MainWindow(QMainWindow):
 
     def on_finished(self, output_paths: list[str]) -> None:
         self.generate_button.setEnabled(True)
-        self.generate_open_button.setEnabled(True)
         output_count = len(output_paths)
-        if self.open_after_generate:
-            target_path = Path(output_paths[0]).parent if output_count > 1 else Path(output_paths[0])
-            try:
-                os.startfile(target_path)
-            except OSError as exc:
-                QMessageBox.warning(self, "无法打开文件", str(exc))
-            else:
-                if output_count > 1:
-                    self.append_log("已打开输出文件夹。")
-                else:
-                    self.append_log("已打开临时文件。请在对应软件中手动另存为需要的位置。")
+        if output_count == 1:
+            message = f"文件已生成:\n{output_paths[0]}"
         else:
-            if output_count == 1:
-                message = f"文件已生成:\n{output_paths[0]}"
-            else:
-                output_dir = Path(output_paths[0]).parent
-                output_format = Path(output_paths[0]).suffix.upper().lstrip(".")
-                message = f"已生成 {output_count} 个 {output_format}:\n{output_dir}"
-            QMessageBox.information(self, "完成", message)
+            output_dir = Path(output_paths[0]).parent
+            output_format = Path(output_paths[0]).suffix.upper().lstrip(".")
+            message = f"已生成 {output_count} 个 {output_format}:\n{output_dir}"
+        QMessageBox.information(self, "完成", message)
         self.thread = None
         self.worker = None
-        self.open_after_generate = False
 
     def on_failed(self, message: str) -> None:
         self.generate_button.setEnabled(True)
-        self.generate_open_button.setEnabled(True)
         self.append_log(f"错误: {message}")
         QMessageBox.critical(self, "生成失败", message)
         self.thread = None
         self.worker = None
-        self.open_after_generate = False
 
 
 def main() -> int:

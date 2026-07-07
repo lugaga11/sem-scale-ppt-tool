@@ -966,8 +966,6 @@ def safe_filename_part(value: str) -> str:
 
 def split_output_path(output_path: Path, item: SlideItem, index: int, total: int, suffix: str) -> Path:
     output_path = output_path.with_suffix(suffix)
-    if total == 1:
-        return output_path
     stem = safe_filename_part(item.source_path.stem)
     return output_path.with_name(f"{output_path.stem}_{index:02d}_{stem}{suffix}")
 

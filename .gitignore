@@ -11,3 +11,5 @@ sample/
 venv/
 .env
 *.pptx
+*.ppt
+*.svg

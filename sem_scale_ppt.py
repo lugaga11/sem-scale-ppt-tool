@@ -96,6 +96,28 @@ class Calibration:
 
 
 @dataclass(frozen=True)
+class CalibrationOverride:
+    known_length_nm: float
+    x1_px: float
+    y1_px: float
+    x2_px: float
+    y2_px: float
+
+    @property
+    def pixel_length(self) -> float:
+        return math.hypot(self.x2_px - self.x1_px, self.y2_px - self.y1_px)
+
+    @property
+    def nm_per_pixel(self) -> float:
+        if not math.isfinite(self.known_length_nm) or self.known_length_nm <= 0:
+            raise ValueError("Manual calibration length must be greater than zero.")
+        pixel_length = self.pixel_length
+        if not math.isfinite(pixel_length) or pixel_length <= 0:
+            raise ValueError("Manual calibration line must have a positive pixel length.")
+        return self.known_length_nm / pixel_length
+
+
+@dataclass(frozen=True)
 class ThicknessMeasurement:
     top_y_px: float
     bottom_y_px: float
@@ -558,14 +580,25 @@ def prepare_slide_item(
     fixed_scale_nm: float | None,
     auto_scale_preset: str,
     measurement_overrides: Sequence[MeasurementOverride] | None = None,
+    calibration_override: CalibrationOverride | None = None,
 ) -> SlideItem:
     with Image.open(path) as image:
         width_px, height_px = image.size
-        calibration = parse_sem_metadata(image)
+        if calibration_override is not None:
+            calibration = Calibration(
+                calibration_override.nm_per_pixel,
+                (
+                    "manual calibration: "
+                    f"{calibration_override.known_length_nm:g} nm / "
+                    f"{calibration_override.pixel_length:.1f} px"
+                ),
+            )
+        else:
+            calibration = parse_sem_metadata(image)
         if not calibration:
             raise ValueError(
                 f"No pixel calibration found for {path.name}. "
-                "This GUI version only uses calibration embedded in image metadata."
+                "Add embedded metadata or provide a manual calibration."
             )
         png_path = temp_dir / f"{index:05d}_{path.stem}.png"
         convert_image_to_png(image, png_path)
@@ -1147,7 +1180,7 @@ def build_svg(
     parts.append(
         f'  <image x="{svg_num(layout.image_x)}" y="{svg_num(layout.image_y)}" '
         f'width="{svg_num(layout.image_w)}" height="{svg_num(layout.image_h)}" '
-        f'href="{image_href}" xlink:href="{image_href}" preserveAspectRatio="none" />'
+        f'xlink:href="{image_href}" preserveAspectRatio="none" />'
     )
     add_svg_scale_bar(
         parts,
@@ -1196,6 +1229,7 @@ def generate_pptx(
     inset_y_percent: float = DEFAULTS["inset_y_percent"],
     line_width_pt: float = DEFAULTS["line_width_pt"],
     measurement_overrides: Mapping[Path, Sequence[MeasurementOverride]] | None = None,
+    calibration_overrides: Mapping[Path, CalibrationOverride] | None = None,
 ) -> list[SlideItem]:
     slide_w, slide_h = int(DEFAULT_SLIDE_W), int(DEFAULT_SLIDE_H)
     margin = int(Inches(margin_inches))
@@ -1203,6 +1237,7 @@ def generate_pptx(
     color = hex_color(bar_color)
     image_paths = find_images(input_path)
     measurement_override_map = {path_key(path): tuple(overrides) for path, overrides in (measurement_overrides or {}).items()}
+    calibration_override_map = {path_key(path): override for path, override in (calibration_overrides or {}).items()}
 
     with tempfile.TemporaryDirectory(prefix="sem_scale_ppt_") as temp:
         temp_dir = Path(temp)
@@ -1213,7 +1248,8 @@ def generate_pptx(
                 index,
                 fixed_scale_nm,
                 auto_scale_preset,
-                measurement_override_map.get(path_key(path), ()),
+                measurement_overrides=measurement_override_map.get(path_key(path), ()),
+                calibration_override=calibration_override_map.get(path_key(path)),
             )
             for index, path in enumerate(image_paths, start=1)
         ]
@@ -1248,6 +1284,7 @@ def generate_svg(
     inset_y_percent: float = DEFAULTS["inset_y_percent"],
     line_width_pt: float = DEFAULTS["line_width_pt"],
     measurement_overrides: Mapping[Path, Sequence[MeasurementOverride]] | None = None,
+    calibration_overrides: Mapping[Path, CalibrationOverride] | None = None,
 ) -> list[SlideItem]:
     page_w, page_h = DEFAULT_PAGE_W_PT, DEFAULT_PAGE_H_PT
     margin = int(round(margin_inches * POINTS_PER_INCH))
@@ -1255,6 +1292,7 @@ def generate_svg(
     color = hex_color(bar_color)
     image_paths = find_images(input_path)
     measurement_override_map = {path_key(path): tuple(overrides) for path, overrides in (measurement_overrides or {}).items()}
+    calibration_override_map = {path_key(path): override for path, override in (calibration_overrides or {}).items()}
 
     with tempfile.TemporaryDirectory(prefix="sem_scale_svg_") as temp:
         temp_dir = Path(temp)
@@ -1265,7 +1303,8 @@ def generate_svg(
                 index,
                 fixed_scale_nm,
                 auto_scale_preset,
-                measurement_override_map.get(path_key(path), ()),
+                measurement_overrides=measurement_override_map.get(path_key(path), ()),
+                calibration_override=calibration_override_map.get(path_key(path)),
             )
             for index, path in enumerate(image_paths, start=1)
         ]

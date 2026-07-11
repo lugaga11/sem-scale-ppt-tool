@@ -66,15 +66,16 @@ git status --short --branch
 - 队列表格保持 3 列：`生成`、`文件`、`测量`。
 - `生成` 控制是否导出该图；生成时只处理已勾选图片。
 - 文件队列行选择保持单选，不支持 `Ctrl` 或 `Shift` 多选。
-- `文件` 显示文件名，完整路径放在 tooltip；同名文件显示为 `文件名 [父文件夹名]`。
+- `文件` 显示文件名，完整路径和标定来源放在 tooltip；同名文件显示为 `文件名 [父文件夹名]`。
+- 导入图片时预检元数据标定；缺少标定时在文件单元格显示警告图标、行内测量编辑按钮显示红色，队列统计和生成前预检都会提示缺标定数量或文件名。
 - `测量` 列只包含行内编辑按钮；无标注时显示 `编辑`，有标注时显示 `膜厚`、`测距 2` 或 `膜厚+测距 2`。
 - 新导入图片默认 `生成=True`、无测量标注，避免表面图被误加测量对象。
-- 生成时只导出同时满足 `生成=True` 且存在会话内测量标注的图片。
+- 生成时只处理 `生成=True` 的图片；其中只有存在会话内测量标注的图片才会额外导出膜厚或测距对象。
 - 点击行内按钮会打开统一预览窗口，顶部用 `膜厚` / `测距` 作为添加和编辑工具。
 - 点击 `膜厚` 会新增或选中一条膜厚标注；自动识别只用于初始建议或 `重置选中`，切换工具本身不保存标注。
 - 膜厚和测距都走统一标注选择流程：预览始终显示所有标注，选中后可拖动、删除、清空或应用；`取消` 不写回队列状态。
 - `测距` 工具支持拖拽任意两点添加距离标注，一张图可保留多条；选中已有测距后可拖动端点调整，按住 `Shift` 可锁定到 0/45/90 度等八个方向。
-- 右键菜单提供清除选中测量标注和删除选中。
+- 右键菜单提供手动标定、恢复元数据标定、清除选中测量标注和删除选中。
 - 输出格式通过 `PPTX` / `SVG` 单选按钮选择，不使用下拉框。
 - 标尺位置支持右下、左下、右上、左上。
 - 标尺长度支持自动短/中/长，也支持固定值，例如 `1um`、`500nm`。
@@ -91,7 +92,7 @@ git status --short --branch
 ## SVG 导出约定
 
 - SVG 页面贴合图片比例，不保留 16:9 背景。
-- 图片会以 base64 PNG 形式嵌入 SVG，因此 SVG 文件通常会比 TIFF 或 PDF 更大。
+- 图片会以单份 base64 PNG 数据嵌入 SVG；不要同时在 `href` 和 `xlink:href` 重复写入完整 data URI。
 - 图片嵌入不会因为 base64 本身损失画质；画质主要取决于前面从源图片转换出的 PNG。
 - 标尺横线使用 SVG `<line>`，文字使用 `<text>`。
 - 横线应保持 `stroke-linecap="butt"`，不要改成圆角端点。
@@ -109,6 +110,11 @@ git status --short --branch
 - `Pixel Size = ... nm`
 
 内部统一按 `nm/pixel` 处理。固定标尺值由 `parse_scale_nm()` 解析，支持 `nm`、`um`、`mm` 等单位。自动标尺从 `SCALE_CANDIDATES_NM` 中选择接近目标比例的候选值。
+
+- GUI 手动标定通过在原图坐标中拖出一条已知长度线并输入实际长度，保存为 `CalibrationOverride(known_length_nm, x1, y1, x2, y2)`。
+- `CalibrationOverride.nm_per_pixel` 按 `known_length_nm / pixel_length` 计算；手动标定优先于图片元数据，同时用于横向标尺、膜厚和测距。
+- `calibration_overrides` 与 `measurement_overrides` 一样按规范化图片路径传入 PPTX/SVG 两条核心生成路径。
+- 取消手动标定时恢复元数据值；若图片没有元数据，则重新进入缺标定状态，不能生成或打开测量预览。
 
 截面厚度识别基于 SEM 图像区域的上下界面：
 
@@ -135,6 +141,7 @@ git status --short --branch
 - GUI 队列维护时，保持 `生成`、`文件`、`测量` 三列表格，不要重新增加独立 `文件夹`、`厚度状态` 或 `测距状态` 列，除非用户明确要求。
 - 测量相关批量操作应优先放在队列右键菜单，不要重新占用主界面按钮行。
 - 行内测量控件状态要和 `marked_measurement_paths()`、`measurement_overrides_for_generation()` 保持一致。
+- 文件标定图标、tooltip 和缺标定计数要与 `metadata_calibrations`、`calibration_overrides`、`calibration_overrides_for_generation()` 保持一致。
 - 核心生成函数新增参数时，要同时检查 PPTX 和 SVG 两条导出路径是否都需要支持。
 - 新增测量类型时优先扩展 `MeasurementOverride.kind` 到 `MeasurementSegment` 的转换逻辑，复用 PPTX/SVG 的通用线段绘制函数。
 - 保持 PDF 相关功能移除状态，除非明确要求恢复。
@@ -148,6 +155,7 @@ git status --short --branch
 
 ```text
 python -m compileall sem_scale_ppt.py sem_scale_ppt_gui.py
+python -m unittest discover -s tests -v
 ```
 
 涉及导出逻辑时，建议用一张示例图片分别导出 PPTX 和 SVG，重点检查：
@@ -160,6 +168,8 @@ python -m compileall sem_scale_ppt.py sem_scale_ppt_gui.py
 - 若涉及测量标注，检查只有按钮为 `已标` 的图片生成厚度或测距对象，SVG 中不应包含测量 marker 或测量 `<polygon>`。
 - 检查厚度和测距数值是否为三位小数，手动微调或拖动端点后导出数值是否随标注位置变化。
 - 检查 SVG 横向标尺仍为 `stroke-linecap="butt"`。
+- 检查每个 SVG 只包含一次 `data:image/png;base64,`，避免内嵌图片体积翻倍。
+- 用一张无标定元数据的普通 PNG 验证：未手动标定时阻止生成；应用手动标定后 PPTX/SVG 和测量预览都使用覆盖后的 `nm/pixel`。
 
 涉及 GUI 布局时，建议实际启动界面或用 Qt offscreen 检查控件层级，确认左侧队列、右侧参数和底部状态栏位置正确。
 
@@ -167,6 +177,7 @@ python -m compileall sem_scale_ppt.py sem_scale_ppt_gui.py
 
 - 导入文件夹后队列表格为 3 列。
 - 图片默认 `生成=True`、测量按钮为 `编辑`。
+- 无元数据图片显示缺标定警告且测量编辑按钮为红色；应用手动标定后按钮恢复默认/已标样式，警告和缺标定计数消失；恢复元数据标定后按原图实际状态更新。
 - 应用膜厚/测距后计数显示对应测量数量，行内按钮显示 `膜厚`、`测距 N` 或 `膜厚+测距 N`。
 - 自然排序后每张图的 `生成` / 测量摘要状态仍跟随原文件。
 - 删除选中、清空队列会正确清理对应手动厚度状态。

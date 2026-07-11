@@ -12,7 +12,7 @@ from typing import TypedDict
 
 from PIL import Image
 from PySide6.QtCore import QMimeData, QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QDrag, QImage, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtGui import QColor, QDrag, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QRadioButton,
     QSpinBox,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -44,6 +45,8 @@ from PySide6.QtWidgets import (
 )
 
 from sem_scale_ppt import (
+    Calibration,
+    CalibrationOverride,
     DEFAULTS,
     DEFAULT_MARGIN_INCHES,
     IMAGE_EXTENSIONS,
@@ -52,6 +55,7 @@ from sem_scale_ppt import (
     format_length_label,
     generate_pptx,
     generate_svg,
+    parse_scale_nm,
     parse_sem_metadata,
     path_key,
     svg_output_path,
@@ -73,6 +77,7 @@ class GenerateOptions(TypedDict):
     inset_y_percent: float
     line_width_pt: float
     measurement_overrides: dict[Path, list[MeasurementOverride]]
+    calibration_overrides: dict[Path, CalibrationOverride]
 
 
 POSITIONS = {
@@ -119,6 +124,25 @@ def label_for_value(options: dict[str, str], value: str) -> str:
         if option_value == value:
             return label
     return next(iter(options))
+
+
+def scale_input_from_nm(length_nm: float) -> str:
+    if length_nm >= 1000:
+        return f"{length_nm / 1000:g}um"
+    return f"{length_nm:g}nm"
+
+
+def qimage_from_pil(image: Image.Image) -> QImage:
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    image_bytes = rgb.tobytes()
+    return QImage(
+        image_bytes,
+        width,
+        height,
+        width * 3,
+        QImage.Format.Format_RGB888,
+    ).copy()
 
 
 class FileQueueWidget(QTableWidget):
@@ -396,6 +420,10 @@ class MeasurementCellWidget(QWidget):
         self.default_button_palette = QPalette(self.edit_button.palette())
         self.marked_button_palette = QPalette(self.default_button_palette)
         self.marked_button_palette.setColor(QPalette.ColorRole.Button, QColor("#DDF3E3"))
+        self.missing_calibration_button_palette = QPalette(self.default_button_palette)
+        self.missing_calibration_button_palette.setColor(QPalette.ColorRole.Button, QColor("#F3DDDD"))
+        self.summary = "编辑"
+        self.calibration_available = True
         self.edit_button.setFixedWidth(self.edit_button.sizeHint().width())
 
         layout = QHBoxLayout(self)
@@ -406,11 +434,28 @@ class MeasurementCellWidget(QWidget):
         self.edit_button.clicked.connect(lambda: self.edit_requested.emit(self))
 
     def set_summary(self, summary: str) -> None:
-        marked = summary != "编辑"
+        self.summary = summary
         self.edit_button.setText(summary)
-        self.edit_button.setStyleSheet("")
-        self.edit_button.setAutoFillBackground(False)
-        self.edit_button.setPalette(self.marked_button_palette if marked else self.default_button_palette)
+        self.update_button_style()
+
+    def set_calibration_available(self, available: bool) -> None:
+        self.calibration_available = available
+        self.update_button_style()
+
+    def update_button_style(self) -> None:
+        if not self.calibration_available:
+            self.edit_button.setStyleSheet("")
+            self.edit_button.setAutoFillBackground(False)
+            self.edit_button.setPalette(self.missing_calibration_button_palette)
+            self.edit_button.setToolTip(
+                "缺少可用的像素标定；请右键该图片选择“手动标定…”后再编辑测量标注"
+            )
+        else:
+            marked = self.summary != "编辑"
+            self.edit_button.setStyleSheet("")
+            self.edit_button.setAutoFillBackground(False)
+            self.edit_button.setPalette(self.marked_button_palette if marked else self.default_button_palette)
+            self.edit_button.setToolTip("编辑测膜厚和测距标注；已标状态会在生成时自动导出")
         self.edit_button.update()
 
     def set_marked(self, marked: bool) -> None:
@@ -429,12 +474,17 @@ class MeasurementPreviewWidget(QWidget):
         nm_per_pixel: float,
         annotations: list[MeasurementOverride],
         auto_thickness: MeasurementOverride | None,
+        *,
+        distance_label_mode: str = "length",
+        single_distance: bool = False,
     ) -> None:
         super().__init__()
         self.pixmap = QPixmap.fromImage(qimage)
         self.image_w = qimage.width()
         self.image_h = qimage.height()
         self.nm_per_pixel = nm_per_pixel
+        self.distance_label_mode = distance_label_mode
+        self.single_distance = single_distance
         self.annotations = [
             annotation
             for annotation in (self.clamped_annotation(annotation) for annotation in annotations)
@@ -715,6 +765,8 @@ class MeasurementPreviewWidget(QWidget):
 
     def measurement_label(self, annotation: MeasurementOverride) -> str:
         length_px = math.hypot(annotation.x2_px - annotation.x1_px, annotation.y2_px - annotation.y1_px)
+        if self.distance_label_mode == "pixels":
+            return f"{length_px:.1f} px"
         return format_length_label(length_px * self.nm_per_pixel)
 
     def draw_endpoint_handle(self, painter: QPainter, point: QPointF, color: QColor, selected: bool) -> None:
@@ -955,16 +1007,19 @@ class MeasurementPreviewWidget(QWidget):
                 self.creating_end[1] - self.creating_start[1],
             )
             if length_px >= 3:
-                self.annotations.append(
-                    MeasurementOverride(
-                        kind="distance",
-                        x1_px=self.creating_start[0],
-                        y1_px=self.creating_start[1],
-                        x2_px=self.creating_end[0],
-                        y2_px=self.creating_end[1],
-                    )
+                annotation = MeasurementOverride(
+                    kind="distance",
+                    x1_px=self.creating_start[0],
+                    y1_px=self.creating_start[1],
+                    x2_px=self.creating_end[0],
+                    y2_px=self.creating_end[1],
                 )
-                self.selected_index = len(self.annotations) - 1
+                if self.single_distance:
+                    self.annotations = [annotation]
+                    self.selected_index = 0
+                else:
+                    self.annotations.append(annotation)
+                    self.selected_index = len(self.annotations) - 1
                 self.annotations_changed.emit()
                 self.selection_changed.emit()
             self.update()
@@ -1007,6 +1062,12 @@ class MeasurementPreviewWidget(QWidget):
 
     def info_text(self) -> str:
         annotation = self.selected_annotation()
+        if self.distance_label_mode == "pixels":
+            if annotation is None and self.annotations:
+                annotation = self.annotations[0]
+            if annotation is not None:
+                return f"标定线长度：{self.measurement_label(annotation)}；拖动端点可微调"
+            return "在图像中的已知长度上拖出一条标定线；按住 Shift 可锁定方向"
         thickness_count = 1 if self.thickness_index() >= 0 else 0
         distance_count = self.distance_count()
         if annotation and annotation.kind == "thickness":
@@ -1029,12 +1090,176 @@ class MeasurementPreviewWidget(QWidget):
         self.clamp_pan()
 
 
+class CalibrationDialog(QDialog):
+    def __init__(
+        self,
+        path: Path,
+        existing_override: CalibrationOverride | None,
+        metadata_calibration: Calibration | None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.path = path
+        self._result: CalibrationOverride | None = None
+        self.setWindowTitle(f"手动标定 - {path.name}")
+        self.resize(900, 680)
+
+        with Image.open(path) as image:
+            qimage = qimage_from_pil(image)
+
+        annotations = []
+        if existing_override is not None:
+            annotations.append(
+                MeasurementOverride(
+                    kind="distance",
+                    x1_px=existing_override.x1_px,
+                    y1_px=existing_override.y1_px,
+                    x2_px=existing_override.x2_px,
+                    y2_px=existing_override.y2_px,
+                )
+            )
+
+        layout = QVBoxLayout(self)
+        source_text = (
+            f"元数据标定：{metadata_calibration.nm_per_pixel:g} nm/px（{metadata_calibration.source}）"
+            if metadata_calibration is not None
+            else "元数据标定：未检测到"
+        )
+        source_label = QLabel(source_text)
+        source_label.setWordWrap(True)
+        layout.addWidget(source_label)
+
+        instruction = QLabel(
+            "在图中沿一段已知实际长度拖出标定线，再输入该长度，例如 1um 或 500nm。"
+            "新标定会优先于图片元数据，并同时用于标尺和所有测量值。"
+        )
+        instruction.setWordWrap(True)
+        layout.addWidget(instruction)
+
+        self.preview = MeasurementPreviewWidget(
+            qimage,
+            1.0,
+            annotations,
+            None,
+            distance_label_mode="pixels",
+            single_distance=True,
+        )
+        self.preview.use_distance_tool()
+        if annotations:
+            self.preview.select_annotation(0)
+        self.preview.annotations_changed.connect(self.update_info)
+        self.preview.selection_changed.connect(self.update_info)
+        self.preview.zoom_changed.connect(self.update_zoom_label)
+        layout.addWidget(self.preview, stretch=1)
+
+        preview_info_row = QHBoxLayout()
+        self.info_label = QLabel()
+        self.zoom_label = QLabel()
+        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        reset_zoom_button = QPushButton("重置缩放")
+        reset_zoom_button.clicked.connect(self.preview.reset_zoom)
+        preview_info_row.addWidget(self.info_label, stretch=1)
+        preview_info_row.addWidget(self.zoom_label)
+        preview_info_row.addWidget(reset_zoom_button)
+        layout.addLayout(preview_info_row)
+
+        form = QFormLayout()
+        self.known_length_edit = QLineEdit(
+            scale_input_from_nm(existing_override.known_length_nm) if existing_override else "1um"
+        )
+        self.pixel_length_label = QLabel("未绘制")
+        self.calibration_result_label = QLabel("等待标定线")
+        form.addRow("已知实际长度", self.known_length_edit)
+        form.addRow("标定线像素长度", self.pixel_length_label)
+        form.addRow("计算结果", self.calibration_result_label)
+        layout.addLayout(form)
+
+        button_row = QHBoxLayout()
+        clear_button = QPushButton("清除标定线")
+        clear_button.clicked.connect(self.preview.clear_annotations)
+        self.apply_button = QPushButton("应用标定")
+        self.apply_button.clicked.connect(self.accept)
+        cancel_button = QPushButton("取消")
+        cancel_button.clicked.connect(self.reject)
+        button_row.addWidget(clear_button)
+        button_row.addStretch()
+        button_row.addWidget(self.apply_button)
+        button_row.addWidget(cancel_button)
+        layout.addLayout(button_row)
+
+        self.known_length_edit.textChanged.connect(self.update_info)
+        self.update_zoom_label(self.preview.zoom_factor)
+        self.update_info()
+
+    def distance_annotation(self) -> MeasurementOverride | None:
+        for annotation in self.preview.annotations:
+            if annotation.kind == "distance":
+                return annotation
+        return None
+
+    def calculated_override(self) -> CalibrationOverride:
+        annotation = self.distance_annotation()
+        if annotation is None:
+            raise ValueError("请先在图像上拖出一条已知长度的标定线。")
+        known_length_nm = parse_scale_nm(self.known_length_edit.text().strip())
+        if not math.isfinite(known_length_nm) or known_length_nm <= 0:
+            raise ValueError("已知实际长度必须大于 0，例如 1um 或 500nm。")
+        result = CalibrationOverride(
+            known_length_nm=known_length_nm,
+            x1_px=annotation.x1_px,
+            y1_px=annotation.y1_px,
+            x2_px=annotation.x2_px,
+            y2_px=annotation.y2_px,
+        )
+        _ = result.nm_per_pixel
+        return result
+
+    def update_zoom_label(self, zoom_factor: float) -> None:
+        self.zoom_label.setText(f"{zoom_factor * 100:.0f}%")
+
+    def update_info(self, *_args) -> None:
+        self.info_label.setText(self.preview.info_text())
+        annotation = self.distance_annotation()
+        if annotation is None:
+            self.pixel_length_label.setText("未绘制")
+            self.calibration_result_label.setText("等待标定线")
+            self.apply_button.setEnabled(False)
+            return
+        pixel_length = math.hypot(
+            annotation.x2_px - annotation.x1_px,
+            annotation.y2_px - annotation.y1_px,
+        )
+        self.pixel_length_label.setText(f"{pixel_length:.3f} px")
+        try:
+            result = self.calculated_override()
+        except ValueError as exc:
+            self.calibration_result_label.setText(str(exc))
+            self.apply_button.setEnabled(False)
+        else:
+            self.calibration_result_label.setText(f"{result.nm_per_pixel:.9g} nm/px")
+            self.apply_button.setEnabled(True)
+
+    def accept(self) -> None:
+        try:
+            self._result = self.calculated_override()
+        except ValueError as exc:
+            QMessageBox.warning(self, "标定参数错误", str(exc))
+            return
+        super().accept()
+
+    def result_calibration_override(self) -> CalibrationOverride:
+        if self._result is None:
+            raise ValueError("Manual calibration dialog was not accepted.")
+        return self._result
+
+
 class MeasurementPreviewDialog(QDialog):
     def __init__(
         self,
         path: Path,
         measurement_overrides: list[MeasurementOverride],
         parent: QWidget | None = None,
+        calibration: Calibration | None = None,
     ) -> None:
         super().__init__(parent)
         self.path = path
@@ -1043,20 +1268,12 @@ class MeasurementPreviewDialog(QDialog):
 
         with Image.open(path) as image:
             self.image_w, self.image_h = image.size
-            calibration = parse_sem_metadata(image)
-            if calibration is None:
+            selected_calibration = calibration or parse_sem_metadata(image)
+            if selected_calibration is None:
                 raise ValueError(f"没有在 {path.name} 中找到像素标定信息。")
-            self.nm_per_pixel = calibration.nm_per_pixel
-            auto_measurement = detect_thickness_measurement(image, calibration)
-            rgb = image.convert("RGB")
-            self._image_bytes = rgb.tobytes()
-            qimage = QImage(
-                self._image_bytes,
-                self.image_w,
-                self.image_h,
-                self.image_w * 3,
-                QImage.Format.Format_RGB888,
-            ).copy()
+            self.nm_per_pixel = selected_calibration.nm_per_pixel
+            auto_measurement = detect_thickness_measurement(image, selected_calibration)
+            qimage = qimage_from_pil(image)
 
         self.auto_measurement = auto_measurement
         auto_thickness = (
@@ -1204,6 +1421,7 @@ class GeneratorWorker(QObject):
                     inset_y_percent=self.options["inset_y_percent"],
                     line_width_pt=self.options["line_width_pt"],
                     measurement_overrides=self.options["measurement_overrides"],
+                    calibration_overrides=self.options["calibration_overrides"],
                 )
                 total = len(items)
                 output_paths = [
@@ -1225,6 +1443,7 @@ class GeneratorWorker(QObject):
                     inset_y_percent=self.options["inset_y_percent"],
                     line_width_pt=self.options["line_width_pt"],
                     measurement_overrides=self.options["measurement_overrides"],
+                    calibration_overrides=self.options["calibration_overrides"],
                 )
                 output_paths = [self.options["output_path"]]
             if len(output_paths) == 1:
@@ -1236,7 +1455,7 @@ class GeneratorWorker(QObject):
             for item in items:
                 self.log.emit(
                     f"{item.source_path.name}: {item.calibration.nm_per_pixel:g} nm/px, "
-                    f"标尺 {item.label} = {item.scale_px:.1f} px"
+                    f"标尺 {item.label} = {item.scale_px:.1f} px，标定来源 {item.calibration.source}"
                 )
                 distance_index = 0
                 for measurement in item.measurements:
@@ -1260,6 +1479,9 @@ class MainWindow(QMainWindow):
         self.thread: QThread | None = None
         self.worker: GeneratorWorker | None = None
         self.measurement_overrides: dict[str, list[MeasurementOverride]] = {}
+        self.calibration_overrides: dict[str, CalibrationOverride] = {}
+        self.metadata_calibrations: dict[str, Calibration | None] = {}
+        self.calibration_errors: dict[str, str] = {}
         self.setWindowTitle("SEM 标尺 PPT 生成器")
         self.resize(DEFAULTS["window_width"], DEFAULTS["window_height"])
         self._build_ui()
@@ -1475,6 +1697,64 @@ class MainWindow(QMainWindow):
             self.refresh_item_labels()
             self.update_count()
 
+    def inspect_metadata_calibration(self, path: Path, force: bool = False) -> None:
+        key = path_key(path)
+        if not force and key in self.metadata_calibrations:
+            return
+        try:
+            with Image.open(path) as image:
+                calibration = parse_sem_metadata(image)
+        except Exception as exc:
+            calibration = None
+            self.calibration_errors[key] = str(exc)
+        else:
+            self.calibration_errors.pop(key, None)
+        self.metadata_calibrations[key] = calibration
+
+    def effective_calibration(self, path: Path) -> Calibration | None:
+        key = path_key(path)
+        override = self.calibration_overrides.get(key)
+        if override is not None:
+            return Calibration(
+                override.nm_per_pixel,
+                f"手动标定：{override.known_length_nm:g} nm / {override.pixel_length:.1f} px",
+            )
+        self.inspect_metadata_calibration(path)
+        return self.metadata_calibrations.get(key)
+
+    def missing_calibration_paths(self, paths: list[Path]) -> list[Path]:
+        return [path for path in paths if self.effective_calibration(path) is None]
+
+    def update_file_calibration_status(self, row: int) -> None:
+        if row < 0 or row >= self.file_list.rowCount():
+            return
+        item = self.file_list.item(row, COL_NAME)
+        if item is None:
+            return
+        path = self.item_path(row)
+        key = path_key(path)
+        override = self.calibration_overrides.get(key)
+        calibration = self.effective_calibration(path)
+        measurement_cell = self.measurement_cell(row)
+        if measurement_cell is not None:
+            measurement_cell.set_calibration_available(calibration is not None)
+        if override is not None:
+            status = (
+                f"手动标定：{override.nm_per_pixel:.9g} nm/px\n"
+                f"已知长度：{scale_input_from_nm(override.known_length_nm)}\n"
+                f"标定线：{override.pixel_length:.3f} px"
+            )
+            item.setIcon(QIcon())
+        elif calibration is not None:
+            status = f"元数据标定：{calibration.nm_per_pixel:g} nm/px\n来源：{calibration.source}"
+            item.setIcon(QIcon())
+        else:
+            error = self.calibration_errors.get(key)
+            detail = f"\n读取错误：{error}" if error else ""
+            status = f"未检测到像素标定。请右键此图片选择“手动标定…”{detail}"
+            item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning))
+        item.setToolTip(f"{path}\n\n{status}")
+
     def checkbox_item(self, checked: bool) -> QTableWidgetItem:
         item = QTableWidgetItem()
         item.setFlags(
@@ -1494,6 +1774,7 @@ class MainWindow(QMainWindow):
         return item
 
     def add_queue_row(self, path: Path, generate: bool) -> None:
+        self.inspect_metadata_calibration(path)
         row = self.file_list.rowCount()
         was_blocked = self.file_list.blockSignals(True)
         try:
@@ -1506,6 +1787,7 @@ class MainWindow(QMainWindow):
         finally:
             self.file_list.blockSignals(was_blocked)
         self.update_measurement_status(row)
+        self.update_file_calibration_status(row)
 
     def item_path(self, row: int) -> Path:
         item = self.file_list.item(row, COL_NAME)
@@ -1591,7 +1873,7 @@ class MainWindow(QMainWindow):
                 if name_counts.get(path.name.lower(), 0) > 1:
                     display_name = f"{path.name} [{path.parent.name or path.parent}]"
                 name_item.setText(display_name)
-                name_item.setToolTip(str(path))
+                self.update_file_calibration_status(row)
 
     def update_count(self, *_args) -> None:
         total = self.file_list.rowCount()
@@ -1604,7 +1886,12 @@ class MainWindow(QMainWindow):
         ]
         thickness = sum(1 for annotation in marked_annotations if annotation.kind == "thickness")
         distance = sum(1 for annotation in marked_annotations if annotation.kind == "distance")
-        self.count_label.setText(f"生成 {selected} / 共 {total}，已标 {measurement}，膜厚 {thickness}，测距 {distance}")
+        missing_calibration = len(self.missing_calibration_paths(self.checked_paths()))
+        missing_text = f"，缺标定 {missing_calibration}" if missing_calibration else ""
+        self.count_label.setText(
+            f"生成 {selected} / 共 {total}，已标 {measurement}，"
+            f"膜厚 {thickness}，测距 {distance}{missing_text}"
+        )
 
     def on_queue_item_changed(self, item: QTableWidgetItem) -> None:
         self.update_count()
@@ -1620,16 +1907,27 @@ class MainWindow(QMainWindow):
             self.file_list.selectRow(row)
 
         menu = QMenu(self)
+        manual_calibration_action = menu.addAction("手动标定…")
+        restore_metadata_action = menu.addAction("恢复元数据标定")
+        menu.addSeparator()
         clear_measurement_action = menu.addAction("清除选中测量标注")
         menu.addSeparator()
         remove_action = menu.addAction("删除选中")
 
-        has_selection = bool(self.selected_rows())
+        selected_rows = self.selected_rows()
+        has_selection = bool(selected_rows)
+        selected_key = path_key(self.item_path(selected_rows[0])) if len(selected_rows) == 1 else ""
+        manual_calibration_action.setEnabled(len(selected_rows) == 1)
+        restore_metadata_action.setEnabled(bool(selected_key) and selected_key in self.calibration_overrides)
         clear_measurement_action.setEnabled(has_selection)
         remove_action.setEnabled(has_selection)
 
         action = menu.exec(self.file_list.viewport().mapToGlobal(position))
-        if action == clear_measurement_action:
+        if action == manual_calibration_action:
+            self.calibrate_selected()
+        elif action == restore_metadata_action:
+            self.clear_selected_manual_calibrations()
+        elif action == clear_measurement_action:
             self.clear_selected_measurements()
         elif action == remove_action:
             self.remove_selected()
@@ -1638,6 +1936,9 @@ class MainWindow(QMainWindow):
         for row in self.selected_rows():
             key = path_key(self.item_path(row))
             self.measurement_overrides.pop(key, None)
+            self.calibration_overrides.pop(key, None)
+            self.metadata_calibrations.pop(key, None)
+            self.calibration_errors.pop(key, None)
         for row in self.selected_rows():
             self.file_list.removeRow(row)
         self.refresh_item_labels()
@@ -1692,6 +1993,9 @@ class MainWindow(QMainWindow):
     def clear_queue(self) -> None:
         self.file_list.setRowCount(0)
         self.measurement_overrides.clear()
+        self.calibration_overrides.clear()
+        self.metadata_calibrations.clear()
+        self.calibration_errors.clear()
         self.file_list.setHorizontalHeaderLabels(["生成", "文件", "测量"])
         self.update_count()
 
@@ -1712,12 +2016,51 @@ class MainWindow(QMainWindow):
             self.update_measurement_status(row)
         self.update_count()
 
+    def calibrate_selected(self) -> None:
+        selected_rows = list(reversed(self.selected_rows()))
+        if len(selected_rows) != 1:
+            QMessageBox.warning(self, "选择图片", "请在队列中选择一张需要手动标定的图片。")
+            return
+        row = selected_rows[0]
+        path = self.item_path(row)
+        key = path_key(path)
+        self.inspect_metadata_calibration(path)
+        try:
+            dialog = CalibrationDialog(
+                path,
+                self.calibration_overrides.get(key),
+                self.metadata_calibrations.get(key),
+                self,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "无法手动标定", str(exc))
+            return
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.calibration_overrides[key] = dialog.result_calibration_override()
+            self.update_file_calibration_status(row)
+            self.update_count()
+
+    def clear_selected_manual_calibrations(self) -> None:
+        for row in self.selected_rows():
+            key = path_key(self.item_path(row))
+            self.calibration_overrides.pop(key, None)
+            self.update_file_calibration_status(row)
+        self.update_count()
+
     def measurement_overrides_for_generation(self) -> dict[Path, list[MeasurementOverride]]:
         overrides: dict[Path, list[MeasurementOverride]] = {}
         for path in self.marked_measurement_paths():
             annotations = self.measurement_overrides.get(path_key(path))
             if annotations:
                 overrides[path] = list(annotations)
+        return overrides
+
+    def calibration_overrides_for_generation(self) -> dict[Path, CalibrationOverride]:
+        overrides: dict[Path, CalibrationOverride] = {}
+        for path in self.checked_paths():
+            override = self.calibration_overrides.get(path_key(path))
+            if override is not None:
+                overrides[path] = override
         return overrides
 
     def preview_selected_measurement(self, row: int | None = None) -> None:
@@ -1729,11 +2072,21 @@ class MainWindow(QMainWindow):
             row = selected_rows[0]
         path = self.item_path(row)
         key = path_key(path)
+        calibration = self.effective_calibration(path)
+        if calibration is None:
+            QMessageBox.warning(
+                self,
+                "缺少像素标定",
+                f"{path.name} 没有可用的像素标定。\n\n"
+                "请在队列中右键该图片，选择“手动标定…”。",
+            )
+            return
         try:
             dialog = MeasurementPreviewDialog(
                 path,
                 self.measurement_overrides.get(key, []),
-                self,
+                parent=self,
+                calibration=calibration,
             )
         except Exception as exc:
             QMessageBox.warning(self, "无法编辑测量", str(exc))
@@ -1756,7 +2109,18 @@ class MainWindow(QMainWindow):
             input_paths = self.checked_paths()
             if not input_paths:
                 raise ValueError("请至少添加并勾选一张 SEM 图片。")
+            missing_calibration = self.missing_calibration_paths(input_paths)
+            if missing_calibration:
+                names = "\n".join(f"- {path.name}" for path in missing_calibration[:8])
+                remaining = len(missing_calibration) - 8
+                if remaining > 0:
+                    names += f"\n- 另有 {remaining} 张"
+                raise ValueError(
+                    "以下图片缺少像素标定，无法计算标尺：\n"
+                    f"{names}\n\n请在队列中右键图片，选择“手动标定…”。"
+                )
             measurement_overrides = self.measurement_overrides_for_generation()
+            calibration_overrides = self.calibration_overrides_for_generation()
             output_format = self.current_output_format()
             suffix = f".{output_format}"
             output_text = self.output_edit.text().strip()
@@ -1786,6 +2150,7 @@ class MainWindow(QMainWindow):
                 "inset_y_percent": float(self.inset_y_spin.value()),
                 "line_width_pt": float(self.line_width_spin.value()),
                 "measurement_overrides": measurement_overrides,
+                "calibration_overrides": calibration_overrides,
             }
         except Exception as exc:
             QMessageBox.warning(self, "参数错误", str(exc))

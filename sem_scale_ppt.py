@@ -63,21 +63,7 @@ AUTO_SCALE_PRESETS = {
     "long": (0.32, 0.22, 0.45),
 }
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
-SCALE_CANDIDATES_NM = [
-    10,
-    20,
-    50,
-    100,
-    200,
-    500,
-    1000,
-    2000,
-    5000,
-    10000,
-    20000,
-    50000,
-    100000,
-]
+SCALE_SERIES = (1.0, 2.0, 5.0)
 UNIT_TO_NM = {
     "fm": 1e-6,
     "pm": 1e-3,
@@ -268,12 +254,26 @@ def parse_scale_nm(value: str) -> float:
 
 
 def format_scale_label(scale_nm: float) -> str:
-    if scale_nm >= 1000:
+    if not math.isfinite(scale_nm) or scale_nm <= 0:
+        raise ValueError("Scale length must be a positive finite value.")
+    if scale_nm >= 1_000_000_000:
+        value = scale_nm / 1_000_000_000.0
+        unit = "m"
+    elif scale_nm >= 1_000_000:
+        value = scale_nm / 1_000_000.0
+        unit = "mm"
+    elif scale_nm >= 1000:
         value = scale_nm / 1000.0
         unit = "\u03bcm"
-    else:
+    elif scale_nm >= 1:
         value = scale_nm
         unit = "nm"
+    elif scale_nm >= 1e-3:
+        value = scale_nm / 1e-3
+        unit = "pm"
+    else:
+        value = scale_nm / 1e-6
+        unit = "fm"
     number = str(int(round(value))) if abs(value - round(value)) < 1e-9 else f"{value:g}"
     return f"{number} {unit}"
 
@@ -514,18 +514,47 @@ def measurement_segment_from_override(
     )
 
 
+def dynamic_scale_candidates_nm(target_nm: float) -> list[float]:
+    if not math.isfinite(target_nm) or target_nm <= 0:
+        raise ValueError("Target scale length must be a positive finite value.")
+    center_exponent = math.floor(math.log10(target_nm))
+    candidates: set[float] = set()
+    for exponent in range(center_exponent - 2, center_exponent + 3):
+        try:
+            base = 10.0**exponent
+        except OverflowError:
+            continue
+        for factor in SCALE_SERIES:
+            candidate = factor * base
+            if math.isfinite(candidate) and candidate > 0:
+                candidates.add(candidate)
+    if not candidates:
+        raise ValueError("Unable to generate automatic scale candidates.")
+    return sorted(candidates)
+
+
 def choose_scale_nm(
     width_px: int,
     nm_per_pixel: float,
     fixed_scale_nm: float | None,
     auto_scale_preset: str,
 ) -> float:
-    if fixed_scale_nm:
+    if width_px <= 0:
+        raise ValueError("Image width must be greater than zero.")
+    if not math.isfinite(nm_per_pixel) or nm_per_pixel <= 0:
+        raise ValueError("Pixel calibration must be a positive finite value.")
+    if fixed_scale_nm is not None:
+        if not math.isfinite(fixed_scale_nm) or fixed_scale_nm <= 0:
+            raise ValueError("Fixed scale length must be a positive finite value.")
         return fixed_scale_nm
     target, minimum, maximum = AUTO_SCALE_PRESETS.get(auto_scale_preset, AUTO_SCALE_PRESETS["medium"])
+    image_width_nm = width_px * nm_per_pixel
+    if not math.isfinite(image_width_nm) or image_width_nm <= 0:
+        raise ValueError("Calibrated image width must be a positive finite value.")
+    target_nm = image_width_nm * target
     scored: list[tuple[int, float, float]] = []
-    for candidate in SCALE_CANDIDATES_NM:
-        fraction = (candidate / nm_per_pixel) / width_px
+    for candidate in dynamic_scale_candidates_nm(target_nm):
+        fraction = candidate / image_width_nm
         in_range = minimum <= fraction <= maximum
         scored.append((0 if in_range else 1, abs(fraction - target), candidate))
     return min(scored, key=lambda item: (item[0], item[1]))[2]

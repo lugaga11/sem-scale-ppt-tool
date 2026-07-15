@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -12,15 +14,39 @@ from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import QApplication
 
 from sem_scale_ppt import (
+    Calibration,
     CalibrationOverride,
+    choose_scale_nm,
+    dynamic_scale_candidates_nm,
+    format_scale_label,
     generate_pptx,
     generate_svg,
     path_key,
 )
-from sem_scale_ppt_gui import CalibrationDialog, MainWindow
+from sem_scale_ppt_gui import CalibrationDialog, MainWindow, MeasurementPreviewDialog
 
 
 class ManualCalibrationCoreTests(unittest.TestCase):
+    def test_dynamic_scale_candidates_cover_extreme_calibrations(self) -> None:
+        width_px = 1024
+        for nm_per_pixel in (1e-9, 1.0, 1e6):
+            chosen_nm = choose_scale_nm(width_px, nm_per_pixel, None, "medium")
+            fraction = chosen_nm / nm_per_pixel / width_px
+            self.assertGreaterEqual(fraction, 0.12)
+            self.assertLessEqual(fraction, 0.20)
+            exponent = math.floor(math.log10(chosen_nm))
+            mantissa = chosen_nm / (10.0**exponent)
+            self.assertTrue(any(math.isclose(mantissa, value) for value in (1.0, 2.0, 5.0)))
+
+    def test_dynamic_scale_candidates_and_labels_use_engineering_units(self) -> None:
+        candidates = dynamic_scale_candidates_nm(163.84)
+        self.assertIn(100.0, candidates)
+        self.assertIn(200.0, candidates)
+        self.assertEqual(format_scale_label(500), "500 nm")
+        self.assertEqual(format_scale_label(2000), "2 μm")
+        self.assertEqual(format_scale_label(2_000_000), "2 mm")
+        self.assertEqual(format_scale_label(500_000_000_000), "500 m")
+
     def test_manual_calibration_drives_both_exports_and_svg_embeds_image_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -137,6 +163,30 @@ class ManualCalibrationGuiTests(unittest.TestCase):
                 self.assertTrue(dialog.apply_button.isEnabled())
             finally:
                 dialog.close()
+
+    def test_thickness_detection_is_lazy_and_runs_only_on_first_click(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "plain.png"
+            Image.new("RGB", (200, 100), (60, 60, 60)).save(source)
+            with patch("sem_scale_ppt_gui.detect_thickness_measurement", return_value=None) as detect:
+                dialog = MeasurementPreviewDialog(
+                    source,
+                    [],
+                    calibration=Calibration(1.0, "test calibration"),
+                )
+                try:
+                    detect.assert_not_called()
+                    self.assertFalse(dialog.auto_detection_attempted)
+
+                    dialog.on_thickness_tool_clicked()
+                    detect.assert_called_once()
+                    self.assertTrue(dialog.auto_detection_attempted)
+                    self.assertGreaterEqual(dialog.preview.thickness_index(), 0)
+
+                    dialog.on_thickness_tool_clicked()
+                    detect.assert_called_once()
+                finally:
+                    dialog.close()
 
 
 if __name__ == "__main__":

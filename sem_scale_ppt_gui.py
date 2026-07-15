@@ -1271,28 +1271,19 @@ class MeasurementPreviewDialog(QDialog):
             selected_calibration = calibration or parse_sem_metadata(image)
             if selected_calibration is None:
                 raise ValueError(f"没有在 {path.name} 中找到像素标定信息。")
+            self.calibration = selected_calibration
             self.nm_per_pixel = selected_calibration.nm_per_pixel
-            auto_measurement = detect_thickness_measurement(image, selected_calibration)
             qimage = qimage_from_pil(image)
 
-        self.auto_measurement = auto_measurement
-        auto_thickness = (
-            MeasurementOverride(
-                kind="thickness",
-                x1_px=auto_measurement.x_center_px,
-                y1_px=auto_measurement.top_y_px,
-                x2_px=auto_measurement.x_center_px,
-                y2_px=auto_measurement.bottom_y_px,
-            )
-            if auto_measurement
-            else None
-        )
+        self.auto_detection_attempted = False
+        self.auto_measurement = None
 
         layout = QVBoxLayout(self)
         tool_row = QHBoxLayout()
         tool_row.addWidget(QLabel("添加/编辑"))
         self.thickness_tool_button = QPushButton("膜厚")
         self.thickness_tool_button.setCheckable(True)
+        self.thickness_tool_button.setToolTip("首次点击时运行自动膜厚识别并给出初始建议")
         self.distance_tool_button = QPushButton("测距")
         self.distance_tool_button.setCheckable(True)
         self.tool_group = QButtonGroup(self)
@@ -1308,7 +1299,7 @@ class MeasurementPreviewDialog(QDialog):
             qimage,
             self.nm_per_pixel,
             list(measurement_overrides),
-            auto_thickness,
+            None,
         )
         self.preview.annotations_changed.connect(self.update_info)
         self.preview.selection_changed.connect(self.update_info)
@@ -1373,7 +1364,42 @@ class MeasurementPreviewDialog(QDialog):
         self.info_label.setText(self.preview.info_text())
         self.update_mode_controls()
 
+    def ensure_auto_thickness(self) -> None:
+        if self.auto_detection_attempted:
+            return
+        self.thickness_tool_button.setEnabled(False)
+        self.info_label.setText("正在自动识别膜厚界面…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        try:
+            with Image.open(self.path) as image:
+                auto_measurement = detect_thickness_measurement(image, self.calibration)
+        except Exception as exc:
+            QMessageBox.warning(self, "膜厚识别失败", str(exc))
+            self.thickness_tool_button.setToolTip("自动识别失败；再次点击可重试")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.thickness_tool_button.setEnabled(True)
+
+        self.auto_detection_attempted = True
+        self.auto_measurement = auto_measurement
+        if auto_measurement is None:
+            self.preview.auto_thickness = None
+            self.thickness_tool_button.setToolTip("未识别到清晰界面；使用默认膜厚建议位置")
+            return
+        auto_thickness = MeasurementOverride(
+            kind="thickness",
+            x1_px=auto_measurement.x_center_px,
+            y1_px=auto_measurement.top_y_px,
+            x2_px=auto_measurement.x_center_px,
+            y2_px=auto_measurement.bottom_y_px,
+        )
+        self.preview.auto_thickness = self.preview.clamped_annotation(auto_thickness)
+        self.thickness_tool_button.setToolTip("已加载自动膜厚建议；可拖动界面线继续调整")
+
     def on_thickness_tool_clicked(self) -> None:
+        self.ensure_auto_thickness()
         self.preview.add_or_select_thickness()
         self.update_tool_buttons(self.preview.current_tool)
         self.update_info()

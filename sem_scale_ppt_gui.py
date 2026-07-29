@@ -51,14 +51,18 @@ from sem_scale_ppt import (
     DEFAULT_MARGIN_INCHES,
     IMAGE_EXTENSIONS,
     MeasurementOverride,
+    choose_scale_nm,
     detect_thickness_measurement,
     format_length_label,
     generate_pptx,
     generate_svg,
+    image_to_display_grayscale,
+    is_high_bit_grayscale,
     parse_scale_nm,
     parse_sem_metadata,
     path_key,
     svg_output_path,
+    validate_generation_options,
 )
 
 
@@ -133,7 +137,10 @@ def scale_input_from_nm(length_nm: float) -> str:
 
 
 def qimage_from_pil(image: Image.Image) -> QImage:
-    rgb = image.convert("RGB")
+    if is_high_bit_grayscale(image):
+        rgb = image_to_display_grayscale(image).convert("RGB")
+    else:
+        rgb = image.convert("RGB")
     width, height = rgb.size
     image_bytes = rgb.tobytes()
     return QImage(
@@ -495,14 +502,26 @@ class MeasurementPreviewWidget(QWidget):
         self.selected_index = -1
         self.dragging_thickness: str | None = None
         self.dragging_distance: tuple[int, str] | None = None
+        self.dragging_whole: tuple[int, float, float, MeasurementOverride] | None = None
+        self.drag_history_recorded = False
         self.creating_start: tuple[float, float] | None = None
         self.creating_end: tuple[float, float] | None = None
+        self.undo_stack: list[tuple[list[MeasurementOverride], int, str]] = []
+        self.redo_stack: list[tuple[list[MeasurementOverride], int, str]] = []
+        self.history_limit = 100
         self.zoom_factor = 1.0
         self.max_zoom_factor = 10.0
         self.pan_x = 0.0
         self.pan_y = 0.0
+        self.panning = False
+        self.pan_last_pos: QPointF | None = None
         self.setMinimumSize(640, 420)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
+        self.setToolTip(
+            "拖动线段整体移动；Ctrl+Z 撤销，Ctrl+Y/Ctrl+Shift+Z 重做；"
+            "Delete 删除选中；Esc 取消绘制；Ctrl+滚轮缩放；放大后按住鼠标中键平移"
+        )
 
     def clamped_annotation(self, annotation: MeasurementOverride | None) -> MeasurementOverride | None:
         if annotation is None:
@@ -554,6 +573,60 @@ class MeasurementPreviewWidget(QWidget):
     def has_annotations(self) -> bool:
         return bool(self.annotations)
 
+    def history_state(self) -> tuple[list[MeasurementOverride], int, str]:
+        return list(self.annotations), self.selected_index, self.current_tool
+
+    def record_history(self) -> None:
+        self.undo_stack.append(self.history_state())
+        if len(self.undo_stack) > self.history_limit:
+            del self.undo_stack[0]
+        self.redo_stack.clear()
+
+    def cancel_interaction(self) -> None:
+        self.creating_start = None
+        self.creating_end = None
+        self.dragging_distance = None
+        self.dragging_thickness = None
+        self.dragging_whole = None
+        self.drag_history_recorded = False
+        self.panning = False
+        self.pan_last_pos = None
+        self.setCursor(Qt.CursorShape.CrossCursor if self.current_tool == "distance" else Qt.CursorShape.ArrowCursor)
+
+    def restore_history_state(self, state: tuple[list[MeasurementOverride], int, str]) -> None:
+        annotations, selected_index, tool = state
+        previous_tool = self.current_tool
+        self.annotations = list(annotations)
+        self.selected_index = selected_index if 0 <= selected_index < len(self.annotations) else -1
+        self.current_tool = tool if tool in {"thickness", "distance"} else "distance"
+        self.cancel_interaction()
+        self.annotations_changed.emit()
+        self.selection_changed.emit()
+        if self.current_tool != previous_tool:
+            self.tool_changed.emit(self.current_tool)
+        self.update()
+
+    def undo(self) -> None:
+        if not self.undo_stack:
+            return
+        self.redo_stack.append(self.history_state())
+        self.restore_history_state(self.undo_stack.pop())
+
+    def redo(self) -> None:
+        if not self.redo_stack:
+            return
+        self.undo_stack.append(self.history_state())
+        self.restore_history_state(self.redo_stack.pop())
+
+    def cancel_current_drawing(self) -> bool:
+        if self.creating_start is None and self.creating_end is None:
+            return False
+        self.creating_start = None
+        self.creating_end = None
+        self.setCursor(Qt.CursorShape.CrossCursor if self.current_tool == "distance" else Qt.CursorShape.ArrowCursor)
+        self.update()
+        return True
+
     def set_tool(self, tool: str) -> None:
         if tool not in {"thickness", "distance"}:
             return
@@ -562,6 +635,8 @@ class MeasurementPreviewWidget(QWidget):
             self.tool_changed.emit(tool)
         self.dragging_thickness = None
         self.dragging_distance = None
+        self.dragging_whole = None
+        self.drag_history_recorded = False
         self.creating_start = None
         self.creating_end = None
         self.update()
@@ -586,6 +661,7 @@ class MeasurementPreviewWidget(QWidget):
         index = self.thickness_index()
         if index < 0:
             thickness = self.auto_thickness or self.fallback_thickness()
+            self.record_history()
             self.annotations.append(thickness)
             index = len(self.annotations) - 1
             self.annotations_changed.emit()
@@ -699,10 +775,35 @@ class MeasurementPreviewWidget(QWidget):
             max(0.0, min(snapped_y, float(self.image_h - 1))),
         )
 
+    def translated_annotation(
+        self,
+        annotation: MeasurementOverride,
+        delta_x: float,
+        delta_y: float,
+    ) -> MeasurementOverride:
+        min_x = min(annotation.x1_px, annotation.x2_px)
+        max_x = max(annotation.x1_px, annotation.x2_px)
+        min_y = min(annotation.y1_px, annotation.y2_px)
+        max_y = max(annotation.y1_px, annotation.y2_px)
+        delta_x = max(-min_x, min(delta_x, float(self.image_w - 1) - max_x))
+        delta_y = max(-min_y, min(delta_y, float(self.image_h - 1) - max_y))
+        return MeasurementOverride(
+            annotation.kind,
+            annotation.x1_px + delta_x,
+            annotation.y1_px + delta_y,
+            annotation.x2_px + delta_x,
+            annotation.y2_px + delta_y,
+        )
+
     def update_annotation(self, index: int, annotation: MeasurementOverride) -> None:
         clamped = self.clamped_annotation(annotation)
         if clamped is None or not 0 <= index < len(self.annotations):
             return
+        if clamped == self.annotations[index]:
+            return
+        if not self.drag_history_recorded:
+            self.record_history()
+            self.drag_history_recorded = True
         self.annotations[index] = clamped
         self.annotations_changed.emit()
         self.update()
@@ -905,7 +1006,24 @@ class MeasurementPreviewWidget(QWidget):
         self.zoom_changed.emit(self.zoom_factor)
 
     def mousePressEvent(self, event) -> None:
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        if event.button() == Qt.MouseButton.MiddleButton:
+            if (
+                self.zoom_factor > 1.0001
+                and not self.creating_start
+                and not self.dragging_distance
+                and not self.dragging_thickness
+                and not self.dragging_whole
+            ):
+                self.panning = True
+                self.pan_last_pos = event.position()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+            else:
+                event.ignore()
+            return
         if event.button() != Qt.MouseButton.LeftButton:
+            event.ignore()
             return
         widget_x = event.position().x()
         widget_y = event.position().y()
@@ -916,13 +1034,18 @@ class MeasurementPreviewWidget(QWidget):
             annotation = self.annotations[index]
             self.select_annotation(index)
             if annotation.kind == "thickness":
-                self.dragging_thickness = endpoint
-                self.setCursor(Qt.CursorShape.SizeHorCursor if endpoint == "center" else Qt.CursorShape.SizeVerCursor)
+                if endpoint == "center":
+                    self.dragging_whole = (index, image_x, image_y, annotation)
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                else:
+                    self.dragging_thickness = endpoint
+                    self.setCursor(Qt.CursorShape.SizeVerCursor)
             elif endpoint in {"start", "end"}:
                 self.dragging_distance = (index, endpoint)
                 self.setCursor(Qt.CursorShape.CrossCursor)
             else:
-                self.setCursor(Qt.CursorShape.PointingHandCursor)
+                self.dragging_whole = (index, image_x, image_y, annotation)
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
             return
 
         if self.current_tool == "distance":
@@ -935,6 +1058,18 @@ class MeasurementPreviewWidget(QWidget):
             self.select_none()
 
     def mouseMoveEvent(self, event) -> None:
+        if self.panning:
+            position = event.position()
+            if self.pan_last_pos is not None:
+                delta = position - self.pan_last_pos
+                self.pan_x += delta.x()
+                self.pan_y += delta.y()
+                self.clamp_pan()
+                self.update()
+            self.pan_last_pos = position
+            event.accept()
+            return
+
         widget_x = event.position().x()
         widget_y = event.position().y()
         image_x, image_y = self.widget_to_image(widget_x, widget_y)
@@ -948,6 +1083,14 @@ class MeasurementPreviewWidget(QWidget):
                 shift_locked,
             )
             self.update()
+            return
+        if self.dragging_whole:
+            index, anchor_x, anchor_y, original = self.dragging_whole
+            if 0 <= index < len(self.annotations):
+                self.update_annotation(
+                    index,
+                    self.translated_annotation(original, image_x - anchor_x, image_y - anchor_y),
+                )
             return
         if self.dragging_distance:
             index, endpoint = self.dragging_distance
@@ -990,17 +1133,33 @@ class MeasurementPreviewWidget(QWidget):
             index, endpoint = handle
             annotation = self.annotations[index]
             if annotation.kind == "thickness":
-                self.setCursor(Qt.CursorShape.SizeHorCursor if endpoint == "center" else Qt.CursorShape.SizeVerCursor)
+                self.setCursor(Qt.CursorShape.SizeAllCursor if endpoint == "center" else Qt.CursorShape.SizeVerCursor)
             elif endpoint in {"start", "end"}:
                 self.setCursor(Qt.CursorShape.CrossCursor)
             else:
-                self.setCursor(Qt.CursorShape.PointingHandCursor)
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
         elif self.current_tool == "distance":
             self.setCursor(Qt.CursorShape.CrossCursor)
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
-    def mouseReleaseEvent(self, _event) -> None:
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton:
+            if self.panning:
+                self.panning = False
+                self.pan_last_pos = None
+                self.setCursor(
+                    Qt.CursorShape.CrossCursor
+                    if self.current_tool == "distance"
+                    else Qt.CursorShape.ArrowCursor
+                )
+                event.accept()
+            else:
+                event.ignore()
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            event.ignore()
+            return
         if self.creating_start and self.creating_end:
             length_px = math.hypot(
                 self.creating_end[0] - self.creating_start[0],
@@ -1014,6 +1173,7 @@ class MeasurementPreviewWidget(QWidget):
                     x2_px=self.creating_end[0],
                     y2_px=self.creating_end[1],
                 )
+                self.record_history()
                 if self.single_distance:
                     self.annotations = [annotation]
                     self.selected_index = 0
@@ -1027,11 +1187,14 @@ class MeasurementPreviewWidget(QWidget):
         self.creating_end = None
         self.dragging_distance = None
         self.dragging_thickness = None
+        self.dragging_whole = None
+        self.drag_history_recorded = False
         self.setCursor(Qt.CursorShape.CrossCursor if self.current_tool == "distance" else Qt.CursorShape.ArrowCursor)
 
     def delete_selected_annotation(self) -> None:
         if not 0 <= self.selected_index < len(self.annotations):
             return
+        self.record_history()
         del self.annotations[self.selected_index]
         self.selected_index = -1
         self.annotations_changed.emit()
@@ -1041,6 +1204,7 @@ class MeasurementPreviewWidget(QWidget):
     def clear_annotations(self) -> None:
         if not self.annotations:
             return
+        self.record_history()
         self.annotations.clear()
         self.selected_index = -1
         self.annotations_changed.emit()
@@ -1051,7 +1215,11 @@ class MeasurementPreviewWidget(QWidget):
     def reset_selected_annotation(self) -> None:
         if not self.can_reset_selected():
             return
-        self.annotations[self.selected_index] = self.auto_thickness or self.fallback_thickness()
+        reset_annotation = self.auto_thickness or self.fallback_thickness()
+        if reset_annotation == self.annotations[self.selected_index]:
+            return
+        self.record_history()
+        self.annotations[self.selected_index] = reset_annotation
         self.annotations_changed.emit()
         self.selection_changed.emit()
         self.update()
@@ -1074,12 +1242,12 @@ class MeasurementPreviewWidget(QWidget):
             return (
                 f"膜厚：上界面 y={annotation.y1_px:.1f}px，"
                 f"下界面 y={annotation.y2_px:.1f}px，"
-                f"x={annotation.x1_px:.1f}px，厚度 {self.measurement_label(annotation)}"
+                f"x={annotation.x1_px:.1f}px，厚度 {self.measurement_label(annotation)}；拖动中间竖线整体移动"
             )
         if annotation and annotation.kind == "distance":
             return (
                 f"测距 {distance_count} 条，当前 {self.distance_number(self.selected_index)}: "
-                f"{self.measurement_label(annotation)}"
+                f"{self.measurement_label(annotation)}；拖动线段整体移动"
             )
         if self.current_tool == "thickness":
             return "膜厚工具：点击膜厚可新增或选中膜厚标注；拖动红/蓝线或中间竖线调整"
@@ -1413,6 +1581,30 @@ class MeasurementPreviewDialog(QDialog):
         self.reset_selected_button.setEnabled(self.preview.can_reset_selected())
         self.delete_selected_button.setEnabled(self.preview.selected_annotation() is not None)
         self.clear_button.setEnabled(self.preview.has_annotations())
+
+    def keyPressEvent(self, event) -> None:
+        modifiers = event.modifiers()
+        control_pressed = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        shift_pressed = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        if control_pressed and event.key() == Qt.Key.Key_Z:
+            if shift_pressed:
+                self.preview.redo()
+            else:
+                self.preview.undo()
+            event.accept()
+            return
+        if control_pressed and event.key() == Qt.Key.Key_Y:
+            self.preview.redo()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Delete:
+            self.preview.delete_selected_annotation()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape and self.preview.cancel_current_drawing():
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def result_measurement_overrides(self) -> list[MeasurementOverride]:
         return list(self.preview.annotations)
@@ -2131,6 +2323,7 @@ class MainWindow(QMainWindow):
         self.fixed_scale_edit.setEnabled(not checked)
 
     def generate(self) -> None:
+        scale_fraction_warnings: list[str] = []
         try:
             input_paths = self.checked_paths()
             if not input_paths:
@@ -2178,9 +2371,57 @@ class MainWindow(QMainWindow):
                 "measurement_overrides": measurement_overrides,
                 "calibration_overrides": calibration_overrides,
             }
+            validate_generation_options(
+                options["auto_scale_preset"],
+                options["position"],
+                options["font_size"],
+                options["margin_inches"],
+                options["inset_x_percent"],
+                options["inset_y_percent"],
+                options["line_width_pt"],
+            )
+            if fixed_scale is not None:
+                fixed_scale_nm = parse_scale_nm(fixed_scale)
+                for path in input_paths:
+                    calibration = self.effective_calibration(path)
+                    if calibration is None:
+                        continue
+                    with Image.open(path) as image:
+                        width_px = image.width
+                    try:
+                        choose_scale_nm(
+                            width_px,
+                            calibration.nm_per_pixel,
+                            fixed_scale_nm,
+                            options["auto_scale_preset"],
+                        )
+                    except ValueError as exc:
+                        raise ValueError(f"{path.name}: {exc}") from exc
+                    fraction = fixed_scale_nm / (width_px * calibration.nm_per_pixel)
+                    if fraction < 0.02:
+                        scale_fraction_warnings.append(f"- {path.name}: 占图宽 {fraction:.1%}，可能过短")
+                    elif fraction > 0.80:
+                        scale_fraction_warnings.append(f"- {path.name}: 占图宽 {fraction:.1%}，可能过长")
         except Exception as exc:
             QMessageBox.warning(self, "参数错误", str(exc))
             return
+
+        if scale_fraction_warnings:
+            shown_warnings = scale_fraction_warnings[:8]
+            remaining = len(scale_fraction_warnings) - len(shown_warnings)
+            if remaining > 0:
+                shown_warnings.append(f"- 另有 {remaining} 张图片")
+            answer = QMessageBox.question(
+                self,
+                "固定标尺比例提示",
+                "以下图片的固定标尺比例可能不易阅读：\n"
+                + "\n".join(shown_warnings)
+                + "\n\n仍要继续生成吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
 
         self.log_edit.clear()
         self.generate_button.setEnabled(False)

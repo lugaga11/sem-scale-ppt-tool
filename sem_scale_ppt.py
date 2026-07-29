@@ -62,8 +62,11 @@ AUTO_SCALE_PRESETS = {
     "medium": (0.16, 0.12, 0.20),
     "long": (0.32, 0.22, 0.45),
 }
+SCALE_POSITIONS = {"bottom-right", "bottom-left", "top-right", "top-left"}
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
 SCALE_SERIES = (1.0, 2.0, 5.0)
+HIGH_BIT_GRAYSCALE_MODES = {"I", "I;16", "I;16L", "I;16B", "I;16N"}
+PNG_DIRECT_MODES = {"1", "L", "LA", "P", "RGB", "RGBA", "I;16"}
 UNIT_TO_NM = {
     "fm": 1e-6,
     "pm": 1e-3,
@@ -250,7 +253,10 @@ def parse_scale_nm(value: str) -> float:
     if not match:
         raise ValueError(f"Invalid scale length: {value!r}. Use values like 500nm or 1um.")
     unit = normalize_unit(match.group(2))
-    return float(match.group(1)) * UNIT_TO_NM[unit]
+    length_nm = float(match.group(1)) * UNIT_TO_NM[unit]
+    if not math.isfinite(length_nm) or length_nm <= 0:
+        raise ValueError("Scale length must be a finite value greater than zero.")
+    return length_nm
 
 
 def format_scale_label(scale_nm: float) -> str:
@@ -429,7 +435,7 @@ def detect_thickness_measurement(
     band_width_percent: float = DEFAULTS["thickness_band_width_percent"],
     min_gap_percent: float = DEFAULTS["thickness_min_gap_percent"],
 ) -> ThicknessMeasurement | None:
-    gray = image.convert("L")
+    gray = image_to_display_grayscale(image)
     width, height = gray.size
     content_bottom = detect_sem_content_bottom(gray)
     if content_bottom < max(60, int(height * 0.2)):
@@ -542,19 +548,31 @@ def choose_scale_nm(
     if width_px <= 0:
         raise ValueError("Image width must be greater than zero.")
     if not math.isfinite(nm_per_pixel) or nm_per_pixel <= 0:
-        raise ValueError("Pixel calibration must be a positive finite value.")
+        raise ValueError("Pixel calibration must be a finite value greater than zero.")
+    field_width_nm = width_px * nm_per_pixel
+    if not math.isfinite(field_width_nm) or field_width_nm <= 0:
+        raise ValueError("Image field width is not a finite positive value.")
+
     if fixed_scale_nm is not None:
         if not math.isfinite(fixed_scale_nm) or fixed_scale_nm <= 0:
-            raise ValueError("Fixed scale length must be a positive finite value.")
+            raise ValueError("Fixed scale length must be a finite value greater than zero.")
+        if fixed_scale_nm > field_width_nm * (1.0 + 1e-12):
+            raise ValueError(
+                f"Fixed scale {format_scale_label(fixed_scale_nm)} exceeds the image field width "
+                f"of {format_scale_label(field_width_nm)}."
+            )
         return fixed_scale_nm
-    target, minimum, maximum = AUTO_SCALE_PRESETS.get(auto_scale_preset, AUTO_SCALE_PRESETS["medium"])
-    image_width_nm = width_px * nm_per_pixel
-    if not math.isfinite(image_width_nm) or image_width_nm <= 0:
-        raise ValueError("Calibrated image width must be a positive finite value.")
-    target_nm = image_width_nm * target
+
+    if auto_scale_preset not in AUTO_SCALE_PRESETS:
+        raise ValueError(f"Unknown automatic scale preset: {auto_scale_preset!r}.")
+    target, minimum, maximum = AUTO_SCALE_PRESETS[auto_scale_preset]
+    target_nm = field_width_nm * target
+    if not math.isfinite(target_nm) or target_nm <= 0:
+        raise ValueError("Automatic scale target is not a finite positive value.")
+
     scored: list[tuple[int, float, float]] = []
     for candidate in dynamic_scale_candidates_nm(target_nm):
-        fraction = candidate / image_width_nm
+        fraction = candidate / field_width_nm
         in_range = minimum <= fraction <= maximum
         scored.append((0 if in_range else 1, abs(fraction - target), candidate))
     return min(scored, key=lambda item: (item[0], item[1]))[2]
@@ -596,10 +614,65 @@ def hex_color(value: str) -> str:
     raise ValueError("Color must be a name like white or a hex value like #FFFFFF")
 
 
+def is_high_bit_grayscale(image: Image.Image) -> bool:
+    if image.mode not in HIGH_BIT_GRAYSCALE_MODES:
+        return False
+    if image.mode != "I":
+        return True
+    minimum, maximum = cast(tuple[float, float], image.getextrema())
+    return minimum >= 0 and maximum <= 65535
+
+
+def image_to_display_grayscale(image: Image.Image) -> Image.Image:
+    """Return an 8-bit grayscale image without clipping 16-bit SEM intensities."""
+    if image.mode == "L":
+        return image.copy()
+    if not is_high_bit_grayscale(image):
+        return image.convert("L")
+
+    integer_image = image.convert("I")
+    sample = integer_image.copy()
+    sample.thumbnail((512, 512), Image.Resampling.BILINEAR)
+    values = sorted(int(value) for value in sample.getdata())
+    if not values:
+        return Image.new("L", image.size, 0)
+
+    if len(values) >= 200:
+        low = values[int((len(values) - 1) * 0.005)]
+        high = values[int((len(values) - 1) * 0.995)]
+    else:
+        low, high = values[0], values[-1]
+    low = max(0, min(65535, low))
+    high = max(0, min(65535, high))
+    if high <= low:
+        minimum, maximum = cast(tuple[float, float], integer_image.getextrema())
+        low = max(0, min(65535, int(minimum)))
+        high = max(0, min(65535, int(maximum)))
+    if high <= low:
+        level = max(0, min(255, int(round(low / 65535 * 255))))
+        return Image.new("L", image.size, level)
+
+    span = high - low
+    lut = [
+        0 if value <= low else 255 if value >= high else int(round((value - low) * 255 / span))
+        for value in range(65536)
+    ]
+    return integer_image.point(lut, "L")
+
+
 def convert_image_to_png(image: Image.Image, output_path: Path) -> None:
-    if image.mode not in ("RGB", "RGBA", "L"):
-        image = image.convert("RGB")
-    image.save(output_path, format="PNG")
+    if is_high_bit_grayscale(image):
+        if image.mode in {"I;16", "I;16B"}:
+            png_image = image
+        elif image.mode in {"I;16L", "I;16N"}:
+            png_image = Image.frombytes("I;16", image.size, image.tobytes())
+        else:
+            png_image = image.convert("I;16")
+    elif image.mode in PNG_DIRECT_MODES:
+        png_image = image
+    else:
+        png_image = image.convert("RGB")
+    png_image.save(output_path, format="PNG")
 
 
 def prepare_slide_item(
@@ -631,7 +704,10 @@ def prepare_slide_item(
             )
         png_path = temp_dir / f"{index:05d}_{path.stem}.png"
         convert_image_to_png(image, png_path)
-        scale_nm = choose_scale_nm(width_px, calibration.nm_per_pixel, fixed_scale_nm, auto_scale_preset)
+        try:
+            scale_nm = choose_scale_nm(width_px, calibration.nm_per_pixel, fixed_scale_nm, auto_scale_preset)
+        except ValueError as exc:
+            raise ValueError(f"{path.name}: {exc}") from exc
         scale_px = scale_nm / calibration.nm_per_pixel
         measurement_inputs = list(measurement_overrides or [])
         measurements = tuple(
@@ -654,8 +730,14 @@ def prepare_slide_item(
 
 
 def fit_image(width_px: int, height_px: int, slide_w: int, slide_h: int, margin: int) -> tuple[int, int, int, int]:
+    if width_px <= 0 or height_px <= 0:
+        raise ValueError("Image dimensions must be greater than zero.")
+    if margin < 0:
+        raise ValueError("Page margin cannot be negative.")
     max_w = slide_w - margin * 2
     max_h = slide_h - margin * 2
+    if max_w <= 0 or max_h <= 0:
+        raise ValueError("Page margin is too large for the output page size.")
     scale = min(max_w / width_px, max_h / height_px)
     image_w = int(round(width_px * scale))
     image_h = int(round(height_px * scale))
@@ -665,6 +747,10 @@ def fit_image(width_px: int, height_px: int, slide_w: int, slide_h: int, margin:
 
 
 def fit_tight_page(width_px: int, height_px: int, max_page_w: int, max_page_h: int, margin: int) -> PageLayout:
+    if width_px <= 0 or height_px <= 0:
+        raise ValueError("Image dimensions must be greater than zero.")
+    if margin < 0:
+        raise ValueError("Page margin cannot be negative.")
     max_image_w = max_page_w - margin * 2
     max_image_h = max_page_h - margin * 2
     if max_image_w <= 0 or max_image_h <= 0:
@@ -1244,6 +1330,33 @@ def build_svg(
     output.write_text("\n".join(parts) + "\n", encoding="utf-8")
 
 
+def validate_generation_options(
+    auto_scale_preset: str,
+    position: str,
+    font_size: int | None,
+    margin_inches: float,
+    inset_x_percent: float,
+    inset_y_percent: float,
+    line_width_pt: float,
+) -> None:
+    if auto_scale_preset not in AUTO_SCALE_PRESETS:
+        raise ValueError(f"Unknown automatic scale preset: {auto_scale_preset!r}.")
+    if position not in SCALE_POSITIONS:
+        raise ValueError(f"Unknown scale position: {position!r}.")
+    if font_size is not None and (not math.isfinite(font_size) or font_size <= 0):
+        raise ValueError("Font size must be greater than zero or set to automatic.")
+    if not math.isfinite(margin_inches) or margin_inches < 0:
+        raise ValueError("Page margin must be a finite non-negative value.")
+    for name, value in (
+        ("Horizontal inset", inset_x_percent),
+        ("Vertical inset", inset_y_percent),
+    ):
+        if not math.isfinite(value) or not 0 <= value <= 100:
+            raise ValueError(f"{name} must be between 0 and 100 percent.")
+    if not math.isfinite(line_width_pt) or line_width_pt <= 0:
+        raise ValueError("Line width must be a finite value greater than zero.")
+
+
 def generate_pptx(
     input_path: Path | Iterable[Path],
     output_path: Path,
@@ -1260,6 +1373,15 @@ def generate_pptx(
     measurement_overrides: Mapping[Path, Sequence[MeasurementOverride]] | None = None,
     calibration_overrides: Mapping[Path, CalibrationOverride] | None = None,
 ) -> list[SlideItem]:
+    validate_generation_options(
+        auto_scale_preset,
+        position,
+        font_size,
+        margin_inches,
+        inset_x_percent,
+        inset_y_percent,
+        line_width_pt,
+    )
     slide_w, slide_h = int(DEFAULT_SLIDE_W), int(DEFAULT_SLIDE_H)
     margin = int(Inches(margin_inches))
     fixed_scale_nm = parse_scale_nm(fixed_scale) if fixed_scale else None
@@ -1315,6 +1437,15 @@ def generate_svg(
     measurement_overrides: Mapping[Path, Sequence[MeasurementOverride]] | None = None,
     calibration_overrides: Mapping[Path, CalibrationOverride] | None = None,
 ) -> list[SlideItem]:
+    validate_generation_options(
+        auto_scale_preset,
+        position,
+        font_size,
+        margin_inches,
+        inset_x_percent,
+        inset_y_percent,
+        line_width_pt,
+    )
     page_w, page_h = DEFAULT_PAGE_W_PT, DEFAULT_PAGE_H_PT
     margin = int(round(margin_inches * POINTS_PER_INCH))
     fixed_scale_nm = parse_scale_nm(fixed_scale) if fixed_scale else None

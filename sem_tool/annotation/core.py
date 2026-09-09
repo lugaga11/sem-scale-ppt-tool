@@ -7,6 +7,7 @@ import base64
 import math
 import re
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence, cast
@@ -21,18 +22,18 @@ from pptx.oxml.ns import qn
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Inches, Length, Pt
 
+from ..files import find_images, path_key
+from ..imaging import convert_image_to_png, image_to_display_grayscale
 
 # =========================
 # Default Settings - Edit Here
 # =========================
 DEFAULTS = {
-    # PPT page and GUI size.
+    # PPT page and queue layout.
     "slide_width_inches": 13.333333,
     "slide_height_inches": 7.5,
     "slide_margin_inches": 0.0,
     "output_filename": "sem_with_scale.pptx",
-    "window_width": 600,
-    "window_height": 600,
     "queue_min_height": 190,
     # Use auto_scale_preset: "short", "medium", or "long".
     "auto_scale_preset": "medium",
@@ -63,10 +64,7 @@ AUTO_SCALE_PRESETS = {
     "long": (0.32, 0.22, 0.45),
 }
 SCALE_POSITIONS = {"bottom-right", "bottom-left", "top-right", "top-left"}
-IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
 SCALE_SERIES = (1.0, 2.0, 5.0)
-HIGH_BIT_GRAYSCALE_MODES = {"I", "I;16", "I;16L", "I;16B", "I;16N"}
-PNG_DIRECT_MODES = {"1", "L", "LA", "P", "RGB", "RGBA", "I;16"}
 UNIT_TO_NM = {
     "fm": 1e-6,
     "pm": 1e-3,
@@ -175,14 +173,11 @@ def decode_metadata_value(value: object) -> str:
     if isinstance(value, bytes):
         candidates = []
         for encoding in ("utf-16le", "utf-8", "latin1"):
-            try:
-                text = value.decode(encoding, errors="replace")
-            except Exception:
-                continue
+            text = value.decode(encoding, errors="replace")
             printable = sum(ch.isprintable() or ch in "\r\n\t" for ch in text)
             score = printable - text.count("\x00") * 5
             candidates.append((score, text))
-        return max(candidates, key=lambda item: item[0])[1] if candidates else ""
+        return max(candidates, key=lambda item: item[0])[1]
     if isinstance(value, (tuple, list)):
         return "\n".join(decode_metadata_value(item) for item in value)
     return str(value)
@@ -216,7 +211,7 @@ def parse_sem_metadata(image: Image.Image) -> Calibration | None:
         )
         if hitachi:
             value = float(hitachi.group(1))
-            if value > 0:
+            if value > 0 and math.isfinite(value):
                 return Calibration(value, f"{source}: PixelSize")
 
         for line in re.split(r"[\r\n]+", text):
@@ -446,10 +441,7 @@ def detect_thickness_measurement(
     half_band = band_width / 2
     center_fractions = (0.35, 0.45, 0.55, 0.65, 0.75)
     centers = sorted(
-        {
-            int(round(min(max(width * fraction, half_band), width - half_band)))
-            for fraction in center_fractions
-        }
+        {int(round(min(max(width * fraction, half_band), width - half_band))) for fraction in center_fractions}
     )
 
     candidates: list[ThicknessCandidate] = []
@@ -578,24 +570,6 @@ def choose_scale_nm(
     return min(scored, key=lambda item: (item[0], item[1]))[2]
 
 
-def find_images(input_paths: Path | Iterable[Path]) -> list[Path]:
-    roots = [input_paths] if isinstance(input_paths, Path) else list(input_paths)
-    paths: list[Path] = []
-    for root in roots:
-        if root.is_file():
-            paths.append(root)
-        elif root.is_dir():
-            paths.extend(sorted((path for path in root.rglob("*") if path.is_file()), key=lambda path: str(path).lower()))
-    images = [path for path in paths if path.suffix.lower() in IMAGE_EXTENSIONS]
-    if not images:
-        raise ValueError("No supported image files found.")
-    return images
-
-
-def path_key(path: Path) -> str:
-    return str(path.resolve()).casefold()
-
-
 def hex_color(value: str) -> str:
     colors = {
         "white": "FFFFFF",
@@ -612,67 +586,6 @@ def hex_color(value: str) -> str:
     if re.fullmatch(r"[0-9a-fA-F]{6}", value):
         return value.upper()
     raise ValueError("Color must be a name like white or a hex value like #FFFFFF")
-
-
-def is_high_bit_grayscale(image: Image.Image) -> bool:
-    if image.mode not in HIGH_BIT_GRAYSCALE_MODES:
-        return False
-    if image.mode != "I":
-        return True
-    minimum, maximum = cast(tuple[float, float], image.getextrema())
-    return minimum >= 0 and maximum <= 65535
-
-
-def image_to_display_grayscale(image: Image.Image) -> Image.Image:
-    """Return an 8-bit grayscale image without clipping 16-bit SEM intensities."""
-    if image.mode == "L":
-        return image.copy()
-    if not is_high_bit_grayscale(image):
-        return image.convert("L")
-
-    integer_image = image.convert("I")
-    sample = integer_image.copy()
-    sample.thumbnail((512, 512), Image.Resampling.BILINEAR)
-    values = sorted(int(value) for value in sample.getdata())
-    if not values:
-        return Image.new("L", image.size, 0)
-
-    if len(values) >= 200:
-        low = values[int((len(values) - 1) * 0.005)]
-        high = values[int((len(values) - 1) * 0.995)]
-    else:
-        low, high = values[0], values[-1]
-    low = max(0, min(65535, low))
-    high = max(0, min(65535, high))
-    if high <= low:
-        minimum, maximum = cast(tuple[float, float], integer_image.getextrema())
-        low = max(0, min(65535, int(minimum)))
-        high = max(0, min(65535, int(maximum)))
-    if high <= low:
-        level = max(0, min(255, int(round(low / 65535 * 255))))
-        return Image.new("L", image.size, level)
-
-    span = high - low
-    lut = [
-        0 if value <= low else 255 if value >= high else int(round((value - low) * 255 / span))
-        for value in range(65536)
-    ]
-    return integer_image.point(lut, "L")
-
-
-def convert_image_to_png(image: Image.Image, output_path: Path) -> None:
-    if is_high_bit_grayscale(image):
-        if image.mode in {"I;16", "I;16B"}:
-            png_image = image
-        elif image.mode in {"I;16L", "I;16N"}:
-            png_image = Image.frombytes("I;16", image.size, image.tobytes())
-        else:
-            png_image = image.convert("I;16")
-    elif image.mode in PNG_DIRECT_MODES:
-        png_image = image
-    else:
-        png_image = image.convert("RGB")
-    png_image.save(output_path, format="PNG")
 
 
 def prepare_slide_item(
@@ -699,8 +612,7 @@ def prepare_slide_item(
             calibration = parse_sem_metadata(image)
         if not calibration:
             raise ValueError(
-                f"No pixel calibration found for {path.name}. "
-                "Add embedded metadata or provide a manual calibration."
+                f"No pixel calibration found for {path.name}. Add embedded metadata or provide a manual calibration."
             )
         png_path = temp_dir / f"{index:05d}_{path.stem}.png"
         convert_image_to_png(image, png_path)
@@ -772,9 +684,7 @@ def remove_shape_effects(shape) -> None:
     style = shape._element.find(qn("p:style"))
     if style is not None:
         shape._element.remove(style)
-    sp_pr = getattr(shape._element, "spPr", None)
-    if sp_pr is None:
-        return
+    sp_pr = shape._element.spPr
     for tag in ("a:effectLst", "a:effectDag", "a:scene3d", "a:sp3d"):
         child = sp_pr.find(qn(tag))
         if child is not None:
@@ -847,10 +757,6 @@ def add_scale_bar(
     run.font.name = "Arial"
     run.font.size = Pt(font_pt)
     run.font.color.rgb = rgb
-
-
-def measurement_segments(item: SlideItem) -> tuple[MeasurementSegment, ...]:
-    return item.measurements
 
 
 def scale_measurement_segment(
@@ -1037,7 +943,7 @@ def add_pptx_measurement_markers(
     font_bold: bool,
     line_width_pt: float,
 ) -> None:
-    for segment in measurement_segments(item):
+    for segment in item.measurements:
         add_pptx_measurement_segment(
             slide,
             scale_measurement_segment(segment, item, image_x, image_y, image_w, image_h),
@@ -1074,7 +980,9 @@ def build_pptx(
     for item in items:
         slide = prs.slides.add_slide(blank_layout)
         image_x, image_y, image_w, image_h = fit_image(item.width_px, item.height_px, slide_w, slide_h, margin)
-        slide.shapes.add_picture(str(item.png_path), Emu(image_x), Emu(image_y), width=Emu(image_w), height=Emu(image_h))
+        slide.shapes.add_picture(
+            str(item.png_path), Emu(image_x), Emu(image_y), width=Emu(image_w), height=Emu(image_h)
+        )
         add_scale_bar(
             slide,
             item,
@@ -1112,14 +1020,9 @@ def safe_filename_part(value: str) -> str:
     return cleaned or "image"
 
 
-def split_output_path(output_path: Path, item: SlideItem, index: int, total: int, suffix: str) -> Path:
-    output_path = output_path.with_suffix(suffix)
+def svg_output_path(output_path: Path, item: SlideItem, index: int) -> Path:
     stem = safe_filename_part(item.source_path.stem)
-    return output_path.with_name(f"{output_path.stem}_{index:02d}_{stem}{suffix}")
-
-
-def svg_output_path(output_path: Path, item: SlideItem, index: int, total: int) -> Path:
-    return split_output_path(output_path, item, index, total, ".svg")
+    return output_path.with_name(f"{output_path.stem}_{index:02d}_{stem}.svg")
 
 
 def svg_num(value: float) -> str:
@@ -1250,7 +1153,7 @@ def add_svg_measurement_markers(
     font_bold: bool,
     line_width_pt: float,
 ) -> None:
-    for segment in measurement_segments(item):
+    for segment in item.measurements:
         add_svg_measurement_segment(
             parts,
             scale_measurement_segment(segment, item, image_x, image_y, image_w, image_h),
@@ -1357,6 +1260,34 @@ def validate_generation_options(
         raise ValueError("Line width must be a finite value greater than zero.")
 
 
+@contextmanager
+def prepared_items(
+    input_path: Path | Iterable[Path],
+    fixed_scale: str | None,
+    auto_scale_preset: str,
+    measurement_overrides: Mapping[Path, Sequence[MeasurementOverride]] | None,
+    calibration_overrides: Mapping[Path, CalibrationOverride] | None,
+):
+    """Share preparation and keep lossless temporary images alive until export finishes."""
+    fixed_scale_nm = parse_scale_nm(fixed_scale) if fixed_scale is not None else None
+    image_paths = find_images(input_path)
+    measurements = {path_key(path): tuple(values) for path, values in (measurement_overrides or {}).items()}
+    calibrations = {path_key(path): value for path, value in (calibration_overrides or {}).items()}
+    with tempfile.TemporaryDirectory(prefix="sem_tool_") as temp:
+        yield [
+            prepare_slide_item(
+                path,
+                Path(temp),
+                index,
+                fixed_scale_nm,
+                auto_scale_preset,
+                measurement_overrides=measurements.get(path_key(path), ()),
+                calibration_override=calibrations.get(path_key(path)),
+            )
+            for index, path in enumerate(image_paths, start=1)
+        ]
+
+
 def generate_pptx(
     input_path: Path | Iterable[Path],
     output_path: Path,
@@ -1384,26 +1315,10 @@ def generate_pptx(
     )
     slide_w, slide_h = int(DEFAULT_SLIDE_W), int(DEFAULT_SLIDE_H)
     margin = int(Inches(margin_inches))
-    fixed_scale_nm = parse_scale_nm(fixed_scale) if fixed_scale else None
     color = hex_color(bar_color)
-    image_paths = find_images(input_path)
-    measurement_override_map = {path_key(path): tuple(overrides) for path, overrides in (measurement_overrides or {}).items()}
-    calibration_override_map = {path_key(path): override for path, override in (calibration_overrides or {}).items()}
-
-    with tempfile.TemporaryDirectory(prefix="sem_scale_ppt_") as temp:
-        temp_dir = Path(temp)
-        items = [
-            prepare_slide_item(
-                path,
-                temp_dir,
-                index,
-                fixed_scale_nm,
-                auto_scale_preset,
-                measurement_overrides=measurement_override_map.get(path_key(path), ()),
-                calibration_override=calibration_override_map.get(path_key(path)),
-            )
-            for index, path in enumerate(image_paths, start=1)
-        ]
+    with prepared_items(
+        input_path, fixed_scale, auto_scale_preset, measurement_overrides, calibration_overrides
+    ) as items:
         build_pptx(
             items,
             output_path,
@@ -1448,31 +1363,14 @@ def generate_svg(
     )
     page_w, page_h = DEFAULT_PAGE_W_PT, DEFAULT_PAGE_H_PT
     margin = int(round(margin_inches * POINTS_PER_INCH))
-    fixed_scale_nm = parse_scale_nm(fixed_scale) if fixed_scale else None
     color = hex_color(bar_color)
-    image_paths = find_images(input_path)
-    measurement_override_map = {path_key(path): tuple(overrides) for path, overrides in (measurement_overrides or {}).items()}
-    calibration_override_map = {path_key(path): override for path, override in (calibration_overrides or {}).items()}
-
-    with tempfile.TemporaryDirectory(prefix="sem_scale_svg_") as temp:
-        temp_dir = Path(temp)
-        items = [
-            prepare_slide_item(
-                path,
-                temp_dir,
-                index,
-                fixed_scale_nm,
-                auto_scale_preset,
-                measurement_overrides=measurement_override_map.get(path_key(path), ()),
-                calibration_override=calibration_override_map.get(path_key(path)),
-            )
-            for index, path in enumerate(image_paths, start=1)
-        ]
-        total = len(items)
+    with prepared_items(
+        input_path, fixed_scale, auto_scale_preset, measurement_overrides, calibration_overrides
+    ) as items:
         for index, item in enumerate(items, start=1):
             build_svg(
                 item,
-                svg_output_path(output_path, item, index, total),
+                svg_output_path(output_path, item, index),
                 page_w,
                 page_h,
                 margin,

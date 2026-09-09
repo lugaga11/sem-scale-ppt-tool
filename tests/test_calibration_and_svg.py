@@ -19,28 +19,27 @@ from PySide6.QtGui import QImage, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
-from sem_scale_ppt import (
+from sem_tool.annotation.core import (
     Calibration,
     CalibrationOverride,
     MeasurementOverride,
     choose_scale_nm,
-    convert_image_to_png,
     dynamic_scale_candidates_nm,
     format_scale_label,
     generate_pptx,
     generate_svg,
-    image_to_display_grayscale,
     parse_scale_nm,
     path_key,
     validate_generation_options,
 )
-from sem_scale_ppt_gui import (
+from sem_tool.annotation.preview import (
     CalibrationDialog,
-    MainWindow,
     MeasurementPreviewDialog,
     MeasurementPreviewWidget,
     qimage_from_pil,
 )
+from sem_tool.annotation.ui import AnnotationPanel as MainWindow
+from sem_tool.imaging import convert_image_to_png, image_to_display_grayscale
 
 
 class ManualCalibrationCoreTests(unittest.TestCase):
@@ -202,6 +201,7 @@ class ManualCalibrationGuiTests(unittest.TestCase):
                 measurement_cell = window.measurement_cell(0)
                 self.assertIsNotNone(measurement_cell)
                 assert measurement_cell is not None
+                self.assertEqual(measurement_cell.edit_button.text(), "手动标定")
                 self.assertEqual(
                     measurement_cell.edit_button.palette().color(QPalette.ColorRole.Button).name(),
                     "#f3dddd",
@@ -219,6 +219,7 @@ class ManualCalibrationGuiTests(unittest.TestCase):
 
                 self.assertEqual(window.missing_calibration_paths([source]), [])
                 self.assertNotIn("缺标定", window.count_label.text())
+                self.assertEqual(measurement_cell.edit_button.text(), "编辑")
                 self.assertIn("手动标定", name_item.toolTip())
                 self.assertEqual(
                     measurement_cell.edit_button.palette().color(QPalette.ColorRole.Button).name(),
@@ -227,6 +228,7 @@ class ManualCalibrationGuiTests(unittest.TestCase):
 
                 window.file_list.selectRow(0)
                 window.clear_selected_manual_calibrations()
+                self.assertEqual(measurement_cell.edit_button.text(), "手动标定")
                 self.assertEqual(window.missing_calibration_paths([source]), [source.resolve()])
                 self.assertIn("缺标定 1", window.count_label.text())
                 self.assertIn("未检测到像素标定", name_item.toolTip())
@@ -261,7 +263,7 @@ class ManualCalibrationGuiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "plain.png"
             Image.new("RGB", (200, 100), (60, 60, 60)).save(source)
-            with patch("sem_scale_ppt_gui.detect_thickness_measurement", return_value=None) as detect:
+            with patch("sem_tool.annotation.preview.detect_thickness_measurement", return_value=None) as detect:
                 dialog = MeasurementPreviewDialog(
                     source,
                     [],

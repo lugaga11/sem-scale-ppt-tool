@@ -1,0 +1,53 @@
+# 开发、验证与打包
+
+在主项目根目录运行命令。已有 `my_base` 环境包含运行和 PyInstaller 依赖。
+新开发环境可以 `python -m pip install -e '.[build,dev]'`。
+
+## 验证
+
+```text
+python -m compileall -q main.py sem_tool tests scripts
+python -m unittest discover -s tests -v
+ruff check sem_tool main.py tests scripts
+```
+
+测试使用 Qt offscreen、临时目录和独立索引，不读写真实用户索引。
+覆盖原有标尺/手动标定/16 位保真/测量编辑，以及截图命中原图、加入列表后标注、重复导入、队列排序、两种格式后台导出和运行中关闭窗口。
+
+可选：使用原搜索项目的本地截图和完整图库做回归，不复制或提交这些样例。
+
+```powershell
+python -m scripts.verify_sample `
+  '..\搜图\test\sample\PixPin_2026-06-29_18-18-57.png' `
+  '..\搜图\test\sample\图库' `
+  'HZH20240731\0725-2-02.tif'
+```
+
+脚本使用临时 SQLite 数据库，验证第一名必须是指定原图；也可以传入其他截图、图库和目标相对路径。
+
+## Windows 打包
+
+```text
+python -m PyInstaller --noconfirm SEMTool.spec
+```
+
+输出为 `dist/SEMTool.exe`。spec 根据自身位置解析入口，可以从其他目录通过绝对路径调用；输出目录仍由 PyInstaller 当前目录或 `--distpath` / `--workpath` 决定。
+只维护一个 spec，不把旧 exe、缓存、样例、个人索引、测试或开发脚本带入产物。
+spec 排除 conda 环境中无关的 Qt 绑定、科学计算和 notebook 包；OpenCV 仅用于特征匹配，不创建自己的 GUI。
+构建时会将 DLL 搜索路径限定为当前 Python 环境和 Windows 系统目录，防止工具宿主 PATH 中的 Poppler 等软件带入不兼容的 ICU/OpenSSL DLL。
+排查打包启动错误时，可设置 `SEM_TOOL_CONSOLE=1` 再构建，并将 `--distpath` 指向独立诊断目录；默认产物不带控制台。
+
+安装包可以通过 `python -m build --wheel` 构建，内容只包含 `sem_tool` 包。
+
+## 关键设计
+
+- 主窗口是唯一 `QMainWindow`；搜索和标注页是 `QWidget`，只有应用入口创建 `QApplication`。
+- 默认首页为“标注与导出”。搜索结果通过统一信号传递原图路径列表，主窗口负责加入队列并选择已有项，保持搜索页不跳转；用户切换到标注页后开始编辑。
+- 显式文件列表保留顺序；文件夹内按自然顺序递归枚举，重叠目录和重复文件按完整路径去重。
+- 所有显示像素通过共享映射生成，导出在独立临时目录保存无损 PNG。两种格式复用准备流程。
+- 搜索线程只传路径、统计和结果；标注窗口在主线程创建。跨线程回调声明 `@Slot` 并使用排队连接；线程结束后同步 `wait()` 再释放引用。GUI 测试通过实际 `QEventLoop` 等待后台任务，避免等待代码占用 GIL 后误报超时并销毁仍运行的线程。
+- Ctrl+V 只在搜索页内充当粘贴截图快捷键，其他页保留文本框的标准粘贴行为。
+- 索引状态查询只读尺寸、时间和错误等字段，不加载特征 BLOB。更新会重试失败文件；没有 ORB 特征的图片仍算扫描完成。
+- 保留现有 SQLite schema 和 `ImageOriginFinder` 数据目录，升级无需复制大型索引。
+
+手动回归应检查搜索页和标注页切换、无标定图、非 ASCII 路径、窗口关闭，以及 SVG 独立文件和 PPTX 原生对象可编辑性。

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sem-image-tool"
-version = "1.0.0"
+version = "1.1.0"
 description = "Local original-image search, SEM measurement, and editable PPTX/SVG export"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,13 +18,20 @@ dependencies = [
 
 [project.optional-dependencies]
 build = ["pyinstaller>=6.0", "build>=1.0"]
-dev = ["ruff>=0.11"]
+dev = ["ruff>=0.11", "pyright>=1.1.413"]
 
 [project.gui-scripts]
 sem-tool = "sem_tool.app:main"
 
 [tool.setuptools.packages.find]
 include = ["sem_tool*"]
+
+[tool.setuptools.package-data]
+sem_tool = ["assets/*.svg"]
+
+[tool.pyright]
+include = ["main.py", "sem_tool", "tests", "scripts"]
+typeCheckingMode = "basic"
 
 [tool.ruff]
 target-version = "py310"

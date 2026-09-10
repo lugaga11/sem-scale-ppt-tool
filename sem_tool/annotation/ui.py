@@ -3,30 +3,33 @@ from __future__ import annotations
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import Qt, QThread, Signal, Slot
-from PySide6.QtGui import QColor, QIcon
+from PySide6.QtCore import QSignalBlocker, QSize, Qt, QThread, Signal, Slot
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QButtonGroup,
     QCheckBox,
     QColorDialog,
     QDialog,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMenu,
     QMessageBox,
     QPushButton,
-    QRadioButton,
-    QStyle,
+    QScrollArea,
+    QSizePolicy,
+    QSplitter,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ..files import IMAGE_FILE_FILTER, image_paths_from_inputs, natural_key, open_path, path_key
+from ..theme import icon
+from ..widgets import PathLineEdit, SegmentedControl, ToggleSwitch, section_heading
 from .core import (
     DEFAULT_MARGIN_INCHES,
     DEFAULTS,
@@ -76,7 +79,7 @@ def label_for_value(options: dict[str, str], value: str) -> str:
 
 
 class AnnotationPanel(QWidget):
-    queue_changed = Signal(int)
+    queue_changed = Signal(list)
     busy_changed = Signal(bool)
     log_message = Signal(str)
     log_reset = Signal()
@@ -94,18 +97,53 @@ class AnnotationPanel(QWidget):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        root_layout = QVBoxLayout(self)
-        main_layout = QHBoxLayout()
-        root_layout.addLayout(main_layout)
+        self.setObjectName("annotationPanel")
+        root_layout = QHBoxLayout(self)
+        root_layout.setContentsMargins(16, 12, 16, 8)
+        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.content_splitter.setHandleWidth(12)
+        self.content_splitter.setChildrenCollapsible(False)
+        root_layout.addWidget(self.content_splitter)
 
-        queue_box = QWidget()
+        queue_box = QFrame()
+        queue_box.setProperty("panel", True)
         queue_layout = QVBoxLayout(queue_box)
-        queue_layout.setContentsMargins(0, 0, 0, 0)
-        title_row = QHBoxLayout()
-        title_row.addWidget(QLabel("文件队列"))
-        title_row.addStretch()
-        self.count_label = QLabel("0 个文件")
-        title_row.addWidget(self.count_label)
+        queue_layout.setContentsMargins(14, 12, 14, 10)
+        queue_layout.setSpacing(12)
+        title_row = section_heading("文件队列", "image")
+        self.queue_total = QLabel("0 个文件")
+        self.queue_total.setProperty("role", "badge")
+        title_row.insertWidget(2, self.queue_total)
+        self.select_all_button = self._button("全选", self.select_all_generate)
+        self.select_all_button.setIcon(icon("check"))
+        self.select_all_button.setAccessibleDescription("勾选所有文件用于生成")
+        title_row.addWidget(self.select_all_button)
+        self.unselect_all_button = self._button("取消全选", self.unselect_all_generate)
+        self.unselect_all_button.setIcon(icon("square"))
+        self.unselect_all_button.setAccessibleDescription("取消所有文件的生成勾选")
+        title_row.addWidget(self.unselect_all_button)
+        sort_button = self._button("", self.sort_queue)
+        sort_button.setIcon(icon("sort"))
+        sort_button.setFixedWidth(34)
+        sort_button.setAccessibleName("自然排序")
+        sort_button.setProperty("variant", "toolbar")
+        title_row.addWidget(sort_button)
+        more_button = QToolButton()
+        more_button.setObjectName("queueMoreButton")
+        more_button.setProperty("variant", "toolbar")
+        more_button.setIcon(icon("more", "#455c78"))
+        more_button.setIconSize(QSize(24, 24))
+        more_button.setFixedSize(36, 34)
+        more_button.setAccessibleName("队列操作")
+        more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.queue_menu = QMenu(more_button)
+        self.queue_menu.addAction(icon("plus"), "添加文件…", self.choose_input_files)
+        self.queue_menu.addAction(icon("folder"), "添加文件夹…", self.choose_input_folder)
+        self.queue_menu.addSeparator()
+        self.queue_menu.addAction("删除选中", self.remove_selected)
+        self.queue_menu.addAction("清空", self.clear_queue)
+        more_button.setMenu(self.queue_menu)
+        title_row.addWidget(more_button)
         queue_layout.addLayout(title_row)
 
         self.file_list = FileQueueWidget()
@@ -114,131 +152,194 @@ class AnnotationPanel(QWidget):
         self.file_list.itemChanged.connect(self.on_queue_item_changed)
         self.file_list.itemDoubleClicked.connect(self.open_original_file)
         self.file_list.customContextMenuRequested.connect(self.show_queue_context_menu)
-        queue_layout.addWidget(self.file_list)
+        queue_layout.addWidget(self.file_list, 1)
+        self.count_label = QLabel("拖入图片或文件夹，开始标定与测量")
+        self.count_label.setProperty("role", "muted")
+        self.count_label.setWordWrap(True)
+        queue_layout.addWidget(self.count_label)
+        self.content_splitter.addWidget(queue_box)
 
-        queue_buttons = QHBoxLayout()
-        queue_buttons.addWidget(self._button("添加文件", self.choose_input_files))
-        queue_buttons.addWidget(self._button("添加文件夹", self.choose_input_folder))
-        queue_buttons.addWidget(self._button("自然排序", self.sort_queue))
-        queue_layout.addLayout(queue_buttons)
-
-        queue_buttons_2 = QHBoxLayout()
-        queue_buttons_2.addWidget(self._button("全选", self.select_all_generate))
-        queue_buttons_2.addWidget(self._button("取消全选", self.unselect_all_generate))
-        queue_buttons_2.addWidget(self._button("删除选中", self.remove_selected))
-        queue_buttons_2.addWidget(self._button("清空", self.clear_queue))
-        queue_layout.addLayout(queue_buttons_2)
-        main_layout.addWidget(queue_box, stretch=1)
-
-        right_panel = QWidget()
+        right_panel = QFrame()
+        right_panel.setProperty("panel", True)
+        right_panel.setMinimumWidth(300)
+        right_panel.setMaximumWidth(390)
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
-        output_box = QGroupBox("输出")
-        output_layout = QVBoxLayout(output_box)
-        self.output_edit = QLineEdit(str(Path.cwd() / DEFAULTS["output_filename"]))
-        self.output_format_group = QButtonGroup(self)
-        self.output_format_group.setExclusive(True)
-        self.output_format_buttons: dict[str, QRadioButton] = {}
-        format_row = QHBoxLayout()
-        format_row.addWidget(QLabel("输出格式"))
-        for label in OUTPUT_FORMATS:
-            button = QRadioButton(label)
-            self.output_format_group.addButton(button)
-            self.output_format_buttons[label] = button
-            format_row.addWidget(button)
-        format_row.addStretch()
-        self.output_format_buttons["PPTX"].setChecked(True)
-        output_layout.addLayout(format_row)
-        output_layout.addWidget(QLabel("输出文件"))
-        output_path_row = QHBoxLayout()
-        output_path_row.addWidget(self.output_edit, 1)
-        output_path_row.addWidget(self._button("另存为", self.choose_output))
-        output_layout.addLayout(output_path_row)
-        right_layout.addWidget(output_box)
-
-        options_box = QGroupBox("标尺设置")
-        form = QFormLayout(options_box)
-        self.auto_scale_check = QCheckBox("自动选择标尺长度")
+        right_layout.setContentsMargins(1, 10, 1, 1)
+        right_layout.setSpacing(0)
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        settings = QWidget()
+        settings.setObjectName("inspectorContents")
+        settings_layout = QVBoxLayout(settings)
+        settings_layout.setContentsMargins(18, 7, 18, 10)
+        settings_layout.setSpacing(14)
+        settings_layout.addLayout(section_heading("标尺设置", "ruler"))
+        self.scale_form = QFormLayout()
+        self.scale_form.setVerticalSpacing(12)
+        self.scale_form.setHorizontalSpacing(12)
+        self.scale_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.auto_scale_check = ToggleSwitch("自动选择标尺长度")
         self.auto_scale_check.setChecked(True)
         self.auto_scale_check.toggled.connect(self.on_auto_scale_toggled)
-        self.auto_scale_combo = NoWheelComboBox()
-        self.auto_scale_combo.addItems(list(AUTO_SCALE_PRESETS.keys()))
-        self.auto_scale_combo.setCurrentText(label_for_value(AUTO_SCALE_PRESETS, DEFAULTS["auto_scale_preset"]))
+        self.auto_scale_choice = SegmentedControl(list(AUTO_SCALE_PRESETS))
+        self.auto_scale_choice.setCurrentText(label_for_value(AUTO_SCALE_PRESETS, DEFAULTS["auto_scale_preset"]))
         self.fixed_scale_edit = QLineEdit(DEFAULTS["fixed_scale"])
         self.fixed_scale_edit.setEnabled(False)
 
         self.position_combo = NoWheelComboBox()
         self.position_combo.addItems(list(POSITIONS.keys()))
         self.position_combo.setCurrentText(label_for_value(POSITIONS, DEFAULTS["scale_position"]))
-        self.color_edit = QLineEdit(DEFAULTS["bar_color"])
+        self.color_edit = QLineEdit(QColor(DEFAULTS["bar_color"]).name().upper())
         self.line_width_spin = NoWheelDoubleSpinBox()
         self.line_width_spin.setRange(0.25, 20.0)
         self.line_width_spin.setDecimals(2)
+        self.line_width_spin.setSuffix(" pt")
         self.line_width_spin.setSingleStep(0.25)
         self.line_width_spin.setValue(DEFAULTS["line_width_pt"])
         self.font_spin = NoWheelSpinBox()
         self.font_spin.setRange(0, 72)
         self.font_spin.setValue(DEFAULTS["font_size_pt"])
         self.font_spin.setSpecialValueText("自动")
+        self.font_spin.setSuffix(" pt")
         self.font_bold_check = QCheckBox("加粗")
         self.font_bold_check.setChecked(bool(DEFAULTS["font_bold"]))
         self.margin_edit = QLineEdit(f"{DEFAULT_MARGIN_INCHES:g}")
         self.inset_x_spin = NoWheelSpinBox()
         self.inset_x_spin.setRange(0, 40)
         self.inset_x_spin.setValue(DEFAULTS["inset_x_percent"])
+        self.inset_x_spin.setSuffix(" %")
         self.inset_y_spin = NoWheelSpinBox()
         self.inset_y_spin.setRange(0, 40)
         self.inset_y_spin.setValue(DEFAULTS["inset_y_percent"])
+        self.inset_y_spin.setSuffix(" %")
 
         color_row = QHBoxLayout()
+        self.color_button = self._button("", self.choose_color)
+        self.color_button.setFixedWidth(34)
+        self.color_button.setAccessibleName("选择标尺颜色")
+        color_row.addWidget(self.color_button)
         color_row.addWidget(self.color_edit)
-        color_row.addWidget(self._button("取色", self.choose_color))
+        self.color_edit.textChanged.connect(self.update_color_swatch)
+        self.update_color_swatch()
 
-        form.addRow("长度策略", self.auto_scale_check)
-        form.addRow("自动档位", self.auto_scale_combo)
-        form.addRow("固定长度", self.fixed_scale_edit)
-        form.addRow("角落位置", self.position_combo)
-        form.addRow("横向内缩 (%)", self.inset_x_spin)
-        form.addRow("纵向内缩 (%)", self.inset_y_spin)
-        form.addRow("线宽 pt", self.line_width_spin)
-        form.addRow("颜色", color_row)
-        form.addRow("字体大小 pt", self.font_spin)
-        form.addRow("字体样式", self.font_bold_check)
-        form.addRow("页面边距 inch", self.margin_edit)
-        right_layout.addWidget(options_box)
+        automatic_row = QHBoxLayout()
+        automatic_row.addStretch()
+        automatic_row.addWidget(self.auto_scale_check)
+        self.scale_form.addRow("自动长度", automatic_row)
+        self.scale_form.addRow("标尺长度", self.auto_scale_choice)
+        self.scale_form.addRow("固定长度", self.fixed_scale_edit)
+        self.scale_form.addRow("位置", self.position_combo)
+        self.scale_form.addRow("线宽", self.line_width_spin)
+        self.scale_form.addRow("颜色", color_row)
+        settings_layout.addLayout(self.scale_form)
+        self.on_auto_scale_toggled(True)
 
-        action_row = QHBoxLayout()
-        action_row.addStretch()
+        self.advanced_toggle = QToolButton()
+        self.advanced_toggle.setObjectName("advancedToggle")
+        self.advanced_toggle.setText("更多设置")
+        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.advanced_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.advanced_toggle.toggled.connect(self.toggle_advanced_options)
+        settings_layout.addWidget(self.advanced_toggle)
+        self.advanced_options = QWidget()
+        advanced_form = QFormLayout(self.advanced_options)
+        advanced_form.setContentsMargins(0, 0, 0, 0)
+        advanced_form.setSpacing(8)
+        advanced_form.addRow("横向内缩", self.inset_x_spin)
+        advanced_form.addRow("纵向内缩", self.inset_y_spin)
+        advanced_form.addRow("字体大小", self.font_spin)
+        advanced_form.addRow("字体样式", self.font_bold_check)
+        advanced_form.addRow("页边距 inch", self.margin_edit)
+        self.advanced_options.setVisible(False)
+        settings_layout.addWidget(self.advanced_options)
+
+        settings_layout.addLayout(section_heading("导出设置", "document"))
+        self.output_format_control = SegmentedControl(list(OUTPUT_FORMATS))
+        settings_layout.addWidget(self.output_format_control)
+        self.output_hint = QLabel("每张图片一页 · 标注可编辑")
+        self.output_hint.setProperty("role", "muted")
+        self.output_hint.setWordWrap(True)
+        settings_layout.addWidget(self.output_hint)
+        save_label = QLabel("保存位置")
+        save_label.setProperty("role", "muted")
+        settings_layout.addWidget(save_label)
+        self.output_edit = PathLineEdit(str(Path.cwd() / DEFAULTS["output_filename"]))
+        self.output_edit.setMinimumWidth(0)
+        self.output_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        output_path_row = QHBoxLayout()
+        output_path_row.setSpacing(6)
+        output_path_row.addWidget(self.output_edit, 1)
+        save_button = self._button("", self.choose_output)
+        save_button.setIcon(icon("folder"))
+        save_button.setFixedWidth(36)
+        save_button.setAccessibleName("另存为")
+        output_path_row.addWidget(save_button)
+        settings_layout.addLayout(output_path_row)
+        settings_layout.addStretch()
+        self.settings_scroll.setWidget(settings)
+        right_layout.addWidget(self.settings_scroll, 1)
+
+        actions = QVBoxLayout()
+        actions.setContentsMargins(18, 12, 18, 16)
+        actions.setSpacing(10)
+        self.export_count = QLabel("已勾选 0 张")
+        self.export_count.setProperty("role", "muted")
+        actions.addWidget(self.export_count)
         self.generate_button = QPushButton("生成 PPTX")
+        self.generate_button.setObjectName("generateButton")
+        self.generate_button.setProperty("variant", "primary")
+        self.generate_button.setIcon(icon("download", "#ffffff"))
+        self.generate_button.setIconSize(QSize(18, 18))
         self.generate_button.clicked.connect(self.generate)
-        self.output_format_group.buttonToggled.connect(self.on_output_format_changed)
-        action_row.addWidget(self.generate_button)
-        right_layout.addLayout(action_row)
+        self.output_format_control.group.buttonToggled.connect(self.on_output_format_changed)
+        actions.addWidget(self.generate_button)
+        right_layout.addLayout(actions)
+        self.content_splitter.addWidget(right_panel)
+        self.content_splitter.setStretchFactor(0, 1)
+        self.content_splitter.setStretchFactor(1, 0)
+        self.content_splitter.setSizes([794, 342])
 
-        right_layout.addStretch()
-        main_layout.addWidget(right_panel, stretch=1)
+    @Slot(bool)
+    def toggle_advanced_options(self, expanded: bool) -> None:
+        self.advanced_options.setVisible(expanded)
+        self.advanced_toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+
+    @Slot()
+    def update_color_swatch(self) -> None:
+        color = QColor(self.color_edit.text().strip())
+        self.color_button.setText("" if color.isValid() else "?")
+        self.color_button.setStyleSheet(
+            f"background-color: {color.name() if color.isValid() else '#ffffff'}; border: 1px solid #dce3ed;"
+        )
 
     def _button(self, text: str, callback) -> QPushButton:
         button = QPushButton(text)
+        button.setIconSize(QSize(17, 17))
         button.clicked.connect(callback)
         return button
 
     def current_output_format(self) -> str:
-        for label, output_format in OUTPUT_FORMATS.items():
-            if self.output_format_buttons[label].isChecked():
-                return output_format
-        return OUTPUT_FORMATS["PPTX"]
+        return OUTPUT_FORMATS[self.output_format_control.currentText()]
 
     def current_output_suffix(self) -> str:
         return f".{self.current_output_format()}"
 
-    def on_output_format_changed(self, *_args) -> None:
-        suffix = self.current_output_suffix()
+    def on_output_format_changed(self, _button: QPushButton, checked: bool) -> None:
+        if not checked:
+            return
+        output_format = self.current_output_format()
+        suffix = f".{output_format}"
         output_text = self.output_edit.text().strip()
         if output_text:
             self.output_edit.setText(str(Path(output_text).with_suffix(suffix)))
-        self.generate_button.setText(f"生成 {self.current_output_format().upper()}")
+        self.generate_button.setText(f"生成 {output_format.upper()}")
+        self.output_hint.setText(
+            "每张图片一页 · 标注可编辑" if output_format == "pptx"
+            else "每张图片一个文件 · 矢量标注"
+        )
 
     def choose_input_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择 SEM 图片文件夹", str(Path.cwd()))
@@ -276,6 +377,8 @@ class AnnotationPanel(QWidget):
             self.color_edit.setText(color.name().upper())
 
     def open_original_file(self, item: QTableWidgetItem) -> None:
+        if item.column() != COL_NAME:
+            return
         path = self.item_path(item.row())
         if not path.exists():
             QMessageBox.warning(self, "文件不存在", str(path))
@@ -289,22 +392,25 @@ class AnnotationPanel(QWidget):
         existing = {path_key(self.item_path(row)) for row in range(self.file_list.rowCount())}
         added = False
         for path in image_paths_from_inputs(paths):
-            resolved = path.resolve()
-            if path_key(resolved) in existing:
+            key = path_key(path)
+            if key in existing:
                 continue
-            existing.add(path_key(resolved))
-            self.add_queue_row(resolved, generate=True)
+            existing.add(key)
+            self.add_queue_row(path, generate=True)
             added = True
         if added:
             self.refresh_item_labels()
             self.update_count()
+            self._notify_queue_changed()
+            if not self.selected_rows():
+                self.file_list.selectRow(0)
 
     def select_path(self, path: Path) -> int:
         key = path_key(path)
         for row in range(self.file_list.rowCount()):
             if path_key(self.item_path(row)) == key:
                 self.file_list.selectRow(row)
-                self.file_list.scrollToItem(self.file_list.item(row, COL_NAME))
+                self.file_list.scrollTo(self.file_list.model().index(row, COL_NAME))
                 return row
         return -1
 
@@ -355,16 +461,13 @@ class AnnotationPanel(QWidget):
                 f"已知长度：{scale_input_from_nm(override.known_length_nm)}\n"
                 f"标定线：{override.pixel_length:.3f} px"
             )
-            item.setIcon(QIcon())
         elif calibration is not None:
             status = f"元数据标定：{calibration.nm_per_pixel:g} nm/px\n来源：{calibration.source}"
-            item.setIcon(QIcon())
         else:
             error = self.calibration_errors.get(key)
             detail = f"\n读取错误：{error}" if error else ""
             status = f"未检测到像素标定。请右键此图片选择“手动标定…”{detail}"
-            item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning))
-        item.setToolTip(f"{path}\n\n{status}")
+        item.setData(Qt.ItemDataRole.WhatsThisRole, status)
 
     def checkbox_item(self, checked: bool) -> QTableWidgetItem:
         item = QTableWidgetItem()
@@ -377,7 +480,6 @@ class AnnotationPanel(QWidget):
         item = QTableWidgetItem(text)
         item.setData(Qt.ItemDataRole.UserRole, str(path))
         item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-        item.setToolTip(str(path))
         return item
 
     def add_queue_row(self, path: Path, generate: bool) -> None:
@@ -442,10 +544,6 @@ class AnnotationPanel(QWidget):
             parts.append(f"测距 {distance_count}")
         return "+".join(parts) if parts else "编辑"
 
-    def refresh_measurement_statuses(self) -> None:
-        for row in range(self.file_list.rowCount()):
-            self.update_measurement_status(row)
-
     def checked_paths(self) -> list[Path]:
         paths: list[Path] = []
         for row in range(self.file_list.rowCount()):
@@ -480,28 +578,36 @@ class AnnotationPanel(QWidget):
                 if name_counts.get(path.name.lower(), 0) > 1:
                     display_name = f"{path.name} [{path.parent.name or path.parent}]"
                 name_item.setText(display_name)
-                self.update_file_calibration_status(row)
 
     def update_count(self, *_args) -> None:
         total = self.file_list.rowCount()
-        selected = len(self.checked_paths())
-        measurement = len(self.marked_measurement_paths())
+        checked = self.checked_paths()
+        marked = [path for path in checked if self.measurement_overrides.get(path_key(path))]
+        selected = len(checked)
+        measurement = len(marked)
         marked_annotations = [
             annotation
-            for path in self.marked_measurement_paths()
+            for path in marked
             for annotation in self.measurement_overrides.get(path_key(path), [])
         ]
         thickness = sum(1 for annotation in marked_annotations if annotation.kind == "thickness")
         distance = sum(1 for annotation in marked_annotations if annotation.kind == "distance")
-        missing_calibration = len(self.missing_calibration_paths(self.checked_paths()))
-        missing_text = f"，缺标定 {missing_calibration}" if missing_calibration else ""
+        missing_calibration = len(self.missing_calibration_paths(checked))
+        missing_text = f" · 缺标定 {missing_calibration}" if missing_calibration else ""
+        self.queue_total.setText(f"{total} 个文件")
         self.count_label.setText(
-            f"生成 {selected} / 共 {total}，已标 {measurement}，膜厚 {thickness}，测距 {distance}{missing_text}"
+            f"已标注 {measurement} 张 · 膜厚 {thickness} · 测距 {distance}{missing_text}"
+            if total else "拖入图片或文件夹，开始标定与测量"
         )
-        self.queue_changed.emit(total)
+        self.export_count.setText(f"已勾选 {selected} 张{missing_text}")
+        self.file_list.resizeColumnToContents(COL_MEASUREMENT)
+
+    def _notify_queue_changed(self) -> None:
+        self.queue_changed.emit([self.item_path(row) for row in range(self.file_list.rowCount())])
 
     def on_queue_item_changed(self, item: QTableWidgetItem) -> None:
-        self.update_count()
+        if item.column() == COL_GENERATE:
+            self.update_count()
 
     def on_measurement_edit_requested(self, cell: MeasurementCellWidget) -> None:
         row = self.row_for_measurement_cell(cell)
@@ -541,7 +647,10 @@ class AnnotationPanel(QWidget):
 
     def remove_selected(self) -> None:
         for row in self.selected_rows():
-            key = path_key(self.item_path(row))
+            path = self.item_path(row)
+            key = path_key(path)
+            self.file_list.name_delegate.thumbnails.pop(str(path), None)
+            self.file_list.name_delegate.pending.pop(str(path), None)
             self.measurement_overrides.pop(key, None)
             self.calibration_overrides.pop(key, None)
             self.metadata_calibrations.pop(key, None)
@@ -550,15 +659,19 @@ class AnnotationPanel(QWidget):
             self.file_list.removeRow(row)
         self.refresh_item_labels()
         self.update_count()
+        self._notify_queue_changed()
 
     def sort_queue(self) -> None:
+        selected = self.selected_rows()
+        selected_path = self.item_path(selected[0]) if selected else None
         rows = [(self.item_path(row), self.row_checked(row, COL_GENERATE)) for row in range(self.file_list.rowCount())]
         rows.sort(key=lambda row: natural_key(row[0]))
         self.file_list.setRowCount(0)
         for path, generate in rows:
             self.add_queue_row(path, generate=generate)
         self.refresh_item_labels()
-        self.refresh_measurement_statuses()
+        if selected_path is not None:
+            self.select_path(selected_path)
         self.update_count()
 
     def reorder_queue_rows(self, rows: list[int], drop_row: int) -> None:
@@ -582,7 +695,6 @@ class AnnotationPanel(QWidget):
         for path, generate in reordered_rows:
             self.add_queue_row(path, generate=generate)
         self.refresh_item_labels()
-        self.refresh_measurement_statuses()
         self.file_list.clearSelection()
         for row in range(insert_at, insert_at + len(moved_rows)):
             for column in range(self.file_list.columnCount()):
@@ -593,20 +705,26 @@ class AnnotationPanel(QWidget):
 
     def clear_queue(self) -> None:
         self.file_list.setRowCount(0)
+        self.file_list.name_delegate.timer.stop()
+        self.file_list.name_delegate.pending.clear()
+        self.file_list.name_delegate.thumbnails.clear()
         self.measurement_overrides.clear()
         self.calibration_overrides.clear()
         self.metadata_calibrations.clear()
         self.calibration_errors.clear()
         self.update_count()
+        self.queue_changed.emit([])
 
     def select_all_generate(self) -> None:
-        for row in range(self.file_list.rowCount()):
-            self.set_row_checked(row, COL_GENERATE, True)
-        self.update_count()
+        self._set_all_generate(True)
 
     def unselect_all_generate(self) -> None:
-        for row in range(self.file_list.rowCount()):
-            self.set_row_checked(row, COL_GENERATE, False)
+        self._set_all_generate(False)
+
+    def _set_all_generate(self, checked: bool) -> None:
+        with QSignalBlocker(self.file_list):
+            for row in range(self.file_list.rowCount()):
+                self.set_row_checked(row, COL_GENERATE, checked)
         self.update_count()
 
     def clear_selected_measurements(self) -> None:
@@ -632,7 +750,7 @@ class AnnotationPanel(QWidget):
                 self.metadata_calibrations.get(key),
                 self,
             )
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "无法手动标定", str(exc))
             return
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -684,7 +802,7 @@ class AnnotationPanel(QWidget):
                 parent=self,
                 calibration=calibration,
             )
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "无法编辑测量", str(exc))
             return
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -697,8 +815,10 @@ class AnnotationPanel(QWidget):
             self.update_count()
 
     def on_auto_scale_toggled(self, checked: bool) -> None:
-        self.auto_scale_combo.setEnabled(checked)
+        self.auto_scale_choice.setEnabled(checked)
         self.fixed_scale_edit.setEnabled(not checked)
+        self.scale_form.setRowVisible(self.auto_scale_choice, checked)
+        self.scale_form.setRowVisible(self.fixed_scale_edit, not checked)
 
     def generate(self) -> None:
         if self.thread is not None:
@@ -738,7 +858,7 @@ class AnnotationPanel(QWidget):
                 "output_path": output_path,
                 "output_format": output_format,
                 "fixed_scale": fixed_scale,
-                "auto_scale_preset": AUTO_SCALE_PRESETS[self.auto_scale_combo.currentText()],
+                "auto_scale_preset": AUTO_SCALE_PRESETS[self.auto_scale_choice.currentText()],
                 "position": POSITIONS[self.position_combo.currentText()],
                 "bar_color": self.color_edit.text().strip(),
                 "font_size": self.font_spin.value() or None,
@@ -781,7 +901,7 @@ class AnnotationPanel(QWidget):
                         scale_fraction_warnings.append(f"- {path.name}: 占图宽 {fraction:.1%}，可能过短")
                     elif fraction > 0.80:
                         scale_fraction_warnings.append(f"- {path.name}: 占图宽 {fraction:.1%}，可能过长")
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "参数错误", str(exc))
             return
 
@@ -807,12 +927,12 @@ class AnnotationPanel(QWidget):
         self.worker = GeneratorWorker(options)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
-        self.worker.log.connect(self.append_log, Qt.QueuedConnection)
-        self.worker.finished.connect(self.on_finished, Qt.QueuedConnection)
-        self.worker.failed.connect(self.on_failed, Qt.QueuedConnection)
-        self.worker.done.connect(self.thread.quit, Qt.DirectConnection)
+        self.worker.log.connect(self.append_log, Qt.ConnectionType.QueuedConnection)
+        self.worker.finished.connect(self.on_finished, Qt.ConnectionType.QueuedConnection)
+        self.worker.failed.connect(self.on_failed, Qt.ConnectionType.QueuedConnection)
+        self.worker.done.connect(self.thread.quit, Qt.ConnectionType.DirectConnection)
         self.worker.done.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self._cleanup_worker, Qt.QueuedConnection)
+        self.thread.finished.connect(self._cleanup_worker, Qt.ConnectionType.QueuedConnection)
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
@@ -841,6 +961,7 @@ class AnnotationPanel(QWidget):
 
     @Slot()
     def _cleanup_worker(self) -> None:
+        assert self.thread is not None
         self.thread.wait()
         self.thread = None
         self.worker = None

@@ -42,10 +42,23 @@ class GeneratorWorker(QObject):
         try:
             output_format = self.options["output_format"]
             self.log.emit(f"正在生成 {output_format.upper()}...")
-            arguments = dict(self.options)
-            arguments.pop("output_format")
             generator = {"pptx": generate_pptx, "svg": generate_svg}[output_format]
-            items = generator(**arguments)
+            items = generator(
+                input_path=self.options["input_path"],
+                output_path=self.options["output_path"],
+                fixed_scale=self.options["fixed_scale"],
+                auto_scale_preset=self.options["auto_scale_preset"],
+                position=self.options["position"],
+                bar_color=self.options["bar_color"],
+                font_size=self.options["font_size"],
+                font_bold=self.options["font_bold"],
+                margin_inches=self.options["margin_inches"],
+                inset_x_percent=self.options["inset_x_percent"],
+                inset_y_percent=self.options["inset_y_percent"],
+                line_width_pt=self.options["line_width_pt"],
+                measurement_overrides=self.options["measurement_overrides"],
+                calibration_overrides=self.options["calibration_overrides"],
+            )
             if output_format == "svg":
                 output_paths = [
                     svg_output_path(self.options["output_path"], item, index)

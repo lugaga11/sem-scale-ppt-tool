@@ -20,6 +20,7 @@ if sys.platform == "win32":
 a = Analysis(
     [str(project / "main.py")],
     pathex=[str(project)],
+    datas=[(str(project / "sem_tool" / "assets"), "sem_tool/assets")],
     # Unrelated scientific/notebook stacks in conda must not enter the GUI build.
     excludes=["PyQt5", "PyQt6", "PySide2", "tkinter", "IPython", "jupyter", "matplotlib", "scipy", "pandas", "pytest"],
 )

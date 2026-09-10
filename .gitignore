@@ -17,3 +17,4 @@ venv/
 *.pptx
 *.ppt
 *.svg
+!sem_tool/assets/*.svg

@@ -6,6 +6,7 @@ import threading
 import unittest
 from contextlib import closing
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 from xml.etree import ElementTree
 from zipfile import ZipFile
@@ -15,7 +16,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QMimeData, Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
+from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -26,6 +28,7 @@ from sem_tool.files import image_paths_from_inputs, path_key
 from sem_tool.imaging import image_to_display_rgb
 from sem_tool.search.engine import SearchResult, extract_features
 from sem_tool.search.index import ImageIndex
+from sem_tool.search.ui import ResultWidget
 from sem_tool.search.worker import ProgressThrottler, SearchWorker
 from sem_tool.settings import AppSettings, default_db_path
 
@@ -128,7 +131,7 @@ class SearchCoreTests(unittest.TestCase):
 class SearchAnnotationWorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.app = QApplication.instance() or QApplication([])
+        cls.app = cast(QApplication, QApplication.instance() or QApplication([]))
         cls.app.setQuitOnLastWindowClosed(False)
 
     def setUp(self) -> None:
@@ -152,9 +155,11 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.window.close()
         self.wait_until(lambda: self.window.search_panel.thread is None and self.window.annotation_panel.thread is None)
         self.message_timer.stop()
+        self.window.annotation_panel.file_list.dismiss_hover()
+        self.window.annotation_panel.file_list.name_delegate.timer.stop()
         self.app.clipboard().clear()
         self.window.deleteLater()
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()
         self.environment.stop()
         self.temp.cleanup()
@@ -179,6 +184,240 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         path = self.root / name
         texture().save(path, tiffinfo={270: "PixelSize=2.5"})
         return path
+
+    def test_queue_thumbnails_preserve_16_bit_display_and_sort_keeps_selection(self) -> None:
+        first = self.make_original("10.tif")
+        second = self.root / "2.tif"
+        values = np.tile(np.linspace(1000, 54000, 320, dtype=np.uint16), (240, 1))
+        Image.fromarray(values).save(second, tiffinfo={270: "PixelSize=5"})
+        original_bytes = second.read_bytes()
+        with closing(Image.open(second)) as image:
+            expected = image_to_display_rgb(image)
+        panel = self.window.annotation_panel
+        panel.add_paths([first, second])
+        self.window.show()
+        panel.select_path(second)
+        thumbnails = panel.file_list.name_delegate.thumbnails
+        self.wait_until(lambda: str(second) in thumbnails)
+        thumbnail = thumbnails[str(second)].toImage()
+        self.assertFalse(thumbnail.isNull())
+        self.assertLessEqual(thumbnail.width(), 64)
+        self.assertLessEqual(thumbnail.height(), 44)
+        expected_pixels = np.asarray(expected.resize((thumbnail.width(), thumbnail.height()), Image.Resampling.BILINEAR))
+        for x in (5, 25, 50):
+            self.assertAlmostEqual(thumbnail.pixelColor(x, 20).red(), int(expected_pixels[20, x, 0]), delta=3)
+        self.assertEqual(second.read_bytes(), original_bytes)
+
+        panel.set_row_checked(1, 0, False)
+        panel.sort_queue()
+        self.assertEqual(panel.item_path(0), second)
+        self.assertEqual(panel.selected_rows(), [0])
+        self.assertFalse(panel.row_checked(0, 0))
+        panel.remove_selected()
+        self.assertEqual(panel.file_list.rowCount(), 1)
+        self.assertNotIn(str(second), thumbnails)
+        panel.clear_queue()
+        self.assertEqual(panel.file_list.rowCount(), 0)
+        self.assertFalse(thumbnails)
+
+    def test_unreadable_thumbnail_does_not_reuse_another_image(self) -> None:
+        original = self.make_original()
+        broken = self.root / "损坏图片.tif"
+        broken.write_bytes(b"not a TIFF")
+        panel = self.window.annotation_panel
+        panel.add_paths([original, broken])
+        self.window.show()
+        thumbnails = panel.file_list.name_delegate.thumbnails
+        self.wait_until(lambda: str(original) in thumbnails and str(broken) in thumbnails)
+        self.assertFalse(thumbnails[str(original)].isNull())
+        self.assertTrue(thumbnails[str(broken)].isNull())
+        self.assertEqual(self.messages, [])
+
+    def test_drag_import_and_toolbar_bulk_checks_preserve_measurements_and_selection(self) -> None:
+        original = self.make_original()
+        folder = self.root / "子目录"
+        folder.mkdir()
+        second = self.make_original("子目录/第二张.tif")
+        panel = self.window.annotation_panel
+        queue_changes = []
+        panel.queue_changed.connect(queue_changes.append)
+        self.window.resize(940, 620)
+        self.window.show()
+        self.app.processEvents()
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(original)), QUrl.fromLocalFile(str(folder))])
+        enter = QDragEnterEvent(QPoint(10, 10), Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        drop = QDropEvent(QPointF(10, 10), Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        self.app.sendEvent(panel.file_list.viewport(), enter)
+        self.app.sendEvent(panel.file_list.viewport(), drop)
+        self.assertTrue(drop.isAccepted())
+        self.assertEqual(panel.checked_paths(), [original, second])
+        panel.select_path(original)
+        annotations = [MeasurementOverride("distance", 20, 70, 120, 70)]
+        panel.measurement_overrides[path_key(original)] = annotations
+        with patch.object(panel, "update_count", wraps=panel.update_count) as update_count:
+            QTest.mouseClick(panel.unselect_all_button, Qt.MouseButton.LeftButton)
+            update_count.assert_called_once()
+        self.assertEqual(panel.checked_paths(), [])
+        self.assertEqual(panel.selected_rows(), [0])
+        self.assertEqual(panel.measurement_overrides[path_key(original)], annotations)
+
+        self.assertEqual(queue_changes, [[original, second]])
+
+        actions = {action.text(): action for action in panel.queue_menu.actions()}
+        with patch("sem_tool.annotation.ui.QFileDialog.getOpenFileNames", return_value=([str(original)], "")):
+            actions["添加文件…"].trigger()
+        with patch("sem_tool.annotation.ui.QFileDialog.getExistingDirectory", return_value=str(folder)):
+            actions["添加文件夹…"].trigger()
+        self.assertEqual(panel.file_list.rowCount(), 2)
+        self.assertEqual(panel.checked_paths(), [])
+        QTest.mouseClick(panel.select_all_button, Qt.MouseButton.LeftButton)
+        self.assertEqual(panel.checked_paths(), [original, second])
+        self.assertEqual(panel.measurement_overrides[path_key(original)], annotations)
+
+    def test_thumbnail_hover_enlarges_original_preserves_pixels_and_hides_on_leave_and_scroll(self) -> None:
+        original = self.root / "16位悬停.tif"
+        values = np.tile(np.linspace(1000, 54000, 320, dtype=np.uint16), (240, 1))
+        Image.fromarray(values).save(original, tiffinfo={270: "PixelSize=2.5"})
+        before = original.read_bytes()
+        panel = self.window.annotation_panel
+        panel.add_paths([original] + [self.make_original(f"{number}.tif") for number in range(12)])
+        panel.select_path(panel.item_path(1))
+        self.window.show()
+        self.app.processEvents()
+        queue = panel.file_list
+        target = queue.name_delegate.thumbnail_rect(queue.visualRect(queue.model().index(0, 1))).center()
+        QTest.mouseMove(queue.viewport(), QPoint(1, 1))
+        QTest.mouseMove(queue.viewport(), target)
+        self.wait_until(lambda: queue.hover_card.isVisible())
+        card = queue.hover_card
+        self.assertEqual(card.path, original)
+        self.assertEqual(card.original_size.toTuple(), (320, 240))
+        self.assertGreater(card.image.pixmap.width(), 64)
+        self.assertGreater(card.image.pixmap.toImage().pixelColor(250, 50).red(), 180)
+        self.assertIn("TIFF", card.metadata.text())
+        self.assertIn("2.5 nm/px", card.details.text())
+        self.assertEqual(panel.selected_rows(), [1])
+        self.assertEqual(original.read_bytes(), before)
+        self.assertTrue(card.screen().availableGeometry().contains(card.geometry()))
+
+        QTest.mouseMove(queue.viewport(), target + QPoint(130, 0))
+        self.assertFalse(card.isVisible())
+        QTest.mouseMove(queue.viewport(), target)
+        self.wait_until(lambda: card.isVisible())
+        queue.verticalScrollBar().setValue(queue.verticalScrollBar().maximum())
+        self.assertFalse(card.isVisible())
+        self.assertFalse(queue.hover_timer.isActive())
+
+    def test_hover_reloads_changed_files_clears_failed_image_and_closes_when_queue_is_cleared(self) -> None:
+        original = self.make_original()
+        panel = self.window.annotation_panel
+        panel.add_paths([original])
+        self.window.show()
+        self.app.processEvents()
+        queue = panel.file_list
+        target = queue.name_delegate.thumbnail_rect(queue.visualRect(queue.model().index(0, 1))).center()
+        QTest.mouseMove(queue.viewport(), QPoint(1, 1))
+        QTest.mouseMove(queue.viewport(), target)
+        self.wait_until(lambda: queue.hover_card.isVisible())
+        QTest.mouseMove(queue.viewport(), target + QPoint(130, 0))
+        Image.new("L", (200, 100), 73).save(original)
+        QTest.mouseMove(queue.viewport(), target)
+        self.wait_until(lambda: queue.hover_card.isVisible())
+        self.assertEqual(queue.hover_card.original_size.toTuple(), (200, 100))
+        self.assertEqual(queue.hover_card.image.pixmap.toImage().pixelColor(50, 50).red(), 73)
+        QTest.mouseMove(queue.viewport(), target + QPoint(130, 0))
+        original.write_bytes(b"corrupt TIFF")
+        QTest.mouseMove(queue.viewport(), target)
+        self.wait_until(lambda: queue.hover_card.isVisible())
+        self.assertTrue(queue.hover_card.error)
+        self.assertTrue(queue.hover_card.image.pixmap.isNull())
+        panel.clear_queue()
+        self.assertFalse(queue.hover_card.isVisible())
+        self.assertFalse(queue.hover_timer.isActive())
+
+    def test_queue_double_click_opens_original_only_in_file_column(self) -> None:
+        original = self.root / "原图.tif"
+        texture().save(original)
+        panel = self.window.annotation_panel
+        panel.add_paths([original])
+        self.window.show()
+        self.app.processEvents()
+        queue = panel.file_list
+        checkbox = queue.item(0, 0)
+        assert checkbox is not None
+        with patch("sem_tool.annotation.ui.open_path") as open_original:
+            for _ in range(2):
+                position = queue.visualItemRect(checkbox).center()
+                QTest.mouseClick(queue.viewport(), Qt.MouseButton.LeftButton, pos=position)
+                QTest.mouseDClick(queue.viewport(), Qt.MouseButton.LeftButton, pos=position)
+                QTest.mouseRelease(queue.viewport(), Qt.MouseButton.LeftButton, pos=position)
+            open_original.assert_not_called()
+            position = queue.visualRect(queue.model().index(0, 1)).center()
+            QTest.mouseClick(queue.viewport(), Qt.MouseButton.LeftButton, pos=position)
+            QTest.mouseDClick(queue.viewport(), Qt.MouseButton.LeftButton, pos=position)
+            QTest.mouseRelease(queue.viewport(), Qt.MouseButton.LeftButton, pos=position)
+            open_original.assert_called_once_with(original.resolve())
+
+    def test_queue_checkboxes_and_scale_controls_respond_to_mouse_and_keyboard(self) -> None:
+        panel = self.window.annotation_panel
+        panel.add_paths([self.make_original()])
+        self.window.show()
+        self.app.processEvents()
+        queue = panel.file_list
+        checkbox = queue.item(0, 0)
+        assert checkbox is not None
+        QTest.mouseClick(queue.viewport(), Qt.MouseButton.LeftButton, pos=queue.visualItemRect(checkbox).center())
+        self.assertFalse(panel.row_checked(0, 0))
+        QTest.keyClick(queue, Qt.Key.Key_Space)
+        self.assertTrue(panel.row_checked(0, 0))
+        QTest.mouseClick(queue.viewport(), Qt.MouseButton.LeftButton, pos=queue.visualRect(queue.model().index(0, 1)).center())
+        self.assertTrue(panel.row_checked(0, 0))
+
+        QTest.mouseClick(panel.auto_scale_choice.buttons["长"], Qt.MouseButton.LeftButton)
+        self.assertEqual(panel.auto_scale_choice.currentText(), "长")
+        self.assertFalse(panel.auto_scale_choice.buttons["中"].isChecked())
+        QTest.mouseClick(panel.auto_scale_check, Qt.MouseButton.LeftButton)
+        self.assertFalse(panel.auto_scale_check.isChecked())
+        self.assertTrue(panel.fixed_scale_edit.isVisible())
+        QTest.keyClick(panel.auto_scale_check, Qt.Key.Key_Space)
+        self.assertTrue(panel.auto_scale_check.isChecked())
+        self.assertTrue(panel.auto_scale_choice.isVisible())
+        self.assertEqual(panel.auto_scale_choice.currentText(), "长")
+
+    def test_compact_inspector_keeps_generate_accessible_and_output_controls_reachable(self) -> None:
+        panel = self.window.annotation_panel
+        self.window.resize(940, 620)
+        self.window.show()
+        self.app.processEvents()
+        # Showing the status bar posts a second layout pass before its height settles.
+        layout_loop = QEventLoop()
+        QTimer.singleShot(0, layout_loop.quit)
+        layout_loop.exec()
+        button_position = panel.generate_button.mapTo(panel, panel.generate_button.rect().topLeft())
+        scroll = panel.settings_scroll.verticalScrollBar()
+        collapsed_maximum = scroll.maximum()
+        QTest.mouseClick(panel.advanced_toggle, Qt.MouseButton.LeftButton)
+        self.wait_until(lambda: scroll.maximum() > collapsed_maximum)
+        self.assertEqual(self.window.size().toTuple(), (940, 620))
+        self.assertEqual(panel.generate_button.mapTo(panel, panel.generate_button.rect().topLeft()), button_position)
+        self.assertGreater(button_position.x(), panel.width() // 2)
+        self.assertGreater(button_position.y(), panel.height() * 0.75)
+        self.assertTrue(
+            panel.rect().contains(panel.generate_button.mapTo(panel, panel.generate_button.rect().bottomRight()))
+        )
+        scroll.setValue(scroll.maximum())
+        self.app.processEvents()
+        viewport = panel.settings_scroll.viewport()
+        self.assertTrue(viewport.rect().contains(panel.output_edit.mapTo(viewport, panel.output_edit.rect().center())))
+        panel.output_format_control.buttons["SVG"].click()
+        self.assertEqual(panel.generate_button.text(), "生成 SVG")
+        self.assertEqual(Path(panel.output_edit.text()).suffix, ".svg")
+        panel.advanced_toggle.setChecked(False)
+        panel.auto_scale_check.setChecked(False)
+        self.app.processEvents()
+        self.assertTrue(panel.fixed_scale_edit.isVisible())
+        self.assertFalse(panel.auto_scale_choice.isVisible())
 
     def test_search_result_adds_without_switching_then_annotation_exports_both_formats(self) -> None:
         panel = self.window.annotation_panel
@@ -205,11 +444,12 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
 
         def apply_dialog():
             dialog = self.app.activeModalWidget()
-            self.assertIsInstance(dialog, MeasurementPreviewDialog)
+            assert isinstance(dialog, MeasurementPreviewDialog)
             dialog.preview.annotations = [annotation]
             dialog.accept()
 
         widget = search.results_list.itemWidget(search.results_list.item(0))
+        assert isinstance(widget, ResultWidget)
         self.assertEqual(widget.add_button.text(), "加入列表")
         widget.add_button.click()
         self.assertIs(self.window.tabs.currentWidget(), search)
@@ -217,16 +457,20 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.assertFalse(panel.measurement_overrides)
         self.assertEqual(self.window.tabs.tabText(0), "标注与导出 (1)")
         self.assertEqual(panel.item_path(0), original)
-        self.assertEqual(panel.effective_calibration(original).nm_per_pixel, 2.5)
+        calibration = panel.effective_calibration(original)
+        assert calibration is not None
+        self.assertEqual(calibration.nm_per_pixel, 2.5)
         self.window.tabs.setCurrentWidget(panel)
         QTimer.singleShot(0, apply_dialog)
-        panel.measurement_cell(0).edit_button.click()
+        cell = panel.measurement_cell(0)
+        assert cell is not None
+        cell.edit_button.click()
         self.assertEqual(panel.measurement_overrides[path_key(original)], [annotation])
         self.assertIs(self.window.tabs.currentWidget(), panel)
-        # Reusing the same result must preserve the measurement and generation checkbox.
+        # Importing an existing path must preserve the measurement and generation checkbox.
         panel.set_row_checked(0, 0, False)
         self.window.tabs.setCurrentWidget(search)
-        widget.add_button.click()
+        self.window.add_to_annotation_queue([original])
         self.assertIs(self.window.tabs.currentWidget(), search)
         self.assertEqual(panel.file_list.rowCount(), 1)
         self.assertFalse(panel.row_checked(0, 0))
@@ -235,7 +479,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.window.tabs.setCurrentWidget(panel)
 
         for fmt in ("SVG", "PPTX", "SVG", "PPTX"):
-            panel.output_format_buttons[fmt].setChecked(True)
+            panel.output_format_control.buttons[fmt].setChecked(True)
             panel.output_edit.setText(str(self.root / f"export.{fmt.lower()}"))
             panel.generate()
             self.wait_until(lambda: panel.thread is None)
@@ -277,34 +521,83 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
                 dialog.reject()
 
         self.window.add_to_annotation_queue([path])
-        self.assertEqual(panel.measurement_cell(0).edit_button.text(), "手动标定")
+        cell = panel.measurement_cell(0)
+        assert cell is not None
+        self.assertEqual(cell.edit_button.text(), "手动标定")
         dialog_timer = QTimer(self.window)
         dialog_timer.timeout.connect(handle_dialog)
         dialog_timer.start(10)
         try:
-            panel.measurement_cell(0).edit_button.click()
+            cell.edit_button.click()
         finally:
             dialog_timer.stop()
         self.assertEqual(calls, ["calibrate"])
         self.assertIsNone(self.app.activeModalWidget())
         self.assertIs(self.window.tabs.currentWidget(), panel)
         self.assertEqual(panel.calibration_overrides[path_key(path)], override)
-        self.assertEqual(panel.effective_calibration(path).nm_per_pixel, 10)
+        calibration = panel.effective_calibration(path)
+        assert calibration is not None
+        self.assertEqual(calibration.nm_per_pixel, 10)
         self.assertFalse(panel.measurement_overrides)
-        self.assertEqual(panel.measurement_cell(0).edit_button.text(), "编辑")
+        self.assertEqual(cell.edit_button.text(), "编辑")
         dialog_timer.start(10)
         try:
-            panel.measurement_cell(0).edit_button.click()
+            cell.edit_button.click()
         finally:
             dialog_timer.stop()
         self.assertEqual(calls, ["calibrate", "preview"])
+
+    def test_search_added_state_tracks_queue_membership_and_new_results(self) -> None:
+        original = self.make_original()
+        search = self.window.search_panel
+        panel = self.window.annotation_panel
+        search._add_result(1, SearchResult(original, 1, 20, 30, 2))
+        widget = search.results_list.itemWidget(search.results_list.item(0))
+        assert isinstance(widget, ResultWidget)
+        widget.add_button.click()
+        self.assertEqual(widget.add_button.text(), "已加入")
+        self.assertFalse(widget.add_button.isEnabled())
+        search._add_result(2, SearchResult(original, 1, 20, 30, 2))
+        duplicate = search.results_list.itemWidget(search.results_list.item(1))
+        assert isinstance(duplicate, ResultWidget)
+        self.assertEqual(duplicate.add_button.text(), "已加入")
+        panel.select_path(original)
+        panel.remove_selected()
+        for result in (widget, duplicate):
+            self.assertEqual(result.add_button.text(), "加入列表")
+            self.assertTrue(result.add_button.isEnabled())
+        panel.add_paths([original])
+        self.assertEqual(widget.add_button.text(), "已加入")
+        missing = self.root / "gone.tif"
+        search._add_result(3, SearchResult(missing, 1, 20, 30, 2))
+        failed = search.results_list.itemWidget(search.results_list.item(2))
+        assert isinstance(failed, ResultWidget)
+        failed.add_button.click()
+        self.assertEqual(failed.add_button.text(), "加入列表")
+        self.assertTrue(failed.add_button.isEnabled())
+        self.assertEqual([title for title, _ in self.messages], ["原图不可用"])
+
+    def test_editor_io_errors_are_reported_and_programming_errors_propagate(self) -> None:
+        original = self.make_original()
+        panel = self.window.annotation_panel
+        panel.add_paths([original])
+        for constructor, action in (
+            ("CalibrationDialog", panel.calibrate_selected),
+            ("MeasurementPreviewDialog", panel.preview_selected_measurement),
+        ):
+            with patch(f"sem_tool.annotation.ui.{constructor}", side_effect=OSError("cannot read image")):
+                action()
+                self.assertEqual(self.messages[-1][1], "cannot read image")
+            with patch(f"sem_tool.annotation.ui.{constructor}", side_effect=RuntimeError("unexpected bug")):
+                with self.assertRaisesRegex(RuntimeError, "unexpected bug"):
+                    action()
 
     def test_missing_result_is_reported_without_creating_a_queue_entry(self) -> None:
         self.window.add_to_annotation_queue([self.root / "gone.tif"])
         self.assertEqual([title for title, _ in self.messages], ["原图不可用"])
         self.assertEqual(self.window.annotation_panel.file_list.rowCount(), 0)
 
-    def test_multi_selection_keeps_result_order_and_same_name_files_remain_distinct(self) -> None:
+    def test_individual_result_additions_keep_order_and_same_name_files_remain_distinct(self) -> None:
         first = self.make_original()
         nested = self.root / "其他文件夹"
         nested.mkdir()
@@ -314,13 +607,16 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.window.tabs.setCurrentWidget(search)
         for rank, path in enumerate((second, first), 1):
             search._add_result(rank, SearchResult(path, 1, 20, 30, 2))
-            search.results_list.item(rank - 1).setSelected(True)
-        search.add_selected_button.click()
+            widget = search.results_list.itemWidget(search.results_list.item(rank - 1))
+            assert isinstance(widget, ResultWidget)
+            widget.add_button.click()
         self.assertIs(self.window.tabs.currentWidget(), search)
         panel = self.window.annotation_panel
         self.assertEqual(panel.file_list.columnCount(), 3)
         self.assertEqual(panel.checked_paths(), [second, first])
-        self.assertIn("其他文件夹", panel.file_list.item(0, 1).text())
+        item = panel.file_list.item(0, 1)
+        assert item is not None
+        self.assertIn("其他文件夹", item.text())
         override = MeasurementOverride("distance", 1, 1, 11, 1)
         panel.measurement_overrides[path_key(second)] = [override]
         panel.reorder_queue_rows([0], 2)
@@ -333,7 +629,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
     def test_search_shortcut_is_scoped_to_search_panel(self) -> None:
         self.assertTrue(
             all(
-                action.shortcutContext() == Qt.WidgetWithChildrenShortcut
+                action.shortcutContext() == Qt.ShortcutContext.WidgetWithChildrenShortcut
                 for action in self.window.search_panel.actions()
             )
         )
@@ -345,7 +641,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.window.show()
         panel.output_edit.setFocus()
         panel.output_edit.selectAll()
-        QTest.keyClick(panel.output_edit, Qt.Key_V, Qt.ControlModifier)
+        QTest.keyClick(panel.output_edit, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
         self.assertEqual(panel.output_edit.text(), "normal text")
 
     def test_closing_waits_for_search_worker_to_finish(self) -> None:
@@ -353,18 +649,26 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
 
         def delayed_search(_index, _root, _query, **kwargs):
             started.set()
+            kwargs["progress"](1, 4, "matching")
             kwargs["cancel_event"].wait(2)
             return []
 
         search = self.window.search_panel
+        self.window.tabs.setCurrentWidget(search)
         self.window.show()
+        self.assertTrue(search.progress.isHidden())
         with patch.object(ImageIndex, "search", autospec=True, side_effect=delayed_search):
             worker = SearchWorker(self.root, search._new_cancel_event(), query=self.root / "query.png")
             search._start_worker(worker, search._on_search_finished)
-            self.wait_until(started.is_set)
+            self.wait_until(lambda: started.is_set() and search.progress.value() == 25)
+            self.assertTrue(search.progress.isVisible())
+            self.assertEqual(search.progress.height(), 3)
+            self.assertIn("25%", search.status_label.text())
             self.assertFalse(self.window.close())
+            assert search.cancel_event is not None
             self.assertTrue(search.cancel_event.is_set())
             self.wait_until(lambda: search.thread is None and not self.window.isVisible())
+            self.assertTrue(search.progress.isHidden())
 
     def test_closing_waits_for_export_without_dropping_the_output(self) -> None:
         from sem_tool.annotation.core import generate_svg
@@ -379,7 +683,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
 
         panel = self.window.annotation_panel
         panel.add_paths([self.make_original("original.tif")])
-        panel.output_format_buttons["SVG"].setChecked(True)
+        panel.output_format_control.buttons["SVG"].setChecked(True)
         panel.output_edit.setText(str(self.root / "closing.svg"))
         self.window.show()
         with patch("sem_tool.annotation.worker.generate_svg", new=delayed_export):

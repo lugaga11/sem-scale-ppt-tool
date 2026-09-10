@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -80,8 +81,8 @@ def extract_features(path: Path, *, query: bool = False, nfeatures: int = 2500) 
     gray = to_gray(image)
     if query:
         gray = crop_query_content(gray)
-    orb = cv2.ORB_create(nfeatures=nfeatures)
-    keypoints, descriptors = orb.detectAndCompute(gray, None)
+    orb = cv2.ORB.create(nfeatures=nfeatures)
+    keypoints, descriptors = orb.detectAndCompute(gray, np.empty((0, 0), dtype=np.uint8))
     points = _keypoints_to_array(keypoints)
     if descriptors is not None:
         descriptors = np.asarray(descriptors, dtype=np.uint8)
@@ -122,8 +123,8 @@ def match_features(query: ImageFeatures, candidate: ImageFeatures) -> MatchScore
     avg_distance = float(np.mean([item.distance for item in good[:30]]))
     inliers = 0
     if len(good) >= 4:
-        source = np.float32([query.keypoints[item.queryIdx] for item in good]).reshape(-1, 1, 2)
-        target = np.float32([candidate.keypoints[item.trainIdx] for item in good]).reshape(-1, 1, 2)
+        source = np.asarray([query.keypoints[item.queryIdx] for item in good], dtype=np.float32).reshape(-1, 1, 2)
+        target = np.asarray([candidate.keypoints[item.trainIdx] for item in good], dtype=np.float32).reshape(-1, 1, 2)
         _, mask = cv2.findHomography(source, target, cv2.RANSAC, 5.0)
         if mask is not None:
             inliers = int(mask.sum())
@@ -187,7 +188,7 @@ def make_thumbnail(path: Path, *, size: int = 128) -> Optional[bytes]:
     return bytes(encoded)
 
 
-def _keypoints_to_array(keypoints: Optional[list[cv2.KeyPoint]]) -> np.ndarray:
+def _keypoints_to_array(keypoints: Optional[Sequence[cv2.KeyPoint]]) -> np.ndarray:
     if not keypoints:
         return np.empty((0, 2), dtype=np.float32)
     return np.asarray([point.pt for point in keypoints], dtype=np.float32)

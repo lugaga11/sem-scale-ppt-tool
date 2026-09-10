@@ -9,9 +9,11 @@
 python -m compileall -q main.py sem_tool tests scripts
 python -m unittest discover -s tests -v
 ruff check sem_tool main.py tests scripts
+pyright
 ```
 
 测试使用 Qt offscreen、临时目录和独立索引，不读写真实用户索引。
+Pyright 与 Pylance 共用 `pyproject.toml` 中的 basic 类型检查配置。请在项目 Python 环境中运行；也可用 `pyright --pythonpath "解释器路径"` 指定与 VS Code 相同的解释器。
 覆盖原有标尺/手动标定/16 位保真/测量编辑，以及截图命中原图、加入列表后标注、重复导入、队列排序、两种格式后台导出和运行中关闭窗口。
 
 可选：使用原搜索项目的本地截图和完整图库做回归，不复制或提交这些样例。

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
-from PySide6.QtCore import QEvent, QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeyEvent, QKeySequence, QMouseEvent, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -16,26 +17,29 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from ..files import IMAGE_FILE_FILTER, is_supported_image, open_path, reveal_path
+from ..files import IMAGE_FILE_FILTER, is_supported_image, open_path, path_key, reveal_path
+from ..image_widgets import ImageCanvas
 from ..settings import AppSettings, default_db_path
+from ..theme import icon
+from ..widgets import ElidedLabel, EmptyState, PathLineEdit, section_heading
 from .engine import SearchResult
 from .index import ImageIndex, IndexStats, IndexStatus
 from .worker import SearchWorker
 
 
-class DropLineEdit(QLineEdit):
+class DropLineEdit(PathLineEdit):
     paste_requested = Signal()
 
     def __init__(self, *args, **kwargs) -> None:
@@ -57,7 +61,7 @@ class DropLineEdit(QLineEdit):
             super().dropEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        if event.matches(QKeySequence.Paste):
+        if event.matches(QKeySequence.StandardKey.Paste):
             mime = QApplication.clipboard().mimeData()
             if mime.hasImage() or mime.hasUrls():
                 self.paste_requested.emit()
@@ -74,9 +78,10 @@ class SearchPanel(QWidget):
         super().__init__()
         self.cancel_event: Optional[threading.Event] = None
         self.thread: Optional[QThread] = None
-        self.worker: Optional[QObject] = None
+        self.worker: Optional[SearchWorker] = None
         self.work_started_at: Optional[float] = None
         self.settings = AppSettings.load()
+        self._queue_path_keys: set[str] = set()
         self.query_edit = DropLineEdit()
         self.root_edit = DropLineEdit()
         self.top_spin = QSpinBox()
@@ -86,25 +91,34 @@ class SearchPanel(QWidget):
         self.results_list = QListWidget()
         self.index_button = QPushButton("更新索引")
         self.search_button = QPushButton("搜索")
+        self.search_button.setProperty("variant", "primary")
         self.index_management_button = QPushButton("索引管理")
         self.cancel_button = QPushButton("取消")
-        self.add_selected_button = QPushButton("选中结果加入列表")
         self._build_ui()
         self._connect_signals()
         self._install_shortcuts()
         self._restore_settings()
 
     def _build_ui(self) -> None:
+        self.setObjectName("searchPanel")
         self.setAcceptDrops(True)
-        central = self
-        central.setFocusPolicy(Qt.ClickFocus)
-        central.setAcceptDrops(True)
-        root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(14, 14, 14, 14)
-        root_layout.setSpacing(10)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(16, 12, 16, 8)
+        root_layout.setSpacing(12)
+        controls_box = QFrame()
+        controls_box.setProperty("panel", True)
+        controls_layout = QVBoxLayout(controls_box)
+        controls_layout.setContentsMargins(16, 14, 16, 12)
+        controls_layout.setSpacing(10)
+        root_layout.addWidget(controls_box)
 
         form = QGridLayout()
         form.setColumnStretch(1, 1)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(10)
+        self.query_edit.setPlaceholderText("拖入 / 粘贴截图，或选择图片文件")
+        self.root_edit.setPlaceholderText("选择或拖入需要搜索的图库文件夹")
 
         query_button = QPushButton("选择截图")
         query_button.clicked.connect(self.choose_query)
@@ -112,29 +126,29 @@ class SearchPanel(QWidget):
         paste_button.clicked.connect(self.paste_from_clipboard)
         root_button = QPushButton("选择图库")
         root_button.clicked.connect(self.choose_root)
+        for button, name in ((query_button, "image"), (paste_button, "clipboard"), (root_button, "folder"),
+                             (self.index_button, "refresh"), (self.search_button, "search")):
+            button.setIcon(icon(name, "#ffffff" if button is self.search_button else "#7a8fac"))
+            button.setIconSize(QSize(16, 16))
         self.input_controls = (query_button, paste_button, root_button, self.query_edit, self.root_edit, self.top_spin)
-        self._set_uniform_width([query_button, paste_button, root_button, self.index_button])
+        self._set_uniform_width([
+            query_button, paste_button, root_button, self.index_button, self.search_button, self.cancel_button,
+        ])
         form.addWidget(QLabel("截图"), 0, 0)
         form.addWidget(self.query_edit, 0, 1)
-        query_actions = QHBoxLayout()
-        query_actions.setSpacing(6)
-        query_actions.addWidget(query_button)
-        query_actions.addWidget(paste_button)
-        form.addLayout(query_actions, 0, 2)
+        form.addWidget(query_button, 0, 2)
+        form.addWidget(paste_button, 0, 3)
 
         form.addWidget(QLabel("图库"), 1, 0)
         form.addWidget(self.root_edit, 1, 1)
-        root_actions = QHBoxLayout()
-        root_actions.setSpacing(6)
-        root_actions.addWidget(root_button)
-        root_actions.addWidget(self.index_button)
-        form.addLayout(root_actions, 1, 2)
+        form.addWidget(root_button, 1, 2)
+        form.addWidget(self.index_button, 1, 3)
 
         self.top_spin.setRange(1, 50)
         self.top_spin.setValue(10)
         self.top_spin.setFixedWidth(80)
 
-        root_layout.addLayout(form)
+        controls_layout.addLayout(form)
 
         index_menu = QMenu(self.index_management_button)
         index_menu.addAction("打开索引目录").triggered.connect(self.open_index_directory)
@@ -152,40 +166,67 @@ class SearchPanel(QWidget):
         self.index_management_button.setMenu(index_menu)
 
         buttons = QHBoxLayout()
-        buttons.addWidget(QLabel("结果数"))
+        buttons.setSpacing(10)
         buttons.addWidget(self.top_spin)
         buttons.addWidget(self.index_management_button)
         buttons.addStretch(1)
-        buttons.addWidget(self.cancel_button)
-        buttons.addWidget(self.search_button)
-        self._set_uniform_width([self.index_management_button, self.cancel_button, self.search_button])
-        root_layout.addLayout(buttons)
+        form.addWidget(QLabel("结果数"), 2, 0)
+        form.addLayout(buttons, 2, 1)
+        form.addWidget(self.cancel_button, 2, 2)
+        form.addWidget(self.search_button, 2, 3)
 
         self.cancel_button.setEnabled(False)
+        self.cancel_button.setVisible(False)
+        self.progress.setObjectName("searchProgress")
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        root_layout.addWidget(self.progress)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(3)
+        self.progress.setVisible(False)
+        controls_layout.addWidget(self.progress)
 
         self.status_label.setText("选择截图和图库后搜索原图。")
-        self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        root_layout.addWidget(self.status_label)
+        self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.status_label.setProperty("role", "status")
+        self.status_label.setWordWrap(True)
+        controls_layout.addWidget(self.status_label)
 
         self.index_status_label.setText("索引状态: 未选择图库")
-        self.index_status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        root_layout.addWidget(self.index_status_label)
+        self.index_status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.index_status_label.setProperty("role", "muted")
+        self.index_status_label.setWordWrap(True)
+        controls_layout.addWidget(self.index_status_label)
 
-        result_actions = QHBoxLayout()
-        result_actions.addWidget(QLabel("找到原图后，点击“加入列表”，稍后到“标注与导出”处理；支持 Ctrl / Shift 多选。"))
-        result_actions.addStretch()
-        result_actions.addWidget(self.add_selected_button)
-        root_layout.addLayout(result_actions)
+        results_box = QFrame()
+        results_box.setProperty("panel", True)
+        results_layout = QVBoxLayout(results_box)
+        results_layout.setContentsMargins(14, 12, 14, 10)
+        results_layout.setSpacing(10)
+        result_actions = section_heading("匹配结果", "search")
+        self.result_count = QLabel("0 个候选")
+        self.result_count.setProperty("role", "badge")
+        result_actions.insertWidget(2, self.result_count)
+        results_layout.addLayout(result_actions)
 
-        self.results_list.setSpacing(6)
-        self.results_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.results_list.setFocusPolicy(Qt.ClickFocus)
+        self.results_list.setObjectName("searchResults")
+        self.results_list.setSpacing(5)
+        self.results_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.results_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.results_list.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.results_list.setAcceptDrops(True)
-        root_layout.addWidget(self.results_list, 1)
-        self._install_drop_targets(central)
+        self.results_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        results_layout.addWidget(self.results_list, 1)
+        self.results_empty = EmptyState(self.results_list.viewport(), "等待查找原图", "选择截图和图库，搜索对应的原始图片", "search")
+        for signal in (self.results_list.model().rowsInserted, self.results_list.model().rowsRemoved,
+                       self.results_list.model().modelReset):
+            signal.connect(self._update_results_view)
+        root_layout.addWidget(results_box, 1)
+        self._install_drop_targets()
+
+    def _update_results_view(self, *_args) -> None:
+        count = self.results_list.count()
+        self.result_count.setText(f"{count} 个候选")
+        self.results_empty.setVisible(count == 0)
 
     def _connect_signals(self) -> None:
         self.index_button.clicked.connect(self.start_index)
@@ -196,26 +237,22 @@ class SearchPanel(QWidget):
         self.root_edit.editingFinished.connect(self.remember_gallery_dir)
         self.root_edit.editingFinished.connect(self.refresh_index_status)
         self.results_list.itemDoubleClicked.connect(self.open_result_item)
-        self.add_selected_button.clicked.connect(self.add_selected_results)
-        self.results_list.itemSelectionChanged.connect(self._update_result_actions)
-        self._update_result_actions()
+        self.results_list.itemSelectionChanged.connect(self._update_result_selection)
 
-    def _update_result_actions(self) -> None:
-        self.add_selected_button.setEnabled(bool(self.results_list.selectedItems()))
-
-    def add_selected_results(self) -> None:
-        paths = [
-            Path(self.results_list.item(row).data(Qt.ItemDataRole.UserRole))
-            for row in range(self.results_list.count())
-            if self.results_list.item(row).isSelected()
-        ]
-        if paths:
-            self.queue_requested.emit(paths)
+    def _update_result_selection(self) -> None:
+        for row in range(self.results_list.count()):
+            item = self.results_list.item(row)
+            widget = self.results_list.itemWidget(item)
+            if widget is not None and widget.property("selected") != item.isSelected():
+                widget.setProperty("selected", item.isSelected())
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
+                widget.update()
 
     def _install_shortcuts(self) -> None:
         paste_action = QAction(self)
-        paste_action.setShortcut(QKeySequence.Paste)
-        paste_action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        paste_action.setShortcut(QKeySequence.StandardKey.Paste)
+        paste_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         paste_action.triggered.connect(self.paste_from_clipboard)
         self.addAction(paste_action)
 
@@ -224,9 +261,8 @@ class SearchPanel(QWidget):
         for button in buttons:
             button.setFixedWidth(width)
 
-    def _install_drop_targets(self, central: QWidget) -> None:
+    def _install_drop_targets(self) -> None:
         for widget in [
-            central,
             self.status_label,
             self.index_status_label,
             self.progress,
@@ -236,12 +272,13 @@ class SearchPanel(QWidget):
             widget.installEventFilter(self)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if event.type() == QEvent.Type.DragEnter and isinstance(event, QDragEnterEvent):
-            if self._has_supported_drop(event):
-                event.acceptProposedAction()
+        if event.type() == QEvent.Type.DragEnter:
+            drag_event = cast(QDragEnterEvent, event)
+            if self._has_supported_drop(drag_event):
+                drag_event.acceptProposedAction()
                 return True
-        if event.type() == QEvent.Type.Drop and isinstance(event, QDropEvent):
-            if self._handle_drop(event):
+        if event.type() == QEvent.Type.Drop:
+            if self._handle_drop(cast(QDropEvent, event)):
                 return True
         return super().eventFilter(watched, event)
 
@@ -341,7 +378,7 @@ class SearchPanel(QWidget):
                 return
             output_path = clipboard_image_path()
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            if not image.save(str(output_path), "PNG"):
+            if not image.save(str(output_path)):
                 QMessageBox.warning(self, "粘贴失败", "无法保存剪贴板图片。")
                 return
             self.query_edit.setText(str(output_path))
@@ -435,7 +472,7 @@ class SearchPanel(QWidget):
             return
         try:
             status = index.status(root)
-        except Exception as exc:
+        except (OSError, ValueError, sqlite3.Error) as exc:
             QMessageBox.warning(self, "索引状态检查失败", str(exc))
             return
         self._set_index_status(status)
@@ -456,7 +493,7 @@ class SearchPanel(QWidget):
         open_path(path)
         self.status_label.setText(f"已打开索引目录: {path}")
 
-    def _start_worker(self, worker: QObject, finish_slot) -> None:
+    def _start_worker(self, worker: SearchWorker, finish_slot) -> None:
         self._set_busy(True)
         self.progress.setValue(0)
         self.work_started_at = time.monotonic()
@@ -464,18 +501,19 @@ class SearchPanel(QWidget):
         self.worker = worker
         worker.moveToThread(self.thread)
         self.thread.started.connect(worker.run)
-        worker.progress.connect(self._on_progress, Qt.QueuedConnection)
-        worker.finished.connect(finish_slot, Qt.QueuedConnection)
-        worker.failed.connect(self._on_failed, Qt.QueuedConnection)
-        worker.canceled.connect(self._on_canceled, Qt.QueuedConnection)
-        worker.done.connect(self.thread.quit, Qt.DirectConnection)
+        worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(finish_slot, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_failed, Qt.ConnectionType.QueuedConnection)
+        worker.canceled.connect(self._on_canceled, Qt.ConnectionType.QueuedConnection)
+        worker.done.connect(self.thread.quit, Qt.ConnectionType.DirectConnection)
         worker.done.connect(worker.deleteLater)
-        self.thread.finished.connect(self._cleanup_worker, Qt.QueuedConnection)
+        self.thread.finished.connect(self._cleanup_worker, Qt.ConnectionType.QueuedConnection)
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
     @Slot()
     def _cleanup_worker(self) -> None:
+        assert self.thread is not None
         self.thread.wait()
         self.thread = None
         self.worker = None
@@ -507,23 +545,31 @@ class SearchPanel(QWidget):
             f"索引完成: 总数 {stats.total}, 新增/更新 {stats.indexed}, 跳过 {stats.skipped}, 删除 {stats.removed}, 错误 {stats.errors}"
         )
         self.refresh_index_status()
+        self.results_empty.title.setText("图库已准备好")
+        self.results_empty.detail.setText("选择截图，点击“搜索”查找对应原图")
 
     @Slot(object)
     def _on_search_finished(self, results: list[SearchResult]) -> None:
         self.progress.setValue(100)
         self.status_label.setText(f"搜索完成: {len(results)} 个候选")
+        self.results_empty.title.setText("没有找到匹配原图")
+        self.results_empty.detail.setText("可以更换截图，或检查图库索引是否已更新")
         for index, result in enumerate(results, start=1):
             self._add_result(index, result)
 
     @Slot(str)
     def _on_failed(self, message: str) -> None:
         self.status_label.setText("操作失败")
+        self.results_empty.title.setText("操作未完成")
+        self.results_empty.detail.setText("检查图片和图库后重试")
         if self.isEnabled():
             QMessageBox.critical(self, "操作失败", message)
 
     @Slot()
     def _on_canceled(self) -> None:
         self.status_label.setText("已取消")
+        self.results_empty.title.setText("操作已取消")
+        self.results_empty.detail.setText("可以更换截图或图库后重新开始")
 
     def refresh_index_status(self) -> None:
         text = self.root_edit.text().strip()
@@ -536,7 +582,7 @@ class SearchPanel(QWidget):
             return
         try:
             status = ImageIndex().status(root)
-        except Exception as exc:
+        except (OSError, ValueError, sqlite3.Error) as exc:
             self.index_status_label.setText(f"索引状态: 检查失败: {exc}")
             return
         self._set_index_status(status)
@@ -568,27 +614,38 @@ class SearchPanel(QWidget):
             self,
             "建议更新索引",
             message,
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        return answer == QMessageBox.Yes
+        return answer == QMessageBox.StandardButton.Yes
 
     def _confirm_action(self, title: str, message: str) -> bool:
         answer = QMessageBox.question(
             self,
             title,
             message,
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        return answer == QMessageBox.Yes
+        return answer == QMessageBox.StandardButton.Yes
+
+    @Slot(list)
+    def set_queue_paths(self, paths: list[Path]) -> None:
+        keys = {path_key(path) for path in paths}
+        if keys == self._queue_path_keys:
+            return
+        self._queue_path_keys = keys
+        for row in range(self.results_list.count()):
+            widget = cast(ResultWidget, self.results_list.itemWidget(self.results_list.item(row)))
+            widget.set_queued(path_key(widget.result.path) in keys)
 
     def _add_result(self, rank: int, result: SearchResult) -> None:
         item = QListWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, str(result.path))
         widget = ResultWidget(rank, result)
+        widget.set_queued(path_key(result.path) in self._queue_path_keys)
         widget.queue_requested.connect(self.queue_requested)
-        item.setSizeHint(widget.sizeHint())
+        item.setSizeHint(QSize(0, max(widget.minimumHeight(), widget.sizeHint().height())))
         self.results_list.addItem(item)
         self.results_list.setItemWidget(item, widget)
 
@@ -598,11 +655,16 @@ class SearchPanel(QWidget):
             open_path(Path(path_text))
 
     def _set_busy(self, busy: bool) -> None:
+        if busy:
+            self.results_empty.title.setText("正在处理图片")
+            self.results_empty.detail.setText("匹配结果将在这里显示")
         self.index_button.setEnabled(not busy)
         self.search_button.setEnabled(not busy)
         for action in self.index_maintenance_actions:
             action.setEnabled(not busy)
         self.cancel_button.setEnabled(busy)
+        self.cancel_button.setVisible(busy)
+        self.progress.setVisible(busy)
         for control in self.input_controls:
             control.setEnabled(not busy)
         self.busy_changed.emit(busy)
@@ -640,33 +702,39 @@ class ResultWidget(QFrame):
     def __init__(self, rank: int, result: SearchResult) -> None:
         super().__init__()
         self.result = result
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setMinimumHeight(132)
+        self.setObjectName("searchResult")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setMinimumHeight(144)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 14, 12)
+        layout.setSpacing(16)
 
-        preview = QLabel()
+        preview = ImageCanvas("无预览")
         preview.setFixedSize(128, 96)
-        preview.setAlignment(Qt.AlignCenter)
         if result.thumbnail:
             pixmap = QPixmap()
             pixmap.loadFromData(result.thumbnail)
-            preview.setPixmap(pixmap.scaled(preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        else:
-            preview.setText("无预览")
+            preview.setPixmap(pixmap)
         layout.addWidget(preview)
 
         text_layout = QVBoxLayout()
-        title = QLabel(f"#{rank}  {result.path.name}")
-        title.setStyleSheet("font-weight: 600;")
-        path_label = QLabel(str(result.path))
-        path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        path_label.setWordWrap(True)
+        text_layout.setSpacing(7)
+        title_row = QHBoxLayout()
+        title = ElidedLabel(f"{rank:02d}   {result.path.name}")
+        title.setProperty("role", "resultTitle")
+        title_row.addWidget(title, 1)
+        confidence = QLabel(f"置信度 · {result.confidence_label}")
+        confidence.setProperty("role", "confidence")
+        confidence.setProperty("level", "high" if result.confidence_label == "高" else "low")
+        title_row.addWidget(confidence)
+        path_label = ElidedLabel(str(result.path))
+        path_label.setProperty("role", "muted")
         metrics = QLabel(
-            f"置信度: {result.confidence_label}    内点: {result.inliers}    有效匹配: {result.good_matches}    平均距离: {result.avg_distance:.2f}"
+            f"匹配内点 {result.inliers}   ·   有效匹配 {result.good_matches}   ·   平均距离 {result.avg_distance:.2f}"
         )
-        text_layout.addWidget(title)
+        metrics.setProperty("role", "metrics")
+        metrics.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        text_layout.addLayout(title_row)
         text_layout.addWidget(path_label)
         text_layout.addWidget(metrics)
         text_layout.addStretch(1)
@@ -674,10 +742,15 @@ class ResultWidget(QFrame):
 
         action_layout = QHBoxLayout()
         self.add_button = QPushButton("加入列表")
+        self.add_button.setProperty("variant", "soft")
+        self.add_button.setIcon(icon("plus", "#2878f4"))
+        self.add_button.setIconSize(QSize(15, 15))
         self.add_button.clicked.connect(lambda: self.queue_requested.emit([result.path]))
         open_button = QPushButton("打开")
         reveal_button = QPushButton("定位")
         copy_button = QPushButton("复制路径")
+        for button in (open_button, reveal_button, copy_button):
+            button.setProperty("variant", "toolbar")
         open_button.clicked.connect(self.open_file)
         reveal_button.clicked.connect(self.reveal_file)
         copy_button.clicked.connect(self.copy_path)
@@ -687,6 +760,20 @@ class ResultWidget(QFrame):
         action_layout.addWidget(copy_button)
         action_layout.addStretch(1)
         text_layout.addLayout(action_layout)
+        self.add_button.ensurePolished()
+        self.add_button.setFixedSize(self.add_button.sizeHint())
+
+    def set_queued(self, queued: bool) -> None:
+        variant = "added" if queued else "soft"
+        if self.add_button.property("variant") == variant:
+            return
+        self.add_button.setText("已加入" if queued else "加入列表")
+        self.add_button.setProperty("variant", variant)
+        self.add_button.setIcon(icon("check" if queued else "plus", "#226c42" if queued else "#2878f4"))
+        self.add_button.setEnabled(not queued)
+        self.add_button.style().unpolish(self.add_button)
+        self.add_button.style().polish(self.add_button)
+        self.add_button.update()
 
     def open_file(self) -> None:
         open_path(self.result.path)

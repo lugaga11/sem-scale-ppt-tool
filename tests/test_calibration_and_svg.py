@@ -15,7 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QImage, QPalette
+from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -197,15 +197,11 @@ class ManualCalibrationGuiTests(unittest.TestCase):
                 name_item = window.file_list.item(0, 1)
                 self.assertIsNotNone(name_item)
                 assert name_item is not None
-                self.assertFalse(name_item.icon().isNull())
                 measurement_cell = window.measurement_cell(0)
                 self.assertIsNotNone(measurement_cell)
                 assert measurement_cell is not None
                 self.assertEqual(measurement_cell.edit_button.text(), "手动标定")
-                self.assertEqual(
-                    measurement_cell.edit_button.palette().color(QPalette.ColorRole.Button).name(),
-                    "#f3dddd",
-                )
+                self.assertEqual(measurement_cell.edit_button.property("status"), "missing")
 
                 window.calibration_overrides[path_key(source)] = CalibrationOverride(
                     known_length_nm=1000,
@@ -220,22 +216,18 @@ class ManualCalibrationGuiTests(unittest.TestCase):
                 self.assertEqual(window.missing_calibration_paths([source]), [])
                 self.assertNotIn("缺标定", window.count_label.text())
                 self.assertEqual(measurement_cell.edit_button.text(), "编辑")
-                self.assertIn("手动标定", name_item.toolTip())
-                self.assertEqual(
-                    measurement_cell.edit_button.palette().color(QPalette.ColorRole.Button).name(),
-                    measurement_cell.default_button_palette.color(QPalette.ColorRole.Button).name(),
-                )
+                self.assertEqual(measurement_cell.edit_button.property("status"), "ready")
+                self.assertEqual(name_item.toolTip(), "")
+                self.assertIn("手动标定", name_item.data(Qt.ItemDataRole.WhatsThisRole))
 
                 window.file_list.selectRow(0)
                 window.clear_selected_manual_calibrations()
                 self.assertEqual(measurement_cell.edit_button.text(), "手动标定")
+                self.assertEqual(measurement_cell.edit_button.property("status"), "missing")
                 self.assertEqual(window.missing_calibration_paths([source]), [source.resolve()])
                 self.assertIn("缺标定 1", window.count_label.text())
-                self.assertIn("未检测到像素标定", name_item.toolTip())
-                self.assertEqual(
-                    measurement_cell.edit_button.palette().color(QPalette.ColorRole.Button).name(),
-                    "#f3dddd",
-                )
+                self.assertEqual(name_item.toolTip(), "")
+                self.assertIn("未检测到像素标定", name_item.data(Qt.ItemDataRole.WhatsThisRole))
             finally:
                 window.close()
 

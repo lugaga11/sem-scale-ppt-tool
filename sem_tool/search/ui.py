@@ -617,6 +617,8 @@ class SearchPanel(QWidget):
 
     def refresh_index_status(self) -> None:
         """Compare the gallery with its index in the background; the label follows when the result arrives."""
+        if self._background:
+            self.cancel_work()
         text = self.root_edit.text().strip()
         self._status_root = text
         if not text:
@@ -634,10 +636,22 @@ class SearchPanel(QWidget):
 
     @Slot(str)
     def _on_status_failed(self, message: str) -> None:
-        self.index_status_label.setText(f"索引状态：检查失败，{message}")
+        if self._status_is_current():
+            self.index_status_label.setText(f"索引状态：检查失败，{message}")
+
+    def _status_is_current(self) -> bool:
+        # Queued results can arrive after the user edits or clears the gallery field.
+        return (
+            self.worker is not None
+            and self.worker.root == Path(self.root_edit.text().strip())
+            and self.cancel_event is not None
+            and not self.cancel_event.is_set()
+        )
 
     @Slot(object)
     def _set_index_status(self, status: IndexStatus) -> None:
+        if not self._status_is_current():
+            return
         last_indexed = format_timestamp(status.last_indexed_at)
         parts = [
             f"当前图库：已索引 {status.indexed_files}/{status.total_files} 张",

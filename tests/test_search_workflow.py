@@ -29,7 +29,7 @@ from sem_tool.app import MainWindow, install_qt_translation
 from sem_tool.files import image_paths_from_inputs, natural_key, path_key
 from sem_tool.imaging import image_to_display_rgb
 from sem_tool.search.engine import SearchResult, extract_features
-from sem_tool.search.index import ImageIndex, IndexJob, IndexResult, extract_index_results
+from sem_tool.search.index import ImageIndex, IndexJob, IndexResult, IndexStatus, extract_index_results
 from sem_tool.search.ui import CLIPBOARD_KEEP_DAYS, ResultWidget, prune_clipboard_images
 from sem_tool.search.worker import ProgressThrottler, SearchWorker
 from sem_tool.settings import AppSettings, default_db_path
@@ -827,6 +827,32 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
                 self.wait_until(lambda: window.search_panel.thread is None)
                 window.annotation_panel.file_list.name_delegate.timer.stop()
                 window.deleteLater()
+
+    def test_status_check_does_not_replace_a_cleared_or_invalid_gallery(self) -> None:
+        search = self.window.search_panel
+        for replacement, expected in (("", "未选择图库"), (str(self.root / "missing"), "图库目录不存在")):
+            for fail in (False, True):
+                with self.subTest(replacement=replacement, fail=fail):
+                    started, release = threading.Event(), threading.Event()
+
+                    def delayed_status(index, root, **kwargs):
+                        started.set()
+                        release.wait(5)
+                        if fail:
+                            raise OSError("old gallery unavailable")
+                        return IndexStatus(1, 1, 0, 0, 0, 0, 1, None)
+
+                    with patch.object(ImageIndex, "status", autospec=True, side_effect=delayed_status):
+                        search.root_edit.setText(str(self.root))
+                        search.refresh_index_status()
+                        try:
+                            self.wait_until(started.is_set)
+                            search.root_edit.setText(replacement)
+                            search.refresh_index_status()
+                        finally:
+                            release.set()
+                            self.wait_until(lambda: search.thread is None)
+                    self.assertIn(expected, search.index_status_label.text())
 
     def test_search_with_a_stale_index_asks_first_and_maintenance_runs_in_the_worker(self) -> None:
         gallery = self.root / "图库"

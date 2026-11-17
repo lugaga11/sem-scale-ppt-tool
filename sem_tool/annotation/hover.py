@@ -72,7 +72,7 @@ class ImageHoverCard(QFrame):
         else:
             size_text = f"{stat.st_size / 1024:.0f} KB" if stat.st_size < 1024 ** 2 else f"{stat.st_size / 1024 ** 2:.1f} MB"
             self.metadata.setText(
-                f"{self.original_size.width()} × {self.original_size.height()} px   ·   {self._image_format}   ·   {size_text}"
+                f"{self.original_size.width()} × {self.original_size.height()} px · {self._image_format} · {size_text}"
             )
             modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
             self.details.setText(f"{detail}\n修改时间：{modified}")

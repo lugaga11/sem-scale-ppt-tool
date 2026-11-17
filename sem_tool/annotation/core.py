@@ -596,7 +596,7 @@ def prepare_slide_item(
         try:
             scale_nm = choose_scale_nm(width_px, calibration.nm_per_pixel, fixed_scale_nm, auto_scale_preset)
         except ValueError as exc:
-            raise ValueError(f"{path.name}: {exc}") from exc
+            raise ValueError(f"{path.name}：{exc}") from exc
         scale_px = scale_nm / calibration.nm_per_pixel
         measurement_inputs = list(measurement_overrides or [])
         measurements = tuple(

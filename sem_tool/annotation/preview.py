@@ -4,11 +4,10 @@ import math
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
-    QButtonGroup,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -19,12 +18,12 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QToolButton,
     QVBoxLayout,
-    QWhatsThis,
     QWidget,
 )
 
 from ..image_widgets import qimage_from_pil
-from ..theme import icon
+from ..theme import COLORS, COMPACT_HEIGHT, FONT_BODY, RADIUS_SMALL, icon
+from ..widgets import HelpPopover, SegmentedControl, describe, restyle
 from .core import (
     Calibration,
     CalibrationOverride,
@@ -34,6 +33,8 @@ from .core import (
     parse_scale_nm,
     parse_sem_metadata,
 )
+
+TOOL_LABELS = {"distance": "测距", "thickness": "膜厚"}
 
 
 def scale_input_from_nm(length_nm: float) -> str:
@@ -51,14 +52,26 @@ def editor_bar() -> tuple[QFrame, QHBoxLayout]:
     return frame, row
 
 
-def editor_help_button(text: str) -> QToolButton:
+# The overlay is drawn on grey SEM images, so its colours are picked for contrast there and are
+# deliberately separate from the interface palette.
+CANVAS_BACKGROUND = "#20252d"
+DISTANCE_COLOR = "#FFE66D"
+SELECTED_COLOR = "#7CFF8E"
+DRAFT_COLOR = "#FFFFFF"
+INTERFACE_TOP_COLOR = "#00D1FF"
+INTERFACE_BOTTOM_COLOR = "#FF4D4D"
+LABEL_BACKDROP = QColor(0, 0, 0, 150)
+
+
+def editor_help_button(html: str) -> QToolButton:
     button = QToolButton()
     button.setText("?")
-    button.setFixedSize(30, 30)
+    button.setProperty("shape", "icon")
+    button.setFixedSize(COMPACT_HEIGHT, COMPACT_HEIGHT)
+    button.setToolTip("操作说明")
     button.setAccessibleName("操作说明")
-    button.clicked.connect(
-        lambda: QWhatsThis.showText(button.mapToGlobal(QPoint(0, button.height())), text, button)
-    )
+    popover = HelpPopover(html, button)
+    button.clicked.connect(lambda: popover.show_below(button))
     return button
 
 
@@ -87,6 +100,7 @@ class MeasurementPreviewWidget(QWidget):
     ) -> None:
         super().__init__()
         self.pixmap = QPixmap.fromImage(qimage)
+        self._smooth_pixmap = QPixmap()
         self.image_w = qimage.width()
         self.image_h = qimage.height()
         self.nm_per_pixel = nm_per_pixel
@@ -489,9 +503,9 @@ class MeasurementPreviewWidget(QWidget):
         span = math.hypot(dx, dy)
         if span <= 0:
             return
-        color = self.color_with_alpha(QColor("#7CFF8E" if selected else "#FFE66D"), selected)
+        color = self.color_with_alpha(QColor(SELECTED_COLOR if selected else DISTANCE_COLOR), selected)
         if temporary:
-            color = QColor("#FFFFFF")
+            color = QColor(DRAFT_COLOR)
         pen = QPen(color, 3 if selected else 2)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -504,14 +518,7 @@ class MeasurementPreviewWidget(QWidget):
         label_offset = 16.0
         label_x = mid_x + dy / span * label_offset
         label_y = mid_y - dx / span * label_offset
-        label = self.measurement_label(annotation)
-        old_font = painter.font()
-        font = painter.font()
-        font.setPointSize((font.pointSize() if font.pointSize() > 0 else 10) + 1)
-        painter.setFont(font)
-        painter.setPen(QPen(color, 2))
-        painter.drawText(int(label_x), int(label_y), label)
-        painter.setFont(old_font)
+        self.draw_label(painter, QPointF(label_x, label_y), self.measurement_label(annotation), color)
 
     def draw_thickness(self, painter: QPainter, annotation: MeasurementOverride, selected: bool) -> None:
         rect = self.image_rect()
@@ -519,9 +526,9 @@ class MeasurementPreviewWidget(QWidget):
         bottom_line_y = self.image_y_to_widget(annotation.y2_px)
         top_point = self.image_to_widget(annotation.x1_px, annotation.y1_px)
         bottom_point = self.image_to_widget(annotation.x2_px, annotation.y2_px)
-        top_color = self.color_with_alpha(QColor("#00D1FF"), selected)
-        bottom_color = self.color_with_alpha(QColor("#FF4D4D"), selected)
-        measure_color = self.color_with_alpha(QColor("#7CFF8E"), selected)
+        top_color = self.color_with_alpha(QColor(INTERFACE_TOP_COLOR), selected)
+        bottom_color = self.color_with_alpha(QColor(INTERFACE_BOTTOM_COLOR), selected)
+        measure_color = self.color_with_alpha(QColor(SELECTED_COLOR), selected)
         width = 3 if selected else 2
 
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -535,21 +542,49 @@ class MeasurementPreviewWidget(QWidget):
         self.draw_endpoint_handle(painter, bottom_point, measure_color, selected)
 
         mid_y = (top_line_y + bottom_line_y) / 2
-        label_x = min(max(int(top_point.x() + 8), int(rect.left()) + 8), int(rect.right()) - 80)
-        painter.setPen(QPen(measure_color, 2))
-        painter.drawText(label_x, int(mid_y - 8), self.measurement_label(annotation))
+        label_x = min(max(int(top_point.x() + 12), int(rect.left()) + 8), int(rect.right()) - 80)
+        self.draw_label(painter, QPointF(label_x, mid_y + 5), self.measurement_label(annotation), measure_color)
         if selected:
             guide_x = max(8, int(rect.left()) + 8)
-            painter.setPen(QPen(top_color, 2))
-            painter.drawText(guide_x, int(top_line_y) - 8, "上界面")
-            painter.setPen(QPen(bottom_color, 2))
-            painter.drawText(guide_x, int(bottom_line_y) - 8, "下界面")
+            self.draw_label(painter, QPointF(guide_x, top_line_y - 8), "上界面", top_color)
+            self.draw_label(painter, QPointF(guide_x, bottom_line_y - 8), "下界面", bottom_color)
+
+    @staticmethod
+    def draw_label(painter: QPainter, baseline: QPointF, text: str, color: QColor) -> None:
+        """Text on a dark backdrop, so a value stays readable on bright and dark parts of the image."""
+        box = QRectF(painter.fontMetrics().boundingRect(text)).translated(baseline).adjusted(-5, -2, 5, 2)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(LABEL_BACKDROP)
+        painter.drawRoundedRect(box, RADIUS_SMALL, RADIUS_SMALL)
+        painter.setPen(color)
+        painter.drawText(baseline, text)
+
+    def draw_image(self, painter: QPainter) -> None:
+        target = self.image_rect().toRect()
+        scale = self.devicePixelRatioF()
+        if target.width() * scale >= self.image_w:
+            # At or beyond one screen pixel per image pixel, crisp pixels help placing an end point.
+            painter.drawPixmap(target, self.pixmap)
+            return
+        # Shown smaller than its pixels, the image is resampled smoothly; the result is kept so that
+        # dragging an annotation does not rescale the full image on every repaint.
+        size = target.size() * scale
+        if self._smooth_pixmap.size() != size:
+            self._smooth_pixmap = self.pixmap.scaled(
+                size, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
+            self._smooth_pixmap.setDevicePixelRatio(scale)
+        painter.drawPixmap(target.topLeft(), self._smooth_pixmap)
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#20252d"))
-        rect = self.image_rect()
-        painter.drawPixmap(rect.toRect(), self.pixmap)
+        painter.fillRect(self.rect(), QColor(CANVAS_BACKGROUND))
+        self.draw_image(painter)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = QFont(self.font())
+        font.setPixelSize(FONT_BODY)
+        font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(font)
 
         for index, annotation in enumerate(self.annotations):
             selected = index == self.selected_index
@@ -887,7 +922,7 @@ class CalibrationDialog(QDialog):
         layout.setSpacing(6)
         self.toolbar, tool_row = editor_bar()
         tool_icon = QLabel()
-        tool_icon.setPixmap(icon("ruler", "#3979e6").pixmap(17, 17))
+        tool_icon.setPixmap(icon("ruler", COLORS.primary).pixmap(17, 17))
         tool_row.addWidget(tool_icon)
         instruction = QLabel("拖拽绘制标定线 · Shift 锁定方向")
         instruction.setProperty("role", "editorStatus")
@@ -900,7 +935,7 @@ class CalibrationDialog(QDialog):
         )
         self.source_label = QLabel(source_text)
         self.source_label.setProperty("role", "editorStatus")
-        self.source_label.setAccessibleDescription(metadata_calibration.source if metadata_calibration else source_text)
+        describe(self.source_label, metadata_calibration.source if metadata_calibration else source_text)
         tool_row.addWidget(self.source_label)
         self.zoom_label = QLabel()
         self.zoom_label.setProperty("role", "editorStatus")
@@ -909,7 +944,7 @@ class CalibrationDialog(QDialog):
         tool_row.addWidget(self.zoom_label)
         self.reset_zoom_button = QPushButton("适应窗口")
         self.reset_zoom_button.setAutoDefault(False)
-        self.reset_zoom_button.setAccessibleDescription("重置缩放与平移，完整显示图片")
+        describe(self.reset_zoom_button, "重置缩放与平移，完整显示图片")
         tool_row.addWidget(self.reset_zoom_button)
         self.help_button = editor_help_button(
             "<b>手动标定</b><br>沿已知实际长度拖出标定线，输入对应长度，例如 1um 或 500nm。"
@@ -952,12 +987,12 @@ class CalibrationDialog(QDialog):
         self.known_length_edit.setFixedWidth(112)
         self.known_length_edit.setPlaceholderText("例如 1um")
         self.known_length_edit.setAccessibleName("已知实际长度")
-        self.known_length_edit.setAccessibleDescription("标定线对应的实际长度，例如 1um 或 500nm")
+        describe(self.known_length_edit, "标定线对应的实际长度，例如 1um 或 500nm")
         controls.addWidget(self.known_length_edit)
         self.pixel_length_label = QLabel()
         self.pixel_length_label.setProperty("role", "editorStatus")
         self.pixel_length_label.setMinimumWidth(82)
-        self.pixel_length_label.setAccessibleDescription("标定线的像素长度")
+        describe(self.pixel_length_label, "标定线的像素长度")
         controls.addWidget(self.pixel_length_label)
         self.calibration_result_label = QLabel()
         self.calibration_result_label.setProperty("role", "editorValue")
@@ -965,7 +1000,7 @@ class CalibrationDialog(QDialog):
         controls.addWidget(self.calibration_result_label, 1)
         self.clear_button = QPushButton("清除线")
         self.clear_button.setAutoDefault(False)
-        self.clear_button.setAccessibleDescription("清除当前标定线，可用 Ctrl + Z 撤销")
+        describe(self.clear_button, "清除当前标定线，可用 Ctrl + Z 撤销")
         self.clear_button.clicked.connect(self.preview.clear_annotations)
         self.apply_button = QPushButton("应用标定")
         self.apply_button.setProperty("variant", "primary")
@@ -1014,10 +1049,11 @@ class CalibrationDialog(QDialog):
         self.info_label.setText("手动标定优先于元数据，并用于标尺和所有测量")
         annotation = self.distance_annotation()
         self.clear_button.setEnabled(annotation is not None)
+        self._mark_length_invalid(False)
         if annotation is None:
             self.pixel_length_label.setText("— px")
             self.calibration_result_label.setText("等待画线")
-            self.calibration_result_label.setAccessibleDescription("请沿已知实际长度拖出一条标定线")
+            describe(self.calibration_result_label, "请沿已知实际长度拖出一条标定线")
             self.apply_button.setEnabled(False)
             return
         pixel_length = math.hypot(
@@ -1029,13 +1065,21 @@ class CalibrationDialog(QDialog):
             result = self.calculated_override()
         except ValueError as exc:
             self.calibration_result_label.setText("长度无效")
-            self.calibration_result_label.setAccessibleDescription(str(exc))
+            describe(self.calibration_result_label, str(exc))
             self.info_label.setText(str(exc))
             self.apply_button.setEnabled(False)
+            self._mark_length_invalid(True)
         else:
             self.calibration_result_label.setText(f"{result.nm_per_pixel:.9g} nm/px")
-            self.calibration_result_label.setAccessibleDescription(f"每像素对应 {result.nm_per_pixel:.9g} nm")
+            describe(self.calibration_result_label, f"每像素对应 {result.nm_per_pixel:.9g} nm")
             self.apply_button.setEnabled(True)
+
+    def _mark_length_invalid(self, invalid: bool) -> None:
+        state = "invalid" if invalid else ""
+        for widget in (self.known_length_edit, self.calibration_result_label):
+            if (widget.property("state") or "") != state:
+                widget.setProperty("state", state)
+                restyle(widget)
 
     def accept(self) -> None:
         try:
@@ -1085,20 +1129,16 @@ class MeasurementPreviewDialog(QDialog):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
         self.toolbar, tool_row = editor_bar()
-        self.thickness_tool_button = QPushButton("膜厚")
-        self.thickness_tool_button.setAutoDefault(False)
-        self.thickness_tool_button.setCheckable(True)
-        self.thickness_tool_button.setAccessibleDescription("首次点击时运行自动膜厚识别并给出初始建议")
-        self.distance_tool_button = QPushButton("测距")
-        self.distance_tool_button.setAutoDefault(False)
-        self.distance_tool_button.setCheckable(True)
-        self.distance_tool_button.setAccessibleDescription("拖拽添加测距，Shift 锁定方向")
-        self.tool_group = QButtonGroup(self)
-        self.tool_group.setExclusive(True)
-        self.tool_group.addButton(self.thickness_tool_button)
-        self.tool_group.addButton(self.distance_tool_button)
-        tool_row.addWidget(self.distance_tool_button)
-        tool_row.addWidget(self.thickness_tool_button)
+        self.tool_control = SegmentedControl(list(TOOL_LABELS.values()))
+        self.tool_control.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.distance_tool_button = self.tool_control.buttons[TOOL_LABELS["distance"]]
+        self.distance_tool_button.setToolTip("拖拽添加测距，Shift 锁定方向")
+        self.thickness_tool_button = self.tool_control.buttons[TOOL_LABELS["thickness"]]
+        self.thickness_tool_button.setToolTip("首次点击时自动识别膜厚界面，给出可调整的建议位置")
+        for button in self.tool_control.buttons.values():
+            button.setAutoDefault(False)
+            button.setMinimumWidth(52)
+        tool_row.addWidget(self.tool_control)
         separator = QFrame()
         separator.setFrameShape(QFrame.Shape.VLine)
         separator.setProperty("role", "editorSeparator")
@@ -1120,15 +1160,15 @@ class MeasurementPreviewDialog(QDialog):
 
         self.reset_selected_button = QPushButton("重置选中")
         self.reset_selected_button.setAutoDefault(False)
-        self.reset_selected_button.setAccessibleDescription("将选中的膜厚恢复到自动识别建议位置")
+        describe(self.reset_selected_button, "将选中的膜厚恢复到自动识别建议位置")
         self.reset_selected_button.clicked.connect(self.preview.reset_selected_annotation)
         self.delete_selected_button = QPushButton("删除")
         self.delete_selected_button.setAutoDefault(False)
-        self.delete_selected_button.setAccessibleDescription("删除当前选中的标注（Delete）")
+        describe(self.delete_selected_button, "删除当前选中的标注（Delete）")
         self.delete_selected_button.clicked.connect(self.preview.delete_selected_annotation)
         self.clear_button = QPushButton("清空")
         self.clear_button.setAutoDefault(False)
-        self.clear_button.setAccessibleDescription("清空全部标注，可用 Ctrl + Z 撤销")
+        describe(self.clear_button, "清空全部标注，可用 Ctrl + Z 撤销")
         self.clear_button.clicked.connect(self.preview.clear_annotations)
         tool_row.addWidget(self.reset_selected_button)
         tool_row.addWidget(self.delete_selected_button)
@@ -1136,7 +1176,7 @@ class MeasurementPreviewDialog(QDialog):
         tool_row.addStretch()
         self.calibration_label = QLabel(f"{self.nm_per_pixel:g} nm/px")
         self.calibration_label.setProperty("role", "editorStatus")
-        self.calibration_label.setAccessibleDescription(f"像素标定：{self.calibration.source}")
+        describe(self.calibration_label, f"像素标定：{self.calibration.source}")
         tool_row.addWidget(self.calibration_label)
         self.zoom_label = QLabel()
         self.zoom_label.setProperty("role", "editorStatus")
@@ -1144,7 +1184,7 @@ class MeasurementPreviewDialog(QDialog):
         self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.reset_zoom_button = QPushButton("适应窗口")
         self.reset_zoom_button.setAutoDefault(False)
-        self.reset_zoom_button.setAccessibleDescription("重置缩放与平移，完整显示图片")
+        describe(self.reset_zoom_button, "重置缩放与平移，完整显示图片")
         self.reset_zoom_button.clicked.connect(self.preview.reset_zoom)
         tool_row.addWidget(self.zoom_label)
         tool_row.addWidget(self.reset_zoom_button)
@@ -1186,23 +1226,16 @@ class MeasurementPreviewDialog(QDialog):
         self.zoom_label.setText(f"{zoom_factor * 100:.0f}%")
 
     def update_tool_buttons(self, tool: str) -> None:
-        was_thickness_blocked = self.thickness_tool_button.blockSignals(True)
-        was_distance_blocked = self.distance_tool_button.blockSignals(True)
-        try:
-            self.thickness_tool_button.setChecked(tool == "thickness")
-            self.distance_tool_button.setChecked(tool == "distance")
-        finally:
-            self.thickness_tool_button.blockSignals(was_thickness_blocked)
-            self.distance_tool_button.blockSignals(was_distance_blocked)
+        self.tool_control.setCurrentText(TOOL_LABELS[tool])
 
     def update_info(self) -> None:
         annotation = self.preview.selected_annotation()
         counts = f"膜厚 {int(self.preview.thickness_index() >= 0)} · 测距 {self.preview.distance_count()}"
         if annotation is not None:
             name = "膜厚" if annotation.kind == "thickness" else f"测距 {self.preview.distance_number(self.preview.selected_index)}"
-            self.info_label.setText(f"{name}：{self.preview.measurement_label(annotation)}   |   {counts}")
+            self.info_label.setText(f"{name}：{self.preview.measurement_label(annotation)}（全部：{counts}）")
         else:
-            self.info_label.setText(f"{counts}   |   拖拽添加测距，Shift 锁定方向")
+            self.info_label.setText(f"{counts}，拖拽添加测距，Shift 锁定方向")
         self.update_mode_controls()
 
     def ensure_auto_thickness(self) -> None:
@@ -1217,7 +1250,7 @@ class MeasurementPreviewDialog(QDialog):
                 auto_measurement = detect_thickness_measurement(image, self.calibration)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "膜厚识别失败", str(exc))
-            self.thickness_tool_button.setAccessibleDescription("自动识别失败；再次点击可重试")
+            describe(self.thickness_tool_button, "自动识别失败；再次点击可重试")
             return
         finally:
             QApplication.restoreOverrideCursor()
@@ -1226,7 +1259,7 @@ class MeasurementPreviewDialog(QDialog):
         self.auto_detection_attempted = True
         if auto_measurement is None:
             self.preview.auto_thickness = None
-            self.thickness_tool_button.setAccessibleDescription("未识别到清晰界面；使用默认膜厚建议位置")
+            describe(self.thickness_tool_button, "未识别到清晰界面；使用默认膜厚建议位置")
             return
         auto_thickness = MeasurementOverride(
             kind="thickness",
@@ -1236,7 +1269,7 @@ class MeasurementPreviewDialog(QDialog):
             y2_px=auto_measurement.bottom_y_px,
         )
         self.preview.auto_thickness = self.preview.clamped_annotation(auto_thickness)
-        self.thickness_tool_button.setAccessibleDescription("已加载自动膜厚建议；可拖动界面线继续调整")
+        describe(self.thickness_tool_button, "已加载自动膜厚建议；可拖动界面线继续调整")
 
     def on_thickness_tool_clicked(self) -> None:
         self.ensure_auto_thickness()

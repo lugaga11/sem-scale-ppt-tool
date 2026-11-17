@@ -20,12 +20,9 @@ from PySide6.QtGui import QColor, QCursor, QDrag, QFont, QPainter, QPainterPath,
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QComboBox,
-    QDoubleSpinBox,
     QHBoxLayout,
     QHeaderView,
     QPushButton,
-    QSpinBox,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionButton,
@@ -35,8 +32,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..image_widgets import load_display_pixmap
-from ..theme import icon
-from ..widgets import EmptyState
+from ..theme import CHECK_SIZE, COLORS, FONT_BODY, FONT_CAPTION, RADIUS_SMALL, icon
+from ..widgets import EmptyState, describe
 from .core import DEFAULTS
 from .hover import ImageHoverCard
 
@@ -52,7 +49,7 @@ class GenerateCheckDelegate(QStyledItemDelegate):
 
     @staticmethod
     def indicator_rect(option) -> QRect:
-        rect = QRect(0, 0, 18, 18)
+        rect = QRect(0, 0, CHECK_SIZE, CHECK_SIZE)
         rect.moveCenter(option.rect.center())
         return rect
 
@@ -62,7 +59,7 @@ class GenerateCheckDelegate(QStyledItemDelegate):
         background.features &= ~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
         self.table.style().drawControl(QStyle.ControlElement.CE_ItemViewItem, background, painter, self.table)
         if option.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(option.rect.left(), option.rect.top() + 10, 3, option.rect.height() - 20, QColor("#2878f4"))
+            painter.fillRect(option.rect.left(), option.rect.top() + 10, 3, option.rect.height() - 20, QColor(COLORS.primary))
         indicator = QStyleOptionButton()
         indicator.rect = self.indicator_rect(option)
         indicator.state = QStyle.StateFlag.State_Enabled if index.flags() & Qt.ItemFlag.ItemIsEnabled else QStyle.StateFlag.State_None
@@ -140,42 +137,42 @@ class FileNameDelegate(QStyledItemDelegate):
         painter.setClipRect(option.rect)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         image_rect = self.thumbnail_rect(option.rect)
-        painter.setPen(QPen(QColor("#e8edf4"), 1))
-        painter.setBrush(QColor("#f4f7fb"))
-        painter.drawRoundedRect(image_rect.adjusted(-2, -2, 2, 2), 5, 5)
+        painter.setPen(QPen(QColor(COLORS.border), 1))
+        painter.setBrush(QColor(COLORS.subtle))
+        painter.drawRoundedRect(image_rect.adjusted(-2, -2, 2, 2), RADIUS_SMALL + 1, RADIUS_SMALL + 1)
         if thumbnail is not None and not thumbnail.isNull():
             self.thumbnails.move_to_end(key)
             target = QRect(0, 0, thumbnail.width(), thumbnail.height())
             target.moveCenter(image_rect.center())
             painter.save()
             clip = QPainterPath()
-            clip.addRoundedRect(QRectF(image_rect), 4, 4)
+            clip.addRoundedRect(QRectF(image_rect), RADIUS_SMALL, RADIUS_SMALL)
             painter.setClipPath(clip, Qt.ClipOperation.IntersectClip)
             painter.drawPixmap(target, thumbnail)
             painter.restore()
         else:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#ecf2fb"))
-            painter.drawRoundedRect(image_rect, 4, 4)
-            painter.setPen(QColor("#8494ac"))
+            painter.setBrush(QColor(COLORS.tint))
+            painter.drawRoundedRect(image_rect, RADIUS_SMALL, RADIUS_SMALL)
+            painter.setPen(QColor(COLORS.muted))
             painter.drawText(image_rect, Qt.AlignmentFlag.AlignCenter, path.suffix.lstrip(".").upper())
 
         text_rect = option.rect.adjusted(86, 9, -8, -9)
         font = QFont(option.font)
-        font.setPixelSize(14)
+        font.setPixelSize(FONT_BODY)
         font.setWeight(QFont.Weight.Medium)
         painter.setFont(font)
-        painter.setPen(QColor("#28364d"))
+        painter.setPen(QColor(COLORS.heading))
         painter.drawText(
             QRect(text_rect.left(), text_rect.top(), text_rect.width(), 22),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             painter.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, max(0, text_rect.width())),
         )
         font = painter.font()
-        font.setPixelSize(12)
+        font.setPixelSize(FONT_CAPTION)
         font.setWeight(QFont.Weight.Normal)
         painter.setFont(font)
-        painter.setPen(QColor("#7b89a0"))
+        painter.setPen(QColor(COLORS.muted))
         painter.drawText(
             QRect(text_rect.left(), text_rect.top() + 24, text_rect.width(), 18),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
@@ -378,7 +375,7 @@ class FileQueueWidget(QTableWidget):
             return
 
         y = self.drop_indicator_y(self.drop_indicator_row)
-        color = QColor("#2477f2")
+        color = QColor(COLORS.primary)
         painter = QPainter(self.viewport())
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         pen = QPen(color, 3)
@@ -507,21 +504,6 @@ class FileQueueWidget(QTableWidget):
         return preview
 
 
-class NoWheelComboBox(QComboBox):
-    def wheelEvent(self, event) -> None:
-        event.ignore()
-
-
-class NoWheelSpinBox(QSpinBox):
-    def wheelEvent(self, event) -> None:
-        event.ignore()
-
-
-class NoWheelDoubleSpinBox(QDoubleSpinBox):
-    def wheelEvent(self, event) -> None:
-        event.ignore()
-
-
 class MeasurementCellWidget(QWidget):
     edit_requested = Signal(object)
 
@@ -557,16 +539,16 @@ class MeasurementCellWidget(QWidget):
 
     def update_button_style(self) -> None:
         if not self.calibration_available:
-            self.edit_button.setIcon(icon("ruler", "#b15e35"))
+            self.edit_button.setIcon(icon("ruler", COLORS.warning))
             self.edit_button.setProperty("status", "missing")
             self.edit_button.setText("手动标定")
-            self.edit_button.setAccessibleDescription("缺少可用的像素标定；应用手动标定后返回列表，需要测量时再点击“编辑”")
+            describe(self.edit_button, "缺少像素标定：先沿已知长度画线完成手动标定，回到队列后再点“编辑”添加测量")
         else:
             marked = self.summary != "编辑"
-            self.edit_button.setIcon(icon("check", "#226c42") if marked else icon("edit", "#667b96"))
+            self.edit_button.setIcon(icon("check", COLORS.success) if marked else icon("edit"))
             self.edit_button.setProperty("status", "marked" if marked else "ready")
             self.edit_button.setText(self.summary)
-            self.edit_button.setAccessibleDescription("编辑测膜厚和测距标注；已标状态会在生成时自动导出")
+            describe(self.edit_button, "添加或修改膜厚、测距标注；已应用的标注会随图片一起导出")
         self.edit_button.style().unpolish(self.edit_button)
         self.edit_button.style().polish(self.edit_button)
         self.edit_button.setFixedWidth(self.edit_button.sizeHint().width())

@@ -41,7 +41,7 @@ class GeneratorWorker(QObject):
     def run(self) -> None:
         try:
             output_format = self.options["output_format"]
-            self.log.emit(f"正在生成 {output_format.upper()}...")
+            self.log.emit(f"正在生成 {output_format.upper()}…")
             generator = {"pptx": generate_pptx, "svg": generate_svg}[output_format]
             items = generator(
                 input_path=self.options["input_path"],
@@ -67,14 +67,14 @@ class GeneratorWorker(QObject):
             else:
                 output_paths = [self.options["output_path"]]
             if len(output_paths) == 1:
-                self.log.emit(f"已生成: {output_paths[0]}")
+                self.log.emit(f"已生成：{output_paths[0]}")
             else:
-                self.log.emit(f"已生成 {len(output_paths)} 个 {output_format.upper()}:")
+                self.log.emit(f"已生成 {len(output_paths)} 个 {output_format.upper()}：")
                 for path in output_paths:
                     self.log.emit(f"  {path}")
             for item in items:
                 self.log.emit(
-                    f"{item.source_path.name}: {item.calibration.nm_per_pixel:g} nm/px, "
+                    f"{item.source_path.name}：{item.calibration.nm_per_pixel:g} nm/px，"
                     f"标尺 {item.label} = {item.scale_px:.1f} px，标定来源 {item.calibration.source}"
                 )
                 distance_index = 0
@@ -84,10 +84,10 @@ class GeneratorWorker(QObject):
                         measurement.y2_px - measurement.y1_px,
                     )
                     if measurement.kind == "thickness":
-                        self.log.emit(f"  膜厚: {measurement.label} = {length_px:.1f} px")
+                        self.log.emit(f"  膜厚：{measurement.label} = {length_px:.1f} px")
                     else:
                         distance_index += 1
-                        self.log.emit(f"  测距 {distance_index}: {measurement.label} = {length_px:.1f} px")
+                        self.log.emit(f"  测距 {distance_index}：{measurement.label} = {length_px:.1f} px")
             self.finished.emit([str(path) for path in output_paths])
         except Exception as exc:
             self.failed.emit(str(exc))

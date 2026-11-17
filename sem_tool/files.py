@@ -29,7 +29,7 @@ def is_supported_image(path: Path) -> bool:
 
 def iter_image_files(root: Path) -> Iterator[Path]:
     if not root.is_dir():
-        raise ValueError(f"图库目录不存在: {root}")
+        raise ValueError(f"图库目录不存在：{root}")
     for path in root.rglob("*"):
         if is_supported_image(path) and path.is_file():
             yield path

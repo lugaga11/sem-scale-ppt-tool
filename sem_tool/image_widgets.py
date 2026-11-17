@@ -11,7 +11,7 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from .imaging import image_to_display_rgb
-from .theme import icon
+from .theme import COLORS, RADIUS, icon
 
 
 def qimage_from_pil(image: Image.Image) -> QImage:
@@ -48,13 +48,13 @@ class ImageCanvas(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         bounds = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        painter.setPen(QPen(QColor("#e2e9f3"), 1, Qt.PenStyle.DashLine if self.pixmap.isNull() else Qt.PenStyle.SolidLine))
-        painter.setBrush(QColor("#f4f7fc"))
-        painter.drawRoundedRect(bounds, 10, 10)
+        painter.setPen(QPen(QColor(COLORS.border), 1, Qt.PenStyle.DashLine if self.pixmap.isNull() else Qt.PenStyle.SolidLine))
+        painter.setBrush(QColor(COLORS.subtle))
+        painter.drawRoundedRect(bounds, RADIUS, RADIUS)
         if self.pixmap.isNull():
             center = self.rect().center()
-            icon("image", "#91a9ca").paint(painter, center.x() - 16, center.y() - 30, 32, 32)
-            painter.setPen(QColor("#7486a0"))
+            icon("image", COLORS.disabled).paint(painter, center.x() - 16, center.y() - 30, 32, 32)
+            painter.setPen(QColor(COLORS.muted))
             painter.drawText(self.rect().adjusted(8, 40, -8, 0), Qt.AlignmentFlag.AlignCenter, self.placeholder)
             return
         area = self.rect().adjusted(6, 6, -6, -6)
@@ -62,7 +62,7 @@ class ImageCanvas(QWidget):
         target = QRectF(0, 0, size.width(), size.height())
         target.moveCenter(QRectF(area).center())
         clip = QPainterPath()
-        clip.addRoundedRect(bounds, 10, 10)
+        clip.addRoundedRect(bounds, RADIUS, RADIUS)
         painter.setClipPath(clip)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         painter.drawPixmap(target.toRect(), self.pixmap)

@@ -28,8 +28,20 @@ from PySide6.QtWidgets import (
 )
 
 from ..files import IMAGE_FILE_FILTER, image_paths_from_inputs, natural_key, path_key
-from ..theme import icon
-from ..widgets import PathLineEdit, SegmentedControl, ToggleSwitch, open_file_or_warn, section_heading
+from ..theme import CARD_MARGIN, COLORS, ICON_SIZE, SPACING, icon
+from ..widgets import (
+    ColorSwatchButton,
+    NoWheelComboBox,
+    NoWheelDoubleSpinBox,
+    NoWheelSpinBox,
+    PathLineEdit,
+    SegmentedControl,
+    ToggleSwitch,
+    card,
+    make_icon_button,
+    open_file_or_warn,
+    section_heading,
+)
 from .core import (
     DEFAULT_MARGIN_INCHES,
     DEFAULTS,
@@ -49,9 +61,6 @@ from .queue import (
     COL_NAME,
     FileQueueWidget,
     MeasurementCellWidget,
-    NoWheelComboBox,
-    NoWheelDoubleSpinBox,
-    NoWheelSpinBox,
 )
 from .worker import GenerateOptions, GeneratorWorker
 
@@ -87,6 +96,7 @@ class AnnotationPanel(QWidget):
     log_message = Signal(str)
     log_reset = Signal()
     log_requested = Signal()
+    export_finished = Signal(list)
 
     def __init__(self) -> None:
         super().__init__()
@@ -102,42 +112,39 @@ class AnnotationPanel(QWidget):
     def _build_ui(self) -> None:
         self.setObjectName("annotationPanel")
         root_layout = QHBoxLayout(self)
-        root_layout.setContentsMargins(16, 12, 16, 8)
+        root_layout.setContentsMargins(CARD_MARGIN, SPACING, CARD_MARGIN, SPACING)
         self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.content_splitter.setHandleWidth(12)
+        self.content_splitter.setHandleWidth(SPACING)
         self.content_splitter.setChildrenCollapsible(False)
         root_layout.addWidget(self.content_splitter)
+        self.content_splitter.addWidget(self._build_queue_card())
+        self.content_splitter.addWidget(self._build_inspector())
+        self.content_splitter.setStretchFactor(0, 1)
+        self.content_splitter.setStretchFactor(1, 0)
+        self.content_splitter.setSizes([794, 342])
 
-        queue_box = QFrame()
-        queue_box.setProperty("panel", True)
-        queue_layout = QVBoxLayout(queue_box)
-        queue_layout.setContentsMargins(14, 12, 14, 10)
-        queue_layout.setSpacing(12)
+    def _build_queue_card(self) -> QFrame:
+        queue_box, queue_layout = card()
         title_row = section_heading("文件队列", "image")
         self.queue_total = QLabel("0 个文件")
         self.queue_total.setProperty("role", "badge")
         title_row.insertWidget(2, self.queue_total)
         self.select_all_button = self._button("全选", self.select_all_generate)
         self.select_all_button.setIcon(icon("check"))
-        self.select_all_button.setAccessibleDescription("勾选所有文件用于生成")
+        self.select_all_button.setToolTip("勾选所有文件用于生成")
         title_row.addWidget(self.select_all_button)
         self.unselect_all_button = self._button("取消全选", self.unselect_all_generate)
         self.unselect_all_button.setIcon(icon("square"))
-        self.unselect_all_button.setAccessibleDescription("取消所有文件的生成勾选")
+        self.unselect_all_button.setToolTip("取消所有文件的生成勾选")
         title_row.addWidget(self.unselect_all_button)
         sort_button = self._button("", self.sort_queue)
-        sort_button.setIcon(icon("sort"))
-        sort_button.setFixedWidth(34)
-        sort_button.setAccessibleName("自然排序")
         sort_button.setProperty("variant", "toolbar")
+        make_icon_button(sort_button, "sort", "按文件名自然排序")
         title_row.addWidget(sort_button)
         more_button = QToolButton()
         more_button.setObjectName("queueMoreButton")
         more_button.setProperty("variant", "toolbar")
-        more_button.setIcon(icon("more", "#455c78"))
-        more_button.setIconSize(QSize(24, 24))
-        more_button.setFixedSize(36, 34)
-        more_button.setAccessibleName("队列操作")
+        make_icon_button(more_button, "more", "队列操作")
         more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.queue_menu = QMenu(more_button)
         self.queue_menu.addAction(icon("plus"), "添加文件…", self.choose_input_files)
@@ -160,27 +167,54 @@ class AnnotationPanel(QWidget):
         self.count_label.setProperty("role", "muted")
         self.count_label.setWordWrap(True)
         queue_layout.addWidget(self.count_label)
-        self.content_splitter.addWidget(queue_box)
+        return queue_box
 
-        right_panel = QFrame()
-        right_panel.setProperty("panel", True)
-        right_panel.setMinimumWidth(300)
-        right_panel.setMaximumWidth(390)
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(1, 10, 1, 1)
-        right_layout.setSpacing(0)
+    def _build_inspector(self) -> QFrame:
+        """The right-hand column: scrolling settings above the always visible generate button."""
+        inspector = QFrame()
+        inspector.setProperty("panel", True)
+        inspector.setMinimumWidth(300)
+        inspector.setMaximumWidth(390)
+        layout = QVBoxLayout(inspector)
+        layout.setContentsMargins(1, 6, 1, 1)
+        layout.setSpacing(0)
         self.settings_scroll = QScrollArea()
         self.settings_scroll.setWidgetResizable(True)
         self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         settings = QWidget()
         settings.setObjectName("inspectorContents")
         settings_layout = QVBoxLayout(settings)
-        settings_layout.setContentsMargins(18, 7, 18, 10)
-        settings_layout.setSpacing(14)
+        settings_layout.setContentsMargins(CARD_MARGIN, 8, CARD_MARGIN, SPACING)
+        settings_layout.setSpacing(SPACING)
         settings_layout.addLayout(section_heading("标尺设置", "ruler"))
+        settings_layout.addLayout(self._build_scale_form())
+        settings_layout.addLayout(section_heading("导出设置", "document"))
+        self._build_export_settings(settings_layout)
+        settings_layout.addStretch()
+        self.settings_scroll.setWidget(settings)
+        layout.addWidget(self.settings_scroll, 1)
+
+        actions = QVBoxLayout()
+        actions.setContentsMargins(CARD_MARGIN, SPACING, CARD_MARGIN, CARD_MARGIN)
+        actions.setSpacing(8)
+        self.export_count = QLabel("已勾选 0 张")
+        self.export_count.setProperty("role", "muted")
+        actions.addWidget(self.export_count)
+        self.generate_button = QPushButton("生成 PPTX")
+        self.generate_button.setObjectName("generateButton")
+        self.generate_button.setProperty("variant", "primary")
+        self.generate_button.setIcon(icon("download", COLORS.surface))
+        self.generate_button.setIconSize(QSize(18, 18))
+        self.generate_button.clicked.connect(self.generate)
+        actions.addWidget(self.generate_button)
+        layout.addLayout(actions)
+        return inspector
+
+    def _build_scale_form(self) -> QFormLayout:
+        """One form for the everyday and the advanced rows, so every field shares a left edge."""
         self.scale_form = QFormLayout()
-        self.scale_form.setVerticalSpacing(12)
-        self.scale_form.setHorizontalSpacing(12)
+        self.scale_form.setVerticalSpacing(SPACING)
+        self.scale_form.setHorizontalSpacing(SPACING)
         self.scale_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.auto_scale_check = ToggleSwitch("自动选择标尺长度")
         self.auto_scale_check.setChecked(True)
@@ -188,18 +222,54 @@ class AnnotationPanel(QWidget):
         self.auto_scale_choice = SegmentedControl(list(AUTO_SCALE_PRESETS))
         self.auto_scale_choice.setCurrentText(label_for_value(AUTO_SCALE_PRESETS, DEFAULTS["auto_scale_preset"]))
         self.fixed_scale_edit = QLineEdit(DEFAULTS["fixed_scale"])
-        self.fixed_scale_edit.setEnabled(False)
-
+        self.fixed_scale_edit.setPlaceholderText("例如 1um 或 500nm")
         self.position_combo = NoWheelComboBox()
         self.position_combo.addItems(list(POSITIONS.keys()))
         self.position_combo.setCurrentText(label_for_value(POSITIONS, DEFAULTS["scale_position"]))
-        self.color_edit = QLineEdit(f"#{hex_color(DEFAULTS['bar_color'])}")
         self.line_width_spin = NoWheelDoubleSpinBox()
         self.line_width_spin.setRange(0.25, 20.0)
         self.line_width_spin.setDecimals(2)
         self.line_width_spin.setSuffix(" pt")
         self.line_width_spin.setSingleStep(0.25)
         self.line_width_spin.setValue(DEFAULTS["line_width_pt"])
+        self.color_edit = QLineEdit(f"#{hex_color(DEFAULTS['bar_color'])}")
+        self.color_button = ColorSwatchButton("选择标尺颜色")
+        self.color_button.clicked.connect(self.choose_color)
+        self.color_edit.textChanged.connect(self.update_color_swatch)
+        self.update_color_swatch()
+        color_row = QHBoxLayout()
+        color_row.setSpacing(8)
+        color_row.addWidget(self.color_button)
+        color_row.addWidget(self.color_edit)
+        automatic_row = QHBoxLayout()
+        automatic_row.addStretch()
+        automatic_row.addWidget(self.auto_scale_check)
+
+        self.scale_form.addRow("自动长度", automatic_row)
+        self.scale_form.addRow("标尺长度", self.auto_scale_choice)
+        self.scale_form.addRow("固定长度", self.fixed_scale_edit)
+        self.scale_form.addRow("位置", self.position_combo)
+        self.scale_form.addRow("线宽", self.line_width_spin)
+        self.scale_form.addRow("颜色", color_row)
+
+        self.advanced_toggle = QToolButton()
+        self.advanced_toggle.setObjectName("advancedToggle")
+        self.advanced_toggle.setText("更多设置")
+        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.advanced_toggle.setIconSize(QSize(12, 12))
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.advanced_toggle.toggled.connect(self.toggle_advanced_options)
+        self.scale_form.addRow(self.advanced_toggle)
+
+        self.inset_x_spin = NoWheelSpinBox()
+        self.inset_x_spin.setRange(0, 40)
+        self.inset_x_spin.setValue(DEFAULTS["inset_x_percent"])
+        self.inset_x_spin.setSuffix(" %")
+        self.inset_y_spin = NoWheelSpinBox()
+        self.inset_y_spin.setRange(0, 40)
+        self.inset_y_spin.setValue(DEFAULTS["inset_y_percent"])
+        self.inset_y_spin.setSuffix(" %")
         self.font_spin = NoWheelSpinBox()
         self.font_spin.setRange(0, 72)
         self.font_spin.setValue(DEFAULTS["font_size_pt"])
@@ -213,107 +283,42 @@ class AnnotationPanel(QWidget):
         self.margin_spin.setSingleStep(0.05)
         self.margin_spin.setSuffix(" inch")
         self.margin_spin.setValue(DEFAULT_MARGIN_INCHES)
-        self.inset_x_spin = NoWheelSpinBox()
-        self.inset_x_spin.setRange(0, 40)
-        self.inset_x_spin.setValue(DEFAULTS["inset_x_percent"])
-        self.inset_x_spin.setSuffix(" %")
-        self.inset_y_spin = NoWheelSpinBox()
-        self.inset_y_spin.setRange(0, 40)
-        self.inset_y_spin.setValue(DEFAULTS["inset_y_percent"])
-        self.inset_y_spin.setSuffix(" %")
-
-        color_row = QHBoxLayout()
-        self.color_button = self._button("", self.choose_color)
-        self.color_button.setFixedWidth(34)
-        self.color_button.setAccessibleName("选择标尺颜色")
-        color_row.addWidget(self.color_button)
-        color_row.addWidget(self.color_edit)
-        self.color_edit.textChanged.connect(self.update_color_swatch)
-        self.update_color_swatch()
-
-        automatic_row = QHBoxLayout()
-        automatic_row.addStretch()
-        automatic_row.addWidget(self.auto_scale_check)
-        self.scale_form.addRow("自动长度", automatic_row)
-        self.scale_form.addRow("标尺长度", self.auto_scale_choice)
-        self.scale_form.addRow("固定长度", self.fixed_scale_edit)
-        self.scale_form.addRow("位置", self.position_combo)
-        self.scale_form.addRow("线宽", self.line_width_spin)
-        self.scale_form.addRow("颜色", color_row)
-        settings_layout.addLayout(self.scale_form)
+        self.advanced_fields = (
+            self.inset_x_spin, self.inset_y_spin, self.font_spin, self.font_bold_check, self.margin_spin,
+        )
+        for label, field in zip(("横向内缩", "纵向内缩", "字体大小", "字体样式", "页边距"), self.advanced_fields):
+            self.scale_form.addRow(label, field)
         self.on_auto_scale_toggled(True)
+        self.toggle_advanced_options(False)
+        return self.scale_form
 
-        self.advanced_toggle = QToolButton()
-        self.advanced_toggle.setObjectName("advancedToggle")
-        self.advanced_toggle.setText("更多设置")
-        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.advanced_toggle.setArrowType(Qt.ArrowType.RightArrow)
-        self.advanced_toggle.setCheckable(True)
-        self.advanced_toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.advanced_toggle.toggled.connect(self.toggle_advanced_options)
-        settings_layout.addWidget(self.advanced_toggle)
-        self.advanced_options = QWidget()
-        advanced_form = QFormLayout(self.advanced_options)
-        advanced_form.setContentsMargins(0, 0, 0, 0)
-        advanced_form.setSpacing(8)
-        advanced_form.addRow("横向内缩", self.inset_x_spin)
-        advanced_form.addRow("纵向内缩", self.inset_y_spin)
-        advanced_form.addRow("字体大小", self.font_spin)
-        advanced_form.addRow("字体样式", self.font_bold_check)
-        advanced_form.addRow("页边距", self.margin_spin)
-        self.advanced_options.setVisible(False)
-        settings_layout.addWidget(self.advanced_options)
-
-        settings_layout.addLayout(section_heading("导出设置", "document"))
+    def _build_export_settings(self, layout: QVBoxLayout) -> None:
         self.output_format_control = SegmentedControl(list(OUTPUT_FORMATS))
-        settings_layout.addWidget(self.output_format_control)
+        self.output_format_control.group.buttonToggled.connect(self.on_output_format_changed)
+        layout.addWidget(self.output_format_control)
         self.output_hint = QLabel("每张图片一页 · 标注可编辑")
         self.output_hint.setProperty("role", "muted")
         self.output_hint.setWordWrap(True)
-        settings_layout.addWidget(self.output_hint)
+        layout.addWidget(self.output_hint)
         save_label = QLabel("保存位置")
         save_label.setProperty("role", "muted")
-        settings_layout.addWidget(save_label)
+        layout.addWidget(save_label)
         self.output_edit = PathLineEdit(str(Path.cwd() / DEFAULTS["output_filename"]))
         self.output_edit.setMinimumWidth(0)
         self.output_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        output_path_row = QHBoxLayout()
-        output_path_row.setSpacing(6)
-        output_path_row.addWidget(self.output_edit, 1)
         save_button = self._button("", self.choose_output)
-        save_button.setIcon(icon("folder"))
-        save_button.setFixedWidth(36)
-        save_button.setAccessibleName("另存为")
+        make_icon_button(save_button, "folder", "另存为…")
+        output_path_row = QHBoxLayout()
+        output_path_row.setSpacing(8)
+        output_path_row.addWidget(self.output_edit, 1)
         output_path_row.addWidget(save_button)
-        settings_layout.addLayout(output_path_row)
-        settings_layout.addStretch()
-        self.settings_scroll.setWidget(settings)
-        right_layout.addWidget(self.settings_scroll, 1)
-
-        actions = QVBoxLayout()
-        actions.setContentsMargins(18, 12, 18, 16)
-        actions.setSpacing(10)
-        self.export_count = QLabel("已勾选 0 张")
-        self.export_count.setProperty("role", "muted")
-        actions.addWidget(self.export_count)
-        self.generate_button = QPushButton("生成 PPTX")
-        self.generate_button.setObjectName("generateButton")
-        self.generate_button.setProperty("variant", "primary")
-        self.generate_button.setIcon(icon("download", "#ffffff"))
-        self.generate_button.setIconSize(QSize(18, 18))
-        self.generate_button.clicked.connect(self.generate)
-        self.output_format_control.group.buttonToggled.connect(self.on_output_format_changed)
-        actions.addWidget(self.generate_button)
-        right_layout.addLayout(actions)
-        self.content_splitter.addWidget(right_panel)
-        self.content_splitter.setStretchFactor(0, 1)
-        self.content_splitter.setStretchFactor(1, 0)
-        self.content_splitter.setSizes([794, 342])
+        layout.addLayout(output_path_row)
 
     @Slot(bool)
     def toggle_advanced_options(self, expanded: bool) -> None:
-        self.advanced_options.setVisible(expanded)
-        self.advanced_toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        for field in self.advanced_fields:
+            self.scale_form.setRowVisible(field, expanded)
+        self.advanced_toggle.setIcon(icon("chevron-up" if expanded else "chevron-down", COLORS.muted))
 
     def bar_color(self) -> str | None:
         """The colour both exporters will use, as #RRGGBB; None while the text is not a colour they accept."""
@@ -324,13 +329,11 @@ class AnnotationPanel(QWidget):
 
     @Slot()
     def update_color_swatch(self) -> None:
-        color = self.bar_color()
-        self.color_button.setText("" if color else "?")
-        self.color_button.setStyleSheet(f"background-color: {color or '#ffffff'}; border: 1px solid #dce3ed;")
+        self.color_button.set_color(self.bar_color())
 
     def _button(self, text: str, callback) -> QPushButton:
         button = QPushButton(text)
-        button.setIconSize(QSize(17, 17))
+        button.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
         button.clicked.connect(callback)
         return button
 
@@ -385,7 +388,7 @@ class AnnotationPanel(QWidget):
             self.output_edit.setText(path)
 
     def choose_color(self) -> None:
-        color = QColorDialog.getColor(QColor(self.bar_color() or "#FFFFFF"), self, "选择标尺颜色")
+        color = QColorDialog.getColor(QColor(self.bar_color() or COLORS.surface), self, "选择标尺颜色")
         if color.isValid():
             self.color_edit.setText(color.name().upper())
 
@@ -601,7 +604,7 @@ class AnnotationPanel(QWidget):
             f"已标注 {measurement} 张 · 膜厚 {thickness} · 测距 {distance}{missing_text}"
             if total else "拖入图片或文件夹，开始标定与测量"
         )
-        self.export_count.setText(f"已勾选 {selected} 张{missing_text}")
+        self.export_count.setText(f"已勾选 {selected} 张")
         self.file_list.resizeColumnToContents(COL_MEASUREMENT)
 
     def _notify_queue_changed(self) -> None:
@@ -817,8 +820,6 @@ class AnnotationPanel(QWidget):
             self.update_count()
 
     def on_auto_scale_toggled(self, checked: bool) -> None:
-        self.auto_scale_choice.setEnabled(checked)
-        self.fixed_scale_edit.setEnabled(not checked)
         self.scale_form.setRowVisible(self.auto_scale_choice, checked)
         self.scale_form.setRowVisible(self.fixed_scale_edit, not checked)
 
@@ -899,12 +900,12 @@ class AnnotationPanel(QWidget):
                             options["auto_scale_preset"],
                         )
                     except ValueError as exc:
-                        raise ValueError(f"{path.name}: {exc}") from exc
+                        raise ValueError(f"{path.name}：{exc}") from exc
                     fraction = fixed_scale_nm / (width_px * calibration.nm_per_pixel)
                     if fraction < 0.02:
-                        scale_fraction_warnings.append(f"- {path.name}: 占图宽 {fraction:.1%}，可能过短")
+                        scale_fraction_warnings.append(f"- {path.name}：占图宽 {fraction:.1%}，可能过短")
                     elif fraction > 0.80:
-                        scale_fraction_warnings.append(f"- {path.name}: 占图宽 {fraction:.1%}，可能过长")
+                        scale_fraction_warnings.append(f"- {path.name}：占图宽 {fraction:.1%}，可能过长")
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "参数错误", str(exc))
             return
@@ -946,19 +947,20 @@ class AnnotationPanel(QWidget):
 
     @Slot(list)
     def on_finished(self, output_paths: list[str]) -> None:
+        self.export_finished.emit(output_paths)
         output_count = len(output_paths)
         if output_count == 1:
-            message = f"文件已生成:\n{output_paths[0]}"
+            message = f"文件已生成：\n{output_paths[0]}"
         else:
             output_dir = Path(output_paths[0]).parent
             output_format = Path(output_paths[0]).suffix.upper().lstrip(".")
-            message = f"已生成 {output_count} 个 {output_format}:\n{output_dir}"
+            message = f"已生成 {output_count} 个 {output_format}：\n{output_dir}"
         if not self.closing:
             QMessageBox.information(self, "完成", message)
 
     @Slot(str)
     def on_failed(self, message: str) -> None:
-        self.append_log(f"错误: {message}")
+        self.append_log(f"错误：{message}")
         if not self.closing:
             self.log_requested.emit()
             QMessageBox.critical(self, "生成失败", message)

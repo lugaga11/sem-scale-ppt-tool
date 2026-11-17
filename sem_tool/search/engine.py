@@ -44,12 +44,13 @@ class SearchResult:
     thumbnail: Optional[bytes] = None
 
     @property
-    def confidence_label(self) -> str:
+    def confidence(self) -> str:
+        """How much the geometric check supports the match: "high", "medium" or "low"."""
         if self.inliers >= 20:
-            return "高"
+            return "high"
         if self.inliers >= 8:
-            return "中"
-        return "可能不确定"
+            return "medium"
+        return "low"
 
 
 def read_image(path: Path) -> np.ndarray:

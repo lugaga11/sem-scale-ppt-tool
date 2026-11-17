@@ -136,7 +136,7 @@ class ImageIndex:
                     processed += 1
                     skipped += 1
                     if progress:
-                        progress(processed, total, f"跳过未变化: {path.name}")
+                        progress(processed, total, f"跳过未变化：{path.name}")
                     continue
                 jobs.append(
                     IndexJob(
@@ -162,7 +162,7 @@ class ImageIndex:
                 if processed % 25 == 0:
                     conn.commit()
                 if progress:
-                    progress(processed, total, f"索引: {result.job.path.name}")
+                    progress(processed, total, f"索引：{result.job.path.name}")
             conn.commit()
 
         return IndexStats(total=total, indexed=indexed, skipped=skipped, removed=removed, errors=errors)
@@ -223,7 +223,7 @@ class ImageIndex:
                 return []
             path = Path(row["path"])
             if progress:
-                progress(current, total, f"匹配: {path.name}")
+                progress(current, total, f"匹配：{path.name}")
             candidate = deserialize_features(
                 path,
                 row["width"],

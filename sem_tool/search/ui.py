@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional, cast
 
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QSize, Qt, QThread, Signal, Slot
 from PySide6.QtGui import (
     QAction,
     QDragEnterEvent,
@@ -40,8 +40,18 @@ from PySide6.QtWidgets import (
 from ..files import IMAGE_FILE_FILTER, is_supported_image, open_path, path_key
 from ..image_widgets import ImageCanvas
 from ..settings import AppSettings, default_db_path
-from ..theme import icon
-from ..widgets import ElidedLabel, EmptyState, PathLineEdit, open_file_or_warn, reveal_file_or_warn, section_heading
+from ..theme import CARD_MARGIN, COLORS, ICON_SIZE, SPACING, icon
+from ..widgets import (
+    SPIN_TEXT_MARGIN,
+    ElidedLabel,
+    EmptyState,
+    PathLineEdit,
+    card,
+    open_file_or_warn,
+    restyle,
+    reveal_file_or_warn,
+    section_heading,
+)
 from .engine import SearchResult
 from .index import IndexStats, IndexStatus
 from .worker import SearchBlocked, SearchWorker, Task
@@ -105,18 +115,18 @@ class SearchPanel(QWidget):
 
     def _build_ui(self) -> None:
         self.setObjectName("searchPanel")
+        # Files and folders dropped anywhere on the page arrive here; child widgets pass them up.
         self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(16, 12, 16, 8)
-        root_layout.setSpacing(12)
-        controls_box = QFrame()
-        controls_box.setProperty("panel", True)
-        controls_layout = QVBoxLayout(controls_box)
-        controls_layout.setContentsMargins(16, 14, 16, 12)
-        controls_layout.setSpacing(10)
-        root_layout.addWidget(controls_box)
+        root_layout.setContentsMargins(CARD_MARGIN, SPACING, CARD_MARGIN, SPACING)
+        root_layout.setSpacing(SPACING)
+        root_layout.addWidget(self._build_controls_card())
+        root_layout.addWidget(self._build_results_card(), 1)
 
+    def _build_controls_card(self) -> QFrame:
+        controls_box, controls_layout = card()
+        controls_layout.setSpacing(10)
         form = QGridLayout()
         form.setColumnStretch(1, 1)
         form.setHorizontalSpacing(10)
@@ -127,13 +137,15 @@ class SearchPanel(QWidget):
         query_button = QPushButton("选择截图")
         query_button.clicked.connect(self.choose_query)
         paste_button = QPushButton("粘贴截图")
+        paste_button.setToolTip("粘贴剪贴板里的截图或文件（Ctrl+V）")
         paste_button.clicked.connect(self.paste_from_clipboard)
         root_button = QPushButton("选择图库")
         root_button.clicked.connect(self.choose_root)
+        self.index_button.setToolTip("扫描图库，只处理新增、修改和上次失败的图片")
         for button, name in ((query_button, "image"), (paste_button, "clipboard"), (root_button, "folder"),
                              (self.index_button, "refresh"), (self.search_button, "search")):
-            button.setIcon(icon(name, "#ffffff" if button is self.search_button else "#7a8fac"))
-            button.setIconSize(QSize(16, 16))
+            button.setIcon(icon(name, COLORS.surface if button is self.search_button else COLORS.icon))
+            button.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
         self.input_controls = (query_button, paste_button, root_button, self.query_edit, self.root_edit, self.top_spin)
         self._set_uniform_width([
             query_button, paste_button, root_button, self.index_button, self.search_button, self.cancel_button,
@@ -142,7 +154,6 @@ class SearchPanel(QWidget):
         form.addWidget(self.query_edit, 0, 1)
         form.addWidget(query_button, 0, 2)
         form.addWidget(paste_button, 0, 3)
-
         form.addWidget(QLabel("图库"), 1, 0)
         form.addWidget(self.root_edit, 1, 1)
         form.addWidget(root_button, 1, 2)
@@ -151,9 +162,7 @@ class SearchPanel(QWidget):
         self.top_spin.setRange(1, 50)
         self.top_spin.setValue(10)
         self.top_spin.setFixedWidth(80)
-
-        controls_layout.addLayout(form)
-
+        self.top_spin.lineEdit().setTextMargins(SPIN_TEXT_MARGIN, 0, 0, 0)
         index_menu = QMenu(self.index_management_button)
         index_menu.addAction("打开索引目录").triggered.connect(self.open_index_directory)
         index_menu.addSeparator()
@@ -167,17 +176,19 @@ class SearchPanel(QWidget):
             action = index_menu.addAction(text)
             action.triggered.connect(callback)
             self.index_maintenance_actions.append(action)
+        self.index_management_button.setProperty("variant", "menu")
         self.index_management_button.setMenu(index_menu)
 
-        buttons = QHBoxLayout()
-        buttons.setSpacing(10)
-        buttons.addWidget(self.top_spin)
-        buttons.addWidget(self.index_management_button)
-        buttons.addStretch(1)
+        options = QHBoxLayout()
+        options.setSpacing(10)
+        options.addWidget(self.top_spin)
+        options.addWidget(self.index_management_button)
+        options.addStretch(1)
         form.addWidget(QLabel("结果数"), 2, 0)
-        form.addLayout(buttons, 2, 1)
+        form.addLayout(options, 2, 1)
         form.addWidget(self.cancel_button, 2, 2)
         form.addWidget(self.search_button, 2, 3)
+        controls_layout.addLayout(form)
 
         self.cancel_button.setEnabled(False)
         self.cancel_button.setVisible(False)
@@ -190,42 +201,35 @@ class SearchPanel(QWidget):
         controls_layout.addWidget(self.progress)
 
         self.status_label.setText("选择截图和图库后搜索原图。")
-        self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.status_label.setProperty("role", "status")
-        self.status_label.setWordWrap(True)
-        controls_layout.addWidget(self.status_label)
-
-        self.index_status_label.setText("索引状态: 未选择图库")
-        self.index_status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.index_status_label.setText("索引状态：未选择图库")
         self.index_status_label.setProperty("role", "muted")
-        self.index_status_label.setWordWrap(True)
-        controls_layout.addWidget(self.index_status_label)
+        for label in (self.status_label, self.index_status_label):
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+            controls_layout.addWidget(label)
+        return controls_box
 
-        results_box = QFrame()
-        results_box.setProperty("panel", True)
-        results_layout = QVBoxLayout(results_box)
-        results_layout.setContentsMargins(14, 12, 14, 10)
-        results_layout.setSpacing(10)
-        result_actions = section_heading("匹配结果", "search")
+    def _build_results_card(self) -> QFrame:
+        results_box, results_layout = card()
+        heading = section_heading("匹配结果", "search")
         self.result_count = QLabel("0 个候选")
         self.result_count.setProperty("role", "badge")
-        result_actions.insertWidget(2, self.result_count)
-        results_layout.addLayout(result_actions)
+        heading.insertWidget(2, self.result_count)
+        results_layout.addLayout(heading)
 
         self.results_list.setObjectName("searchResults")
         self.results_list.setSpacing(5)
         self.results_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.results_list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.results_list.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.results_list.setAcceptDrops(True)
         self.results_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         results_layout.addWidget(self.results_list, 1)
         self.results_empty = EmptyState(self.results_list.viewport(), "等待查找原图", "选择截图和图库，搜索对应的原始图片", "search")
         for signal in (self.results_list.model().rowsInserted, self.results_list.model().rowsRemoved,
                        self.results_list.model().modelReset):
             signal.connect(self._update_results_view)
-        root_layout.addWidget(results_box, 1)
-        self._install_drop_targets()
+        return results_box
 
     def _update_results_view(self, *_args) -> None:
         count = self.results_list.count()
@@ -240,7 +244,6 @@ class SearchPanel(QWidget):
         self.root_edit.paste_requested.connect(self.paste_from_clipboard)
         self.root_edit.editingFinished.connect(self.remember_gallery_dir)
         self.root_edit.editingFinished.connect(self.refresh_index_status)
-        self.results_list.itemDoubleClicked.connect(self.open_result_item)
         self.results_list.itemSelectionChanged.connect(self._update_result_selection)
 
     def _update_result_selection(self) -> None:
@@ -249,9 +252,7 @@ class SearchPanel(QWidget):
             widget = self.results_list.itemWidget(item)
             if widget is not None and widget.property("selected") != item.isSelected():
                 widget.setProperty("selected", item.isSelected())
-                widget.style().unpolish(widget)
-                widget.style().polish(widget)
-                widget.update()
+                restyle(widget)
 
     def _install_shortcuts(self) -> None:
         paste_action = QAction(self)
@@ -264,27 +265,6 @@ class SearchPanel(QWidget):
         width = max(button.sizeHint().width() for button in buttons)
         for button in buttons:
             button.setFixedWidth(width)
-
-    def _install_drop_targets(self) -> None:
-        for widget in [
-            self.status_label,
-            self.index_status_label,
-            self.progress,
-            self.results_list,
-        ]:
-            widget.setAcceptDrops(True)
-            widget.installEventFilter(self)
-
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if event.type() == QEvent.Type.DragEnter:
-            drag_event = cast(QDragEnterEvent, event)
-            if self._has_supported_drop(drag_event):
-                drag_event.acceptProposedAction()
-                return True
-        if event.type() == QEvent.Type.Drop:
-            if self._handle_drop(cast(QDropEvent, event)):
-                return True
-        return super().eventFilter(watched, event)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if self._has_supported_drop(event):
@@ -315,12 +295,12 @@ class SearchPanel(QWidget):
                 self.root_edit.setText(str(path))
                 self.remember_gallery_dir()
                 self.refresh_index_status()
-                self.status_label.setText(f"已拖入图库目录: {path.name}")
+                self.status_label.setText(f"已拖入图库目录：{path.name}")
                 event.acceptProposedAction()
                 return True
             if path.is_file() and is_supported_image(path):
                 self.query_edit.setText(str(path))
-                self.status_label.setText(f"已拖入截图: {path.name}")
+                self.status_label.setText(f"已拖入截图：{path.name}")
                 event.acceptProposedAction()
                 return True
         self.status_label.setText("拖入的内容不是支持的图片或图库目录")
@@ -341,9 +321,9 @@ class SearchPanel(QWidget):
             path = Path(self.settings.last_gallery_dir)
             if path.is_dir():
                 self.root_edit.setText(str(path))
-                self.index_status_label.setText("索引状态: 尚未检查")
+                self.index_status_label.setText("索引状态：尚未检查")
             else:
-                self.index_status_label.setText(f"索引状态: 上次图库不存在: {path}")
+                self.index_status_label.setText(f"索引状态：上次的图库已不存在（{path}）")
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
@@ -365,7 +345,7 @@ class SearchPanel(QWidget):
         try:
             self.settings.save()
         except OSError as exc:
-            self.status_label.setText(f"无法保存图库设置: {exc}")
+            self.status_label.setText(f"无法保存图库设置：{exc}")
 
     def paste_from_clipboard(self) -> None:
         if self._foreground_busy():
@@ -384,7 +364,7 @@ class SearchPanel(QWidget):
                     return
                 if path.is_file() and is_supported_image(path):
                     self.query_edit.setText(str(path))
-                    self.status_label.setText(f"已从剪贴板粘贴文件: {path.name}")
+                    self.status_label.setText(f"已从剪贴板粘贴文件：{path.name}")
                     return
 
         if mime.hasImage():
@@ -399,7 +379,7 @@ class SearchPanel(QWidget):
                 QMessageBox.warning(self, "粘贴失败", "无法保存剪贴板图片。")
                 return
             self.query_edit.setText(str(output_path))
-            self.status_label.setText(f"已从剪贴板粘贴截图: {output_path.name}")
+            self.status_label.setText(f"已从剪贴板粘贴截图：{output_path.name}")
             return
 
         self.status_label.setText("剪贴板里没有图片或文件路径")
@@ -502,13 +482,13 @@ class SearchPanel(QWidget):
         if self.thread is not None and self.cancel_event is not None:
             self.cancel_event.set()
             if not self._background:
-                self.status_label.setText("正在取消...")
+                self.status_label.setText("正在取消…")
 
     def open_index_directory(self) -> None:
         path = default_db_path().parent
         path.mkdir(parents=True, exist_ok=True)
         open_path(path)
-        self.status_label.setText(f"已打开索引目录: {path}")
+        self.status_label.setText(f"已打开索引目录：{path}")
 
     def _start_worker(self, worker: SearchWorker, finish_slot=None, *, background: bool = False) -> None:
         self._background = background
@@ -559,35 +539,35 @@ class SearchPanel(QWidget):
         if total <= 0:
             return shorten_progress_message(message)
         percent = int(current * 100 / total)
-        parts = [f"进度 {current}/{total} ({percent}%)"]
+        parts = [f"进度 {current}/{total}（{percent}%）"]
         if self.work_started_at and current > 0 and current < total:
             elapsed = time.monotonic() - self.work_started_at
             remaining = elapsed / current * (total - current)
             parts.append(f"预计剩余 {format_duration(remaining)}")
         parts.append(shorten_progress_message(message))
-        return " | ".join(parts)
+        return " · ".join(parts)
 
     @Slot(object)
     def _on_index_finished(self, stats: IndexStats) -> None:
         self.progress.setValue(100)
         self.status_label.setText(
-            f"索引完成: 总数 {stats.total}, 新增/更新 {stats.indexed}, 跳过 {stats.skipped}, 删除 {stats.removed}, 错误 {stats.errors}"
+            f"索引完成：总数 {stats.total} · 新增/更新 {stats.indexed} · 跳过 {stats.skipped} · 删除 {stats.removed} · 错误 {stats.errors}"
         )
         self.results_empty.title.setText("图库已准备好")
         self.results_empty.detail.setText("选择截图，点击“搜索”查找对应原图")
 
     @Slot(object)
     def _on_clear_finished(self, removed: int) -> None:
-        self.status_label.setText(f"已清空当前图库索引: 删除 {removed} 条记录")
+        self.status_label.setText(f"已清空当前图库索引：删除 {removed} 条记录")
 
     @Slot(object)
     def _on_prune_finished(self, removed: int) -> None:
-        self.status_label.setText(f"已清理失效索引记录: 删除 {removed} 条")
+        self.status_label.setText(f"已清理失效索引记录：删除 {removed} 条")
 
     @Slot(object)
     def _on_vacuum_finished(self, sizes: tuple[int, int]) -> None:
         before, after = sizes
-        self.status_label.setText(f"索引库压缩完成: {format_bytes(before)} -> {format_bytes(after)}")
+        self.status_label.setText(f"索引库压缩完成：{format_bytes(before)} → {format_bytes(after)}")
 
     @Slot(object)
     def _on_search_finished(self, outcome: list[SearchResult] | SearchBlocked) -> None:
@@ -600,7 +580,7 @@ class SearchPanel(QWidget):
             return
         results = outcome
         self.progress.setValue(100)
-        self.status_label.setText(f"搜索完成: {len(results)} 个候选")
+        self.status_label.setText(f"搜索完成：{len(results)} 个候选")
         self.results_empty.title.setText("没有找到匹配原图")
         self.results_empty.detail.setText("可以更换截图，或检查图库索引是否已更新")
         for index, result in enumerate(results, start=1):
@@ -640,32 +620,32 @@ class SearchPanel(QWidget):
         text = self.root_edit.text().strip()
         self._status_root = text
         if not text:
-            self.index_status_label.setText("索引状态: 未选择图库")
+            self.index_status_label.setText("索引状态：未选择图库")
             return
         root = Path(text)
         if not root.is_dir():
-            self.index_status_label.setText("索引状态: 图库目录不存在")
+            self.index_status_label.setText("索引状态：图库目录不存在")
             return
         self._when_idle(lambda: self._start_status_check(root))
 
     def _start_status_check(self, root: Path) -> None:
-        self.index_status_label.setText("索引状态: 正在检查…")
+        self.index_status_label.setText("索引状态：正在检查…")
         self._start_worker(SearchWorker(root, self._new_cancel_event(), "status"), background=True)
 
     @Slot(str)
     def _on_status_failed(self, message: str) -> None:
-        self.index_status_label.setText(f"索引状态: 检查失败: {message}")
+        self.index_status_label.setText(f"索引状态：检查失败，{message}")
 
     @Slot(object)
     def _set_index_status(self, status: IndexStatus) -> None:
         last_indexed = format_timestamp(status.last_indexed_at)
         parts = [
-            f"当前图库: 已索引 {status.indexed_files}/{status.total_files} 张",
-            f"上次索引: {last_indexed}",
+            f"当前图库：已索引 {status.indexed_files}/{status.total_files} 张",
+            f"上次索引：{last_indexed}",
         ]
         if status.needs_update:
             parts.append(
-                f"建议更新索引: 新增 {status.new_files}, 修改 {status.changed_files}, 删除 {status.removed_files}, 错误 {status.error_files}"
+                f"建议更新索引：新增 {status.new_files} · 修改 {status.changed_files} · 删除 {status.removed_files} · 错误 {status.error_files}"
             )
         else:
             parts.append("索引已是最新")
@@ -674,10 +654,10 @@ class SearchPanel(QWidget):
     def _confirm_search_with_stale_index(self, status: IndexStatus) -> bool:
         message = (
             "检测到图库可能有变化，建议先更新索引。\n\n"
-            f"新增: {status.new_files}\n"
-            f"修改: {status.changed_files}\n"
-            f"删除: {status.removed_files}\n"
-            f"错误: {status.error_files}\n\n"
+            f"新增：{status.new_files}\n"
+            f"修改：{status.changed_files}\n"
+            f"删除：{status.removed_files}\n"
+            f"错误：{status.error_files}\n\n"
             "仍要使用当前索引继续搜索吗？"
         )
         answer = QMessageBox.question(
@@ -711,18 +691,12 @@ class SearchPanel(QWidget):
 
     def _add_result(self, rank: int, result: SearchResult) -> None:
         item = QListWidgetItem()
-        item.setData(Qt.ItemDataRole.UserRole, str(result.path))
         widget = ResultWidget(rank, result)
         widget.set_queued(path_key(result.path) in self._queue_path_keys)
         widget.queue_requested.connect(self.queue_requested)
         item.setSizeHint(QSize(0, max(widget.minimumHeight(), widget.sizeHint().height())))
         self.results_list.addItem(item)
         self.results_list.setItemWidget(item, widget)
-
-    def open_result_item(self, item: QListWidgetItem) -> None:
-        path_text = item.data(Qt.ItemDataRole.UserRole)
-        if path_text:
-            open_path(Path(path_text))
 
     def _set_busy(self, busy: bool) -> None:
         if busy:
@@ -793,14 +767,15 @@ class ResultWidget(QFrame):
         title = ElidedLabel(f"{rank:02d}   {result.path.name}")
         title.setProperty("role", "resultTitle")
         title_row.addWidget(title, 1)
-        confidence = QLabel(f"置信度 · {result.confidence_label}")
+        confidence = QLabel(f"置信度 · {CONFIDENCE_LABELS[result.confidence]}")
         confidence.setProperty("role", "confidence")
-        confidence.setProperty("level", "high" if result.confidence_label == "高" else "low")
+        confidence.setProperty("level", result.confidence)
+        confidence.setToolTip("按几何一致的匹配点数量估计：20 个以上为高，8 个以上为中")
         title_row.addWidget(confidence)
         path_label = ElidedLabel(str(result.path))
         path_label.setProperty("role", "muted")
         metrics = QLabel(
-            f"匹配内点 {result.inliers}   ·   有效匹配 {result.good_matches}   ·   平均距离 {result.avg_distance:.2f}"
+            f"匹配内点 {result.inliers} · 有效匹配 {result.good_matches} · 平均距离 {result.avg_distance:.2f}"
         )
         metrics.setProperty("role", "metrics")
         metrics.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -811,13 +786,16 @@ class ResultWidget(QFrame):
         layout.addLayout(text_layout, 1)
 
         action_layout = QHBoxLayout()
-        self.add_button = QPushButton("加入列表")
+        self.add_button = QPushButton("加入队列")
         self.add_button.setProperty("variant", "soft")
-        self.add_button.setIcon(icon("plus", "#2878f4"))
-        self.add_button.setIconSize(QSize(15, 15))
+        self.add_button.setIcon(icon("plus", COLORS.primary))
+        self.add_button.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
+        self.add_button.setToolTip("把这张原图加入“标注与导出”的文件队列")
         self.add_button.clicked.connect(lambda: self.queue_requested.emit([result.path]))
         open_button = QPushButton("打开")
+        open_button.setToolTip("用默认程序打开原图")
         reveal_button = QPushButton("定位")
+        reveal_button.setToolTip("在文件管理器中显示")
         copy_button = QPushButton("复制路径")
         for button in (open_button, reveal_button, copy_button):
             button.setProperty("variant", "toolbar")
@@ -837,13 +815,11 @@ class ResultWidget(QFrame):
         variant = "added" if queued else "soft"
         if self.add_button.property("variant") == variant:
             return
-        self.add_button.setText("已加入" if queued else "加入列表")
+        self.add_button.setText("已加入" if queued else "加入队列")
         self.add_button.setProperty("variant", variant)
-        self.add_button.setIcon(icon("check" if queued else "plus", "#226c42" if queued else "#2878f4"))
+        self.add_button.setIcon(icon("check" if queued else "plus", COLORS.success if queued else COLORS.primary))
         self.add_button.setEnabled(not queued)
-        self.add_button.style().unpolish(self.add_button)
-        self.add_button.style().polish(self.add_button)
-        self.add_button.update()
+        restyle(self.add_button)
 
     def open_file(self) -> None:
         open_file_or_warn(self, self.result.path)
@@ -860,6 +836,7 @@ class ResultWidget(QFrame):
 
 
 CLIPBOARD_KEEP_DAYS = 7
+CONFIDENCE_LABELS = {"high": "高", "medium": "中", "low": "低"}
 
 
 def clipboard_image_path() -> Path:
@@ -896,10 +873,7 @@ def format_duration(seconds: float) -> str:
 
 
 def shorten_progress_message(message: str, max_length: int = 48) -> str:
-    if len(message) <= max_length:
-        return message
-    keep = max(8, max_length - 3)
-    return message[:keep] + "..."
+    return message if len(message) <= max_length else message[: max_length - 1] + "…"
 
 
 def format_bytes(size: int) -> str:

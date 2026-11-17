@@ -33,6 +33,7 @@ from sem_tool.search.index import ImageIndex, IndexJob, IndexResult, extract_ind
 from sem_tool.search.ui import CLIPBOARD_KEEP_DAYS, ResultWidget, prune_clipboard_images
 from sem_tool.search.worker import ProgressThrottler, SearchWorker
 from sem_tool.settings import AppSettings, default_db_path
+from sem_tool.theme import apply_theme
 
 
 def texture(seed: int = 10) -> Image.Image:
@@ -193,6 +194,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = cast(QApplication, QApplication.instance() or QApplication([]))
         cls.app.setQuitOnLastWindowClosed(False)
+        apply_theme(cls.app)
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -513,7 +515,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
 
         widget = search.results_list.itemWidget(search.results_list.item(0))
         assert isinstance(widget, ResultWidget)
-        self.assertEqual(widget.add_button.text(), "加入列表")
+        self.assertEqual(widget.add_button.text(), "加入队列")
         widget.add_button.click()
         self.assertIs(self.window.tabs.currentWidget(), search)
         self.assertIsNone(self.app.activeModalWidget())
@@ -627,7 +629,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         panel.select_path(original)
         panel.remove_selected()
         for result in (widget, duplicate):
-            self.assertEqual(result.add_button.text(), "加入列表")
+            self.assertEqual(result.add_button.text(), "加入队列")
             self.assertTrue(result.add_button.isEnabled())
         panel.add_paths([original])
         self.assertEqual(widget.add_button.text(), "已加入")
@@ -636,7 +638,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         failed = search.results_list.itemWidget(search.results_list.item(2))
         assert isinstance(failed, ResultWidget)
         failed.add_button.click()
-        self.assertEqual(failed.add_button.text(), "加入列表")
+        self.assertEqual(failed.add_button.text(), "加入队列")
         self.assertTrue(failed.add_button.isEnabled())
         self.assertEqual([title for title, _ in self.messages], ["原图不可用"])
 

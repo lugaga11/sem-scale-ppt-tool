@@ -292,11 +292,12 @@ class ManualCalibrationGuiTests(unittest.TestCase):
                 for text, exported in (("green", "#00AA00"), ("blue", "#0066CC"), ("ffffff", "#FFFFFF"), ("#12ab34", "#12AB34")):
                     window.color_edit.setText(text)
                     self.assertEqual(window.bar_color(), exported)
-                    self.assertIn(exported, window.color_button.styleSheet())
+                    self.assertEqual(window.color_button.color, exported)
                     self.assertEqual(window.color_button.text(), "")
                 for text in ("orange", "#fff", "#FF000080", ""):
                     window.color_edit.setText(text)
                     self.assertIsNone(window.bar_color())
+                    self.assertIsNone(window.color_button.color)
                     self.assertEqual(window.color_button.text(), "?")
                 with patch("sem_tool.annotation.ui.QMessageBox.warning") as warning:
                     window.generate()

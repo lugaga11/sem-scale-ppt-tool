@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import gc
 import os
 import tempfile
 import threading
 import unittest
+import weakref
 from contextlib import closing
 from pathlib import Path
 from typing import cast
@@ -27,7 +29,7 @@ from sem_tool.app import MainWindow, install_qt_translation
 from sem_tool.files import image_paths_from_inputs, natural_key, path_key
 from sem_tool.imaging import image_to_display_rgb
 from sem_tool.search.engine import SearchResult, extract_features
-from sem_tool.search.index import ImageIndex
+from sem_tool.search.index import ImageIndex, IndexJob, IndexResult, extract_index_results
 from sem_tool.search.ui import CLIPBOARD_KEEP_DAYS, ResultWidget, prune_clipboard_images
 from sem_tool.search.worker import ProgressThrottler, SearchWorker
 from sem_tool.settings import AppSettings, default_db_path
@@ -66,6 +68,47 @@ class SearchCoreTests(unittest.TestCase):
             index.vacuum()
             self.assertEqual(index.clear(gallery), 1)
             self.assertTrue(original.exists())
+
+    def test_search_reads_features_in_chunks_and_never_returns_a_moved_original(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            gallery = root / "gallery"
+            gallery.mkdir()
+            for number in range(5):
+                texture(number + 1).save(gallery / f"{number}.png")
+            query = root / "query.png"
+            texture(4).crop((45, 35, 420, 320)).save(query)
+            index = ImageIndex(root / "index.sqlite")
+            index.update(gallery, max_workers=2)
+            progress = []
+            with patch("sem_tool.search.index.FEATURE_CHUNK_ROWS", 2):
+                results = index.search(gallery, query, top_n=3, progress=lambda current, total, _text: progress.append((current, total)))
+                self.assertEqual(results[0].path, gallery / "3.png")
+                self.assertEqual(len(results), 3)
+                self.assertEqual(progress, [(number, 5) for number in range(1, 6)])
+                (gallery / "3.png").unlink()
+                remaining = index.search(gallery, query, top_n=5)
+            self.assertEqual(len(remaining), 4)
+            self.assertNotIn(gallery / "3.png", [result.path for result in remaining])
+
+    def test_feature_extraction_releases_each_result_once_it_is_consumed(self) -> None:
+        alive = weakref.WeakSet()
+
+        def fake_job(job: IndexJob) -> IndexResult:
+            result = IndexResult(job, 1, 1, 0, b"", None, None)
+            alive.add(result)
+            return result
+
+        jobs = [IndexJob(Path(f"{number}.tif"), f"{number}.tif", ".tif", 1, 1.0) for number in range(200)]
+        consumed = 0
+        with patch("sem_tool.search.index.extract_index_job", new=fake_job):
+            for result in extract_index_results(jobs, max_workers=2):
+                consumed += 1
+                del result
+                if consumed == 150:
+                    gc.collect()
+                    self.assertLessEqual(len(alive), 4)  # the window of two jobs per worker
+        self.assertEqual(consumed, 200)
 
     def test_16_bit_sem_uses_display_pixels_for_search_without_rewriting_original(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

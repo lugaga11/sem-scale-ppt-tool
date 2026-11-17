@@ -4,11 +4,12 @@ import os
 import sqlite3
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import closing
 from dataclasses import dataclass, replace
+from itertools import islice
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
 from ..files import iter_image_files
 from ..settings import default_db_path
@@ -22,6 +23,8 @@ from .engine import (
 )
 
 ProgressCallback = Callable[[int, int, str], None]
+# One image stores up to ~100 KB of features, so they are read and matched a chunk at a time.
+FEATURE_CHUNK_ROWS = 64
 
 
 @dataclass(frozen=True)
@@ -245,16 +248,13 @@ class ImageIndex:
     ) -> list[SearchResult]:
         root = root.resolve()
         query_features = extract_features(query_path.resolve(), query=True)
-        rows = self._feature_rows(root)
-        total = len(rows)
+        total = self.count(root)
         scored: list[SearchResult] = []
 
-        for current, row in enumerate(rows, start=1):
+        for current, row in enumerate(self._iter_feature_rows(root), start=1):
             if cancel_event and cancel_event.is_set():
-                break
+                return []
             path = Path(row["path"])
-            if not path.is_file():
-                continue
             if progress:
                 progress(current, total, f"匹配: {path.name}")
             candidate = deserialize_features(
@@ -276,7 +276,14 @@ class ImageIndex:
             )
 
         scored.sort(key=lambda item: (-item.inliers, -item.good_matches, item.avg_distance, str(item.path)))
-        return [replace(result, thumbnail=make_thumbnail(result.path)) for result in scored[:top_n]]
+        results: list[SearchResult] = []
+        for result in scored:
+            if len(results) == top_n:
+                break
+            # An original may have been moved since the last index update; never offer a dead path.
+            if result.path.is_file():
+                results.append(replace(result, thumbnail=make_thumbnail(result.path)))
+        return results
 
     def count(self, root: Path) -> int:
         root = root.resolve()
@@ -347,18 +354,29 @@ class ImageIndex:
             last_indexed_at=last_indexed_at,
         )
 
-    def _feature_rows(self, root: Path) -> list[sqlite3.Row]:
+    def _iter_feature_rows(self, root: Path) -> Iterator[sqlite3.Row]:
+        """Yield the searchable rows of a gallery in rowid order, one bounded chunk per query.
+
+        Loading every row at once needs the whole gallery's features in memory, and a single long
+        cursor would hold a read lock for the entire search; short chunk queries avoid both.
+        """
+        last_rowid = 0
         with closing(self._connect()) as conn:
-            return list(
-                conn.execute(
+            while True:
+                rows = conn.execute(
                     """
-                    select path, width, height, keypoints, descriptors
-                    from images
-                    where root = ? and descriptors is not null and keypoints is not null
+                    select rowid, path, width, height, keypoints, descriptors
+                    from images not indexed
+                    where root = ? and descriptors is not null and rowid > ?
+                    order by rowid
+                    limit ?
                     """,
-                    (str(root),),
-                )
-            )
+                    (str(root), last_rowid, FEATURE_CHUNK_ROWS),
+                ).fetchall()
+                if not rows:
+                    return
+                yield from rows
+                last_rowid = rows[-1]["rowid"]
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -404,31 +422,30 @@ def default_max_workers() -> int:
 
 
 def extract_index_results(
-    jobs: list[IndexJob],
+    jobs: Iterable[IndexJob],
     *,
     max_workers: Optional[int] = None,
     cancel_event: Optional[threading.Event] = None,
-) -> Iterable[IndexResult]:
-    if not jobs:
-        return
-    workers = max(1, max_workers or default_max_workers())
-    if workers == 1 or len(jobs) == 1:
-        for job in jobs:
-            if cancel_event and cancel_event.is_set():
-                return
-            yield extract_index_job(job)
-        return
+) -> Iterator[IndexResult]:
+    """Extract features on a thread pool, yielding results in completion order.
 
+    Only a small window of jobs is submitted at a time and a future is dropped as soon as its
+    result is handed over, so indexing a large gallery does not keep every result in memory.
+    """
+    workers = max_workers or default_max_workers()
+    remaining = iter(jobs)
+    running: set[Future[IndexResult]] = set()
     executor = ThreadPoolExecutor(max_workers=workers)
-    futures = [executor.submit(extract_index_job, job) for job in jobs]
     try:
-        for future in as_completed(futures):
-            if cancel_event and cancel_event.is_set():
-                break
-            yield future.result()
+        while not (cancel_event and cancel_event.is_set()):
+            for job in islice(remaining, workers * 2 - len(running)):
+                running.add(executor.submit(extract_index_job, job))
+            if not running:
+                return
+            done, running = wait(running, return_when=FIRST_COMPLETED)
+            while done:
+                yield done.pop().result()
     finally:
-        for future in futures:
-            future.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
 
 

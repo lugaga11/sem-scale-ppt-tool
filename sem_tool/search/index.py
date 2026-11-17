@@ -7,9 +7,12 @@ import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import closing
 from dataclasses import dataclass, replace
+from io import BytesIO
 from itertools import islice
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional
+
+import numpy as np
 
 from ..files import iter_image_files
 from ..settings import default_db_path
@@ -25,6 +28,11 @@ from .engine import (
 ProgressCallback = Callable[[int, int, str], None]
 # One image stores up to ~100 KB of features, so they are read and matched a chunk at a time.
 FEATURE_CHUNK_ROWS = 64
+_empty_keypoints = BytesIO()
+np.save(_empty_keypoints, np.empty((0, 2), dtype=np.float32), allow_pickle=False)
+EMPTY_KEYPOINTS = _empty_keypoints.getvalue()
+_empty_keypoints.close()
+del _empty_keypoints
 
 
 @dataclass(frozen=True)
@@ -225,7 +233,6 @@ class ImageIndex:
             if progress:
                 progress(current, total, f"匹配：{path.name}")
             candidate = deserialize_features(
-                path,
                 row["width"],
                 row["height"],
                 row["keypoints"],
@@ -235,7 +242,6 @@ class ImageIndex:
             scored.append(
                 SearchResult(
                     path=path,
-                    score=match.score,
                     inliers=match.inliers,
                     good_matches=match.good_matches,
                     avg_distance=match.avg_distance,
@@ -378,16 +384,6 @@ def scan_gallery(
         yield resolved, stat
 
 
-def serialize_empty_keypoints() -> bytes:
-    from io import BytesIO
-
-    import numpy as np
-
-    buffer = BytesIO()
-    np.save(buffer, np.empty((0, 2), dtype=np.float32), allow_pickle=False)
-    return buffer.getvalue()
-
-
 def default_max_workers() -> int:
     return max(1, min(8, os.cpu_count() or 4))
 
@@ -439,7 +435,7 @@ def extract_index_job(job: IndexJob) -> IndexResult:
             width=0,
             height=0,
             keypoint_count=0,
-            keypoints=serialize_empty_keypoints(),
+            keypoints=EMPTY_KEYPOINTS,
             descriptors=None,
             error=str(exc),
         )

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Create PowerPoint slides or SVGs from SEM images with editable scale bars."""
 
 from __future__ import annotations
@@ -9,6 +8,7 @@ import re
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
+from itertools import accumulate
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence, cast
 from xml.sax.saxutils import escape
@@ -57,8 +57,8 @@ DEFAULT_SLIDE_W = Inches(DEFAULTS["slide_width_inches"])
 DEFAULT_SLIDE_H = Inches(DEFAULTS["slide_height_inches"])
 DEFAULT_MARGIN_INCHES = DEFAULTS["slide_margin_inches"]
 POINTS_PER_INCH = 72.0
-DEFAULT_PAGE_W_PT = int(round(DEFAULTS["slide_width_inches"] * POINTS_PER_INCH))
-DEFAULT_PAGE_H_PT = int(round(DEFAULTS["slide_height_inches"] * POINTS_PER_INCH))
+DEFAULT_PAGE_W_PT = round(DEFAULTS["slide_width_inches"] * POINTS_PER_INCH)
+DEFAULT_PAGE_H_PT = round(DEFAULTS["slide_height_inches"] * POINTS_PER_INCH)
 AUTO_SCALE_PRESETS = {
     "short": (0.11, 0.08, 0.14),
     "medium": (0.16, 0.12, 0.20),
@@ -71,7 +71,6 @@ UNIT_TO_NM = {
     "pm": 1e-3,
     "nm": 1.0,
     "um": 1000.0,
-    "mum": 1000.0,
     "mm": 1_000_000.0,
     "m": 1_000_000_000.0,
 }
@@ -82,6 +81,10 @@ class Calibration:
     nm_per_pixel: float
     source: str
 
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.nm_per_pixel) or self.nm_per_pixel <= 0:
+            raise ValueError("像素标定必须是大于零的有限值。")
+
 
 @dataclass(frozen=True)
 class CalibrationOverride:
@@ -91,18 +94,23 @@ class CalibrationOverride:
     x2_px: float
     y2_px: float
 
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.known_length_nm) or self.known_length_nm <= 0:
+            raise ValueError("手动标定的实际长度必须大于零。")
+        pixel_length = self.pixel_length
+        if not math.isfinite(pixel_length) or pixel_length <= 0:
+            raise ValueError("手动标定线的像素长度必须大于零。")
+        nm_per_pixel = self.known_length_nm / pixel_length
+        if not math.isfinite(nm_per_pixel) or nm_per_pixel <= 0:
+            raise ValueError("像素标定必须是大于零的有限值。")
+
     @property
     def pixel_length(self) -> float:
         return math.hypot(self.x2_px - self.x1_px, self.y2_px - self.y1_px)
 
     @property
     def nm_per_pixel(self) -> float:
-        if not math.isfinite(self.known_length_nm) or self.known_length_nm <= 0:
-            raise ValueError("手动标定的实际长度必须大于零。")
-        pixel_length = self.pixel_length
-        if not math.isfinite(pixel_length) or pixel_length <= 0:
-            raise ValueError("手动标定线的像素长度必须大于零。")
-        return self.known_length_nm / pixel_length
+        return self.known_length_nm / self.pixel_length
 
     def to_calibration(self) -> Calibration:
         return Calibration(self.nm_per_pixel, f"手动标定：{self.known_length_nm:g} nm / {self.pixel_length:.1f} px")
@@ -112,12 +120,7 @@ class CalibrationOverride:
 class ThicknessMeasurement:
     top_y_px: float
     bottom_y_px: float
-    thickness_nm: float
-    label: str
     x_center_px: float
-    band_x0_px: int
-    band_x1_px: int
-    confidence: float
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,10 @@ class MeasurementOverride:
     y1_px: float
     x2_px: float
     y2_px: float
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"thickness", "distance"}:
+            raise ValueError(f"未知的测量类型：{self.kind!r}")
 
 
 @dataclass(frozen=True)
@@ -145,8 +152,6 @@ class ThicknessCandidate:
     top_y_px: float
     bottom_y_px: float
     x_center_px: float
-    band_x0_px: int
-    band_x1_px: int
     score: float
 
 
@@ -234,7 +239,7 @@ def parse_sem_metadata(image: Image.Image) -> Calibration | None:
                 continue
             value = float(match.group(2))
             unit = normalize_unit(match.group(3))
-            nm_per_pixel = value * UNIT_TO_NM.get(unit, math.nan)
+            nm_per_pixel = value * UNIT_TO_NM[unit]
             if nm_per_pixel > 0 and math.isfinite(nm_per_pixel):
                 calibration = Calibration(nm_per_pixel, f"{source}: {match.group(1)}")
                 if match.group(1).lower().startswith("image"):
@@ -259,8 +264,6 @@ def parse_scale_nm(value: str) -> float:
 
 
 def format_scale_label(scale_nm: float) -> str:
-    if not math.isfinite(scale_nm) or scale_nm <= 0:
-        raise ValueError("Scale length must be a positive finite value.")
     if scale_nm >= 1_000_000_000:
         value = scale_nm / 1_000_000_000.0
         unit = "m"
@@ -279,7 +282,7 @@ def format_scale_label(scale_nm: float) -> str:
     else:
         value = scale_nm / 1e-6
         unit = "fm"
-    number = str(int(round(value))) if abs(value - round(value)) < 1e-9 else f"{value:g}"
+    number = str(round(value)) if abs(value - round(value)) < 1e-9 else f"{value:g}"
     return f"{number} {unit}"
 
 
@@ -307,19 +310,11 @@ def first_argmin(values: np.ndarray, start: int, stop: int) -> int:
 
 
 def weighted_median(values: list[tuple[float, float]]) -> float:
-    if not values:
-        raise ValueError("Cannot calculate weighted median for an empty sequence.")
-    total = sum(max(0.0, weight) for _, weight in values)
-    if total <= 0:
-        return sorted(value for value, _ in values)[len(values) // 2]
-    threshold = total / 2
-    running = 0.0
+    """Median of the nonempty candidates accepted by the positive score threshold."""
     sorted_values = sorted(values, key=lambda item: item[0])
-    for value, weight in sorted_values:
-        running += max(0.0, weight)
-        if running >= threshold:
-            return value
-    return sorted_values[-1][0]
+    cumulative = list(accumulate(weight for _, weight in sorted_values))
+    threshold = sum(weight for _, weight in values) / 2
+    return next(value for (value, _), running in zip(sorted_values, cumulative) if running >= threshold)
 
 
 def detect_sem_content_bottom(gray: np.ndarray) -> int:
@@ -357,27 +352,20 @@ def detect_thickness_candidate(
     x0: int,
     x1: int,
     content_bottom: int,
-    min_gap_percent: float,
 ) -> ThicknessCandidate | None:
     profile = row_profile(gray, x0, x1, content_bottom)
-    if len(profile) < 40:
-        return None
     smooth = moving_average(profile, max(3, min(12, int(content_bottom * 0.008))))
     gradient = np.zeros_like(smooth)
     gradient[1:-1] = (smooth[2:] - smooth[:-2]) / 2
 
     top_start = max(5, int(content_bottom * 0.03))
     top_end = min(content_bottom - 10, max(top_start + 10, int(content_bottom * 0.55)))
-    if top_end <= top_start:
-        return None
     top_edge_y = first_argmax(gradient, top_start, top_end)
     top_y = first_argmax(smooth, max(0, top_edge_y - 2), min(content_bottom, top_edge_y + 16))
 
-    min_gap = max(12, int(content_bottom * min_gap_percent / 100))
+    min_gap = max(12, int(content_bottom * DEFAULTS["thickness_min_gap_percent"] / 100))
     lower_start = min(content_bottom - 10, top_y + min_gap)
     lower_end = min(content_bottom - 3, max(lower_start + 10, int(content_bottom * 0.95)))
-    if lower_end <= lower_start:
-        return None
     lower_edge_y = first_argmin(gradient, lower_start, lower_end)
     lower_peak_start = max(lower_start, lower_edge_y - max(8, int(content_bottom * 0.025)))
     bottom_y = first_argmax(smooth, lower_peak_start, min(content_bottom, lower_edge_y + 4))
@@ -390,8 +378,6 @@ def detect_thickness_candidate(
         recovery = smooth[rebound_peak_y] - smooth[valley_y]
         if recovery >= 12.0 and smooth[rebound_peak_y] >= smooth[bottom_y] + 8.0:
             bottom_y = rebound_peak_y
-    if bottom_y <= top_y:
-        return None
 
     contrast_offset = max(8, int(content_bottom * 0.035))
     top_contrast = smooth[top_y] - smooth[max(0, top_y - contrast_offset)]
@@ -404,39 +390,32 @@ def detect_thickness_candidate(
         top_y_px=float(top_y),
         bottom_y_px=float(bottom_y),
         x_center_px=(x0 + x1) / 2,
-        band_x0_px=x0,
-        band_x1_px=x1,
         score=score,
     )
 
 
-def detect_thickness_measurement(
-    image: Image.Image,
-    calibration: Calibration,
-    band_width_percent: float = DEFAULTS["thickness_band_width_percent"],
-    min_gap_percent: float = DEFAULTS["thickness_min_gap_percent"],
-) -> ThicknessMeasurement | None:
+def detect_thickness_measurement(image: Image.Image) -> ThicknessMeasurement | None:
     gray = np.asarray(image_to_display_grayscale(image))
     height, width = gray.shape
     content_bottom = detect_sem_content_bottom(gray)
     if content_bottom < max(60, int(height * 0.2)):
         return None
 
-    band_fraction = max(5.0, min(100.0, float(band_width_percent))) / 100
-    band_width = min(width, max(40, int(round(width * band_fraction))))
+    band_fraction = DEFAULTS["thickness_band_width_percent"] / 100
+    band_width = min(width, max(40, round(width * band_fraction)))
     half_band = band_width / 2
     center_fractions = (0.35, 0.45, 0.55, 0.65, 0.75)
     centers = sorted(
-        {int(round(min(max(width * fraction, half_band), width - half_band))) for fraction in center_fractions}
+        {round(min(max(width * fraction, half_band), width - half_band)) for fraction in center_fractions}
     )
 
     candidates: list[ThicknessCandidate] = []
     for center in centers:
-        x0 = max(0, int(round(center - half_band)))
-        x1 = min(width, int(round(center + half_band)))
+        x0 = max(0, round(center - half_band))
+        x1 = min(width, round(center + half_band))
         if x1 - x0 < 20:
             continue
-        candidate = detect_thickness_candidate(gray, x0, x1, content_bottom, min_gap_percent)
+        candidate = detect_thickness_candidate(gray, x0, x1, content_bottom)
         if candidate:
             candidates.append(candidate)
     if not candidates:
@@ -444,26 +423,15 @@ def detect_thickness_measurement(
 
     best_score = max(candidate.score for candidate in candidates)
     usable = [candidate for candidate in candidates if candidate.score >= max(70.0, best_score * 0.55)]
-    if not usable:
-        return None
     top_y = weighted_median([(candidate.top_y_px, candidate.score) for candidate in usable])
     bottom_y = weighted_median([(candidate.bottom_y_px, candidate.score) for candidate in usable])
-    if bottom_y <= top_y:
-        return None
 
     score_total = sum(candidate.score for candidate in usable)
     x_center = sum(candidate.x_center_px * candidate.score for candidate in usable) / score_total
-    best = max(usable, key=lambda candidate: candidate.score)
-    thickness_nm = (bottom_y - top_y) * calibration.nm_per_pixel
     return ThicknessMeasurement(
         top_y_px=top_y,
         bottom_y_px=bottom_y,
-        thickness_nm=thickness_nm,
-        label=format_length_label(thickness_nm),
         x_center_px=x_center,
-        band_x0_px=best.band_x0_px,
-        band_x1_px=best.band_x1_px,
-        confidence=min(1.0, best_score / 180.0),
     )
 
 
@@ -473,13 +441,13 @@ def measurement_segment_from_override(
     width_px: int,
     height_px: int,
 ) -> MeasurementSegment | None:
-    kind = override.kind if override.kind in {"thickness", "distance"} else "distance"
+    kind = override.kind
     x1 = max(0.0, min(float(override.x1_px), float(width_px - 1)))
     y1 = max(0.0, min(float(override.y1_px), float(height_px - 1)))
     x2 = max(0.0, min(float(override.x2_px), float(width_px - 1)))
     y2 = max(0.0, min(float(override.y2_px), float(height_px - 1)))
     if kind == "thickness":
-        x_center = max(0.0, min((x1 + x2) / 2, float(width_px - 1)))
+        x_center = (x1 + x2) / 2
         top_y, bottom_y = sorted((y1, y2))
         x1 = x2 = x_center
         y1, y2 = top_y, bottom_y
@@ -500,7 +468,7 @@ def measurement_segment_from_override(
 
 def dynamic_scale_candidates_nm(target_nm: float) -> list[float]:
     if not math.isfinite(target_nm) or target_nm <= 0:
-        raise ValueError("Target scale length must be a positive finite value.")
+        raise ValueError("目标标尺长度必须是大于零的有限值。")
     center_exponent = math.floor(math.log10(target_nm))
     candidates: set[float] = set()
     for exponent in range(center_exponent - 2, center_exponent + 3):
@@ -513,7 +481,7 @@ def dynamic_scale_candidates_nm(target_nm: float) -> list[float]:
             if math.isfinite(candidate) and candidate > 0:
                 candidates.add(candidate)
     if not candidates:
-        raise ValueError("Unable to generate automatic scale candidates.")
+        raise ValueError("无法生成自动标尺候选长度。")
     return sorted(candidates)
 
 
@@ -524,16 +492,16 @@ def choose_scale_nm(
     auto_scale_preset: str,
 ) -> float:
     if width_px <= 0:
-        raise ValueError("Image width must be greater than zero.")
+        raise ValueError("图像宽度必须大于零。")
     if not math.isfinite(nm_per_pixel) or nm_per_pixel <= 0:
-        raise ValueError("Pixel calibration must be a finite value greater than zero.")
+        raise ValueError("像素标定必须是大于零的有限值。")
     field_width_nm = width_px * nm_per_pixel
     if not math.isfinite(field_width_nm) or field_width_nm <= 0:
-        raise ValueError("Image field width is not a finite positive value.")
+        raise ValueError("图像视野宽度必须是大于零的有限值。")
 
     if fixed_scale_nm is not None:
         if not math.isfinite(fixed_scale_nm) or fixed_scale_nm <= 0:
-            raise ValueError("Fixed scale length must be a finite value greater than zero.")
+            raise ValueError("固定标尺长度必须是大于零的有限值。")
         if fixed_scale_nm > field_width_nm * (1.0 + 1e-12):
             raise ValueError(
                 f"固定标尺 {format_scale_label(fixed_scale_nm)} 超出了图像视野宽度 "
@@ -541,12 +509,8 @@ def choose_scale_nm(
             )
         return fixed_scale_nm
 
-    if auto_scale_preset not in AUTO_SCALE_PRESETS:
-        raise ValueError(f"Unknown automatic scale preset: {auto_scale_preset!r}.")
     target, minimum, maximum = AUTO_SCALE_PRESETS[auto_scale_preset]
     target_nm = field_width_nm * target
-    if not math.isfinite(target_nm) or target_nm <= 0:
-        raise ValueError("Automatic scale target is not a finite positive value.")
 
     scored: list[tuple[int, float, float]] = []
     for candidate in dynamic_scale_candidates_nm(target_nm):
@@ -619,34 +583,26 @@ def prepare_slide_item(
 
 
 def fit_image(width_px: int, height_px: int, slide_w: int, slide_h: int, margin: int) -> tuple[int, int, int, int]:
-    if width_px <= 0 or height_px <= 0:
-        raise ValueError("Image dimensions must be greater than zero.")
-    if margin < 0:
-        raise ValueError("Page margin cannot be negative.")
     max_w = slide_w - margin * 2
     max_h = slide_h - margin * 2
     if max_w <= 0 or max_h <= 0:
         raise ValueError("页边距过大，页面放不下图片。")
     scale = min(max_w / width_px, max_h / height_px)
-    image_w = int(round(width_px * scale))
-    image_h = int(round(height_px * scale))
-    image_x = int(round((slide_w - image_w) / 2))
-    image_y = int(round((slide_h - image_h) / 2))
+    image_w = round(width_px * scale)
+    image_h = round(height_px * scale)
+    image_x = round((slide_w - image_w) / 2)
+    image_y = round((slide_h - image_h) / 2)
     return image_x, image_y, image_w, image_h
 
 
 def fit_tight_page(width_px: int, height_px: int, max_page_w: int, max_page_h: int, margin: int) -> PageLayout:
-    if width_px <= 0 or height_px <= 0:
-        raise ValueError("Image dimensions must be greater than zero.")
-    if margin < 0:
-        raise ValueError("Page margin cannot be negative.")
     max_image_w = max_page_w - margin * 2
     max_image_h = max_page_h - margin * 2
     if max_image_w <= 0 or max_image_h <= 0:
         raise ValueError("页边距过大，页面放不下图片。")
     scale = min(max_image_w / width_px, max_image_h / height_px)
-    image_w = int(round(width_px * scale))
-    image_h = int(round(height_px * scale))
+    image_w = round(width_px * scale)
+    image_h = round(height_px * scale)
     return PageLayout(
         page_w=image_w + margin * 2,
         page_h=image_h + margin * 2,
@@ -683,13 +639,13 @@ def add_scale_bar(
     inset_y_percent: float,
     line_width_pt: float,
 ) -> None:
-    scale_w = int(round(item.scale_px / item.width_px * image_w))
-    inset_x = int(round(image_w * inset_x_percent / 100))
-    inset_y = int(round(image_h * inset_y_percent / 100))
-    font_pt = font_size or max(10, min(24, int(round(image_w / int(Inches(1)) * 1.4))))
-    text_h = int(round(font_pt * 12700 * 1.8))
+    scale_w = round(item.scale_px / item.width_px * image_w)
+    inset_x = round(image_w * inset_x_percent / 100)
+    inset_y = round(image_h * inset_y_percent / 100)
+    font_pt = font_size or max(10, min(24, round(image_w / int(Inches(1)) * 1.4)))
+    text_h = round(font_pt * 12700 * 1.8)
     text_w = max(scale_w + int(Inches(0.35)), int(Inches(0.75)))
-    label_gap = int(round(font_pt * 12700 * 0.25))
+    label_gap = round(font_pt * 12700 * 0.25)
 
     if position == "bottom-left":
         x1 = image_x + inset_x
@@ -713,7 +669,7 @@ def add_scale_bar(
     line.line.width = Pt(line_width_pt)
     remove_shape_effects(line)
 
-    text_x = int(round(x1 + scale_w / 2 - text_w / 2))
+    text_x = round(x1 + scale_w / 2 - text_w / 2)
     text_y = y1 - text_h - label_gap
     box = slide.shapes.add_textbox(Emu(text_x), Emu(text_y), Emu(text_w), Emu(text_h))
     box.fill.background()
@@ -808,9 +764,6 @@ def set_pptx_line_arrowheads(shape) -> None:
         ("a:headEnd", {"type": "triangle"}),
         ("a:tailEnd", {"type": "triangle"}),
     ):
-        existing = line.find(qn(tag))
-        if existing is not None:
-            line.remove(existing)
         arrow = OxmlElement(tag)
         for key, value in attrs.items():
             arrow.set(key, value)
@@ -829,10 +782,10 @@ def add_pptx_measurement_textbox(
     font_bold: bool,
 ) -> None:
     box = slide.shapes.add_textbox(
-        Emu(int(round(text_x))),
-        Emu(int(round(text_y))),
-        Emu(int(round(text_w))),
-        Emu(int(round(text_h))),
+        Emu(round(text_x)),
+        Emu(round(text_y)),
+        Emu(round(text_w)),
+        Emu(round(text_h)),
     )
     box.fill.background()
     box.line.fill.background()
@@ -870,19 +823,19 @@ def add_pptx_measurement_segment(
     dy = segment.y2_px - segment.y1_px
     span = math.hypot(dx, dy)
     if span <= 0:
-        return
+        return  # An extremely narrow image can round to zero width in page coordinates.
 
     rgb = RGBColor.from_string(color)
-    font_pt = font_size or max(10, min(24, int(round(image_w / int(Inches(1)) * 1.4))))
+    font_pt = font_size or max(10, min(24, round(image_w / int(Inches(1)) * 1.4)))
     ux = dx / span
     uy = dy / span
 
     line = slide.shapes.add_connector(
         MSO_CONNECTOR.STRAIGHT,
-        Emu(int(round(segment.x1_px))),
-        Emu(int(round(segment.y1_px))),
-        Emu(int(round(segment.x2_px))),
-        Emu(int(round(segment.y2_px))),
+        Emu(round(segment.x1_px)),
+        Emu(round(segment.y1_px)),
+        Emu(round(segment.x2_px)),
+        Emu(round(segment.y2_px)),
     )
     line.line.color.rgb = rgb
     line.line.width = Pt(line_width_pt)
@@ -1026,10 +979,10 @@ def add_svg_scale_bar(
     inset_y_percent: float,
     line_width_pt: float,
 ) -> None:
-    scale_w = int(round(item.scale_px / item.width_px * image_w))
-    inset_x = int(round(image_w * inset_x_percent / 100))
-    inset_y = int(round(image_h * inset_y_percent / 100))
-    font_pt = font_size or max(10, min(24, int(round(image_w / POINTS_PER_INCH * 1.4))))
+    scale_w = round(item.scale_px / item.width_px * image_w)
+    inset_x = round(image_w * inset_x_percent / 100)
+    inset_y = round(image_h * inset_y_percent / 100)
+    font_pt = font_size or max(10, min(24, round(image_w / POINTS_PER_INCH * 1.4)))
     text_h = font_pt * 1.8
     label_gap = font_pt * 0.25
 
@@ -1082,9 +1035,9 @@ def add_svg_measurement_segment(
     dy = segment.y2_px - segment.y1_px
     span = math.hypot(dx, dy)
     if span <= 0:
-        return
+        return  # A valid pixel segment can collapse after the image size is rounded to points.
 
-    font_pt = font_size or max(10, min(24, int(round(image_w / POINTS_PER_INCH * 1.4))))
+    font_pt = font_size or max(10, min(24, round(image_w / POINTS_PER_INCH * 1.4)))
     svg_color = f"#{color}"
     font_weight = "700" if font_bold else "400"
     ux = dx / span
@@ -1220,21 +1173,21 @@ def validate_generation_options(
     line_width_pt: float,
 ) -> None:
     if auto_scale_preset not in AUTO_SCALE_PRESETS:
-        raise ValueError(f"Unknown automatic scale preset: {auto_scale_preset!r}.")
+        raise ValueError(f"未知的自动标尺预设：{auto_scale_preset!r}。")
     if position not in SCALE_POSITIONS:
-        raise ValueError(f"Unknown scale position: {position!r}.")
+        raise ValueError(f"未知的标尺位置：{position!r}。")
     if font_size is not None and (not math.isfinite(font_size) or font_size <= 0):
-        raise ValueError("Font size must be greater than zero or set to automatic.")
+        raise ValueError("字号必须大于零，或设为自动。")
     if not math.isfinite(margin_inches) or margin_inches < 0:
-        raise ValueError("Page margin must be a finite non-negative value.")
+        raise ValueError("页边距必须是大于或等于零的有限值。")
     for name, value in (
-        ("Horizontal inset", inset_x_percent),
-        ("Vertical inset", inset_y_percent),
+        ("横向内缩", inset_x_percent),
+        ("纵向内缩", inset_y_percent),
     ):
         if not math.isfinite(value) or not 0 <= value <= 100:
-            raise ValueError(f"{name} must be between 0 and 100 percent.")
+            raise ValueError(f"{name}必须在 0% 到 100% 之间。")
     if not math.isfinite(line_width_pt) or line_width_pt <= 0:
-        raise ValueError("Line width must be a finite value greater than zero.")
+        raise ValueError("线宽必须是大于零的有限值。")
 
 
 @contextmanager
@@ -1339,7 +1292,7 @@ def generate_svg(
         line_width_pt,
     )
     page_w, page_h = DEFAULT_PAGE_W_PT, DEFAULT_PAGE_H_PT
-    margin = int(round(margin_inches * POINTS_PER_INCH))
+    margin = round(margin_inches * POINTS_PER_INCH)
     color = hex_color(bar_color)
     with prepared_items(
         input_path, fixed_scale, auto_scale_preset, measurement_overrides, calibration_overrides

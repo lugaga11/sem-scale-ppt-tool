@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 from PIL import Image
 from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QDrag, QDragEnterEvent, QDropEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -270,11 +270,11 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
             self.assertAlmostEqual(thumbnail.pixelColor(x, 20).red(), int(expected_pixels[20, x, 0]), delta=3)
         self.assertEqual(second.read_bytes(), original_bytes)
 
-        panel.set_row_checked(1, 0, False)
+        panel.set_row_checked(1, False)
         panel.sort_queue()
         self.assertEqual(panel.item_path(0), second)
         self.assertEqual(panel.selected_rows(), [0])
-        self.assertFalse(panel.row_checked(0, 0))
+        self.assertFalse(panel.row_checked(0))
         panel.remove_selected()
         self.assertEqual(panel.file_list.rowCount(), 1)
         self.assertNotIn(str(second), thumbnails)
@@ -421,6 +421,61 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
             QTest.mouseRelease(queue.viewport(), Qt.MouseButton.LeftButton, pos=position)
             open_original.assert_called_once_with(original.resolve())
 
+    def test_single_row_drag_preserves_queue_state_in_both_directions(self) -> None:
+        paths = [self.make_original(f"{number}.tif") for number in range(3)]
+        panel = self.window.annotation_panel
+        panel.add_paths(paths)
+        panel.set_row_checked(0, False)
+        annotation = MeasurementOverride("distance", 0, 20, 100, 20)
+        calibration = CalibrationOverride(500, 0, 0, 100, 0)
+        panel.measurement_overrides[path_key(paths[0])] = [annotation]
+        panel.calibration_overrides[path_key(paths[0])] = calibration
+        self.window.show()
+        self.app.processEvents()
+        queue = panel.file_list
+
+        class QueueEnterEvent(QDragEnterEvent):
+            def source(self):
+                return queue
+
+        class QueueDropEvent(QDropEvent):
+            def source(self):
+                return queue
+
+        for source_row, target_row, at_bottom, expected in (
+            (0, 2, True, [paths[1], paths[2], paths[0]]),
+            (2, 0, False, paths),
+            (0, 0, True, paths),  # dropping just after itself does not move the row
+        ):
+            with self.subTest(source=source_row, target=target_row, bottom=at_bottom):
+                rect = queue.visualRect(queue.model().index(target_row, 1))
+                position = QPoint(rect.center().x(), rect.bottom() - 1 if at_bottom else rect.top() + 1)
+
+                def drop(drag, action):
+                    mime = drag.mimeData()
+                    enter = QueueEnterEvent(position, action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+                    self.app.sendEvent(queue.viewport(), enter)
+                    self.assertTrue(enter.isAccepted())
+                    event = QueueDropEvent(QPointF(position), action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+                    self.app.sendEvent(queue.viewport(), event)
+                    self.assertTrue(event.isAccepted())
+                    return action
+
+                with patch.object(QDrag, "exec", new=drop):
+                    queue.start_queue_row_drag(source_row)
+                self.assertEqual([panel.item_path(row) for row in range(3)], expected)
+                self.assertEqual(panel.checked_paths(), [path for path in expected if path != paths[0]])
+                self.assertEqual(panel.measurement_overrides[path_key(paths[0])], [annotation])
+                self.assertEqual(panel.calibration_overrides[path_key(paths[0])], calibration)
+                self.assertEqual([panel.item_path(row) for row in panel.selected_rows()], [paths[0]])
+                self.assertIsNone(queue.dragged_row)
+                self.assertIsNone(queue.drop_indicator_row)
+
+        with patch.object(QDrag, "exec", return_value=Qt.DropAction.IgnoreAction):
+            queue.start_queue_row_drag(0)
+        self.assertEqual([panel.item_path(row) for row in range(3)], paths)
+        self.assertIsNone(queue.dragged_row)
+
     def test_queue_checkboxes_and_scale_controls_respond_to_mouse_and_keyboard(self) -> None:
         panel = self.window.annotation_panel
         panel.add_paths([self.make_original()])
@@ -430,14 +485,14 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         checkbox = queue.item(0, 0)
         assert checkbox is not None
         QTest.mouseClick(queue.viewport(), Qt.MouseButton.LeftButton, pos=queue.visualItemRect(checkbox).center())
-        self.assertFalse(panel.row_checked(0, 0))
+        self.assertFalse(panel.row_checked(0))
         QTest.keyClick(queue, Qt.Key.Key_Space)
-        self.assertTrue(panel.row_checked(0, 0))
+        self.assertTrue(panel.row_checked(0))
         QTest.mouseClick(queue.viewport(), Qt.MouseButton.LeftButton, pos=queue.visualRect(queue.model().index(0, 1)).center())
-        self.assertTrue(panel.row_checked(0, 0))
+        self.assertTrue(panel.row_checked(0))
         for expected in (False, True):
             QTest.mouseClick(queue.viewport(), Qt.MouseButton.LeftButton, pos=queue.visualItemRect(checkbox).center())
-            self.assertEqual(panel.row_checked(0, 0), expected)
+            self.assertEqual(panel.row_checked(0), expected)
 
         QTest.mouseClick(panel.auto_scale_choice.buttons["长"], Qt.MouseButton.LeftButton)
         self.assertEqual(panel.auto_scale_choice.currentText(), "长")
@@ -533,14 +588,14 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.assertEqual(panel.measurement_overrides[path_key(original)], [annotation])
         self.assertIs(self.window.tabs.currentWidget(), panel)
         # Importing an existing path must preserve the measurement and generation checkbox.
-        panel.set_row_checked(0, 0, False)
+        panel.set_row_checked(0, False)
         self.window.tabs.setCurrentWidget(search)
         self.window.add_to_annotation_queue([original])
         self.assertIs(self.window.tabs.currentWidget(), search)
         self.assertEqual(panel.file_list.rowCount(), 1)
-        self.assertFalse(panel.row_checked(0, 0))
+        self.assertFalse(panel.row_checked(0))
         self.assertEqual(panel.measurement_overrides[path_key(original)], [annotation])
-        panel.set_row_checked(0, 0, True)
+        panel.set_row_checked(0, True)
         self.window.tabs.setCurrentWidget(panel)
 
         for fmt in ("SVG", "PPTX", "SVG", "PPTX"):
@@ -617,13 +672,13 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         search = self.window.search_panel
         panel = self.window.annotation_panel
         self.window.tabs.setCurrentWidget(search)
-        search._add_result(1, SearchResult(original, 1, 20, 30, 2))
+        search._add_result(1, SearchResult(original, 20, 30, 2))
         widget = search.results_list.itemWidget(search.results_list.item(0))
         assert isinstance(widget, ResultWidget)
         widget.add_button.click()
         self.assertEqual(widget.add_button.text(), "已加入")
         self.assertTrue(widget.add_button.isEnabled())
-        search._add_result(2, SearchResult(original, 1, 20, 30, 2))
+        search._add_result(2, SearchResult(original, 20, 30, 2))
         duplicate = search.results_list.itemWidget(search.results_list.item(1))
         assert isinstance(duplicate, ResultWidget)
         self.assertEqual(duplicate.add_button.text(), "已加入")
@@ -632,7 +687,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         texture().save(other)
         panel.add_paths([other])
         panel.select_path(other)
-        panel.set_row_checked(1, 0, False)
+        panel.set_row_checked(1, False)
         annotation = MeasurementOverride("distance", 0, 20, 100, 20)
         calibration = CalibrationOverride(500, 0, 0, 100, 0)
         panel.measurement_overrides[path_key(other)] = [annotation]
@@ -644,7 +699,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.assertIs(self.window.tabs.currentWidget(), search)
         self.assertEqual(panel.file_list.rowCount(), 1)
         self.assertEqual(panel.item_path(0), other)
-        self.assertFalse(panel.row_checked(0, 0))
+        self.assertFalse(panel.row_checked(0))
         self.assertEqual(panel.measurement_overrides[path_key(other)], [annotation])
         self.assertEqual(panel.calibration_overrides[path_key(other)], calibration)
         for state in (panel.measurement_overrides, panel.calibration_overrides, panel.metadata_calibrations):
@@ -664,7 +719,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         panel.add_paths([original])
         self.assertEqual(widget.add_button.text(), "已加入")
         missing = self.root / "gone.tif"
-        search._add_result(3, SearchResult(missing, 1, 20, 30, 2))
+        search._add_result(3, SearchResult(missing, 20, 30, 2))
         failed = search.results_list.itemWidget(search.results_list.item(2))
         assert isinstance(failed, ResultWidget)
         failed.add_button.click()
@@ -702,7 +757,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
 
     def test_search_result_actions_report_missing_files_instead_of_failing_silently(self) -> None:
         search = self.window.search_panel
-        search._add_result(1, SearchResult(self.root / "已移走.tif", 1, 20, 30, 2))
+        search._add_result(1, SearchResult(self.root / "已移走.tif", 20, 30, 2))
         widget = search.results_list.itemWidget(search.results_list.item(0))
         assert isinstance(widget, ResultWidget)
         widget.open_file()
@@ -740,7 +795,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         search = self.window.search_panel
         self.window.tabs.setCurrentWidget(search)
         for rank, path in enumerate((second, first), 1):
-            search._add_result(rank, SearchResult(path, 1, 20, 30, 2))
+            search._add_result(rank, SearchResult(path, 20, 30, 2))
             widget = search.results_list.itemWidget(search.results_list.item(rank - 1))
             assert isinstance(widget, ResultWidget)
             widget.add_button.click()
@@ -753,7 +808,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.assertIn("其他文件夹", item.text())
         override = MeasurementOverride("distance", 1, 1, 11, 1)
         panel.measurement_overrides[path_key(second)] = [override]
-        panel.reorder_queue_rows([0], 2)
+        panel.reorder_queue_row(0, 2)
         self.assertEqual(panel.checked_paths(), [first, second])
         self.assertEqual(panel.measurement_overrides_for_generation()[second], [override])
         panel.clear_queue()

@@ -31,7 +31,6 @@ from .core import (
     detect_thickness_measurement,
     format_length_label,
     parse_scale_nm,
-    parse_sem_metadata,
 )
 
 TOOL_LABELS = {"distance": "测距", "thickness": "膜厚"}
@@ -140,13 +139,13 @@ class MeasurementPreviewWidget(QWidget):
     def clamped_annotation(self, annotation: MeasurementOverride | None) -> MeasurementOverride | None:
         if annotation is None:
             return None
-        kind = annotation.kind if annotation.kind in {"thickness", "distance"} else "distance"
+        kind = annotation.kind
         x1 = max(0.0, min(float(annotation.x1_px), float(self.image_w - 1)))
         y1 = max(0.0, min(float(annotation.y1_px), float(self.image_h - 1)))
         x2 = max(0.0, min(float(annotation.x2_px), float(self.image_w - 1)))
         y2 = max(0.0, min(float(annotation.y2_px), float(self.image_h - 1)))
         if kind == "thickness":
-            x_center = max(0.0, min((x1 + x2) / 2, float(self.image_w - 1)))
+            x_center = (x1 + x2) / 2
             y1, y2 = sorted((y1, y2))
             if y2 <= y1:
                 y2 = min(float(self.image_h - 1), y1 + 1)
@@ -211,8 +210,8 @@ class MeasurementPreviewWidget(QWidget):
         annotations, selected_index, tool = state
         previous_tool = self.current_tool
         self.annotations = list(annotations)
-        self.selected_index = selected_index if 0 <= selected_index < len(self.annotations) else -1
-        self.current_tool = tool if tool in {"thickness", "distance"} else "distance"
+        self.selected_index = selected_index
+        self.current_tool = tool
         self.cancel_interaction()
         self.annotations_changed.emit()
         self.selection_changed.emit()
@@ -243,7 +242,7 @@ class MeasurementPreviewWidget(QWidget):
 
     def set_tool(self, tool: str) -> None:
         if tool not in {"thickness", "distance"}:
-            return
+            raise ValueError(f"未知的测量工具：{tool!r}")
         if self.current_tool != tool:
             self.current_tool = tool
             self.tool_changed.emit(tool)
@@ -325,8 +324,6 @@ class MeasurementPreviewWidget(QWidget):
 
     def widget_to_image_ratio(self, widget_x: float, widget_y: float) -> tuple[float, float]:
         rect = self.image_rect()
-        if rect.width() <= 0 or rect.height() <= 0:
-            return 0.5, 0.5
         ratio_x = (widget_x - rect.left()) / rect.width()
         ratio_y = (widget_y - rect.top()) / rect.height()
         return max(0.0, min(1.0, ratio_x)), max(0.0, min(1.0, ratio_y))
@@ -407,7 +404,7 @@ class MeasurementPreviewWidget(QWidget):
 
     def update_annotation(self, index: int, annotation: MeasurementOverride) -> None:
         clamped = self.clamped_annotation(annotation)
-        if clamped is None or not 0 <= index < len(self.annotations):
+        if clamped is None:
             return
         if clamped == self.annotations[index]:
             return
@@ -719,46 +716,43 @@ class MeasurementPreviewWidget(QWidget):
             return
         if self.dragging_whole:
             index, anchor_x, anchor_y, original = self.dragging_whole
-            if 0 <= index < len(self.annotations):
-                self.update_annotation(
-                    index,
-                    self.translated_annotation(original, image_x - anchor_x, image_y - anchor_y),
-                )
+            self.update_annotation(
+                index,
+                self.translated_annotation(original, image_x - anchor_x, image_y - anchor_y),
+            )
             return
         if self.dragging_distance:
             index, endpoint = self.dragging_distance
-            if 0 <= index < len(self.annotations):
-                current = self.annotations[index]
-                if endpoint == "start":
-                    image_x, image_y = self.snap_distance_endpoint(
-                        current.x2_px,
-                        current.y2_px,
-                        image_x,
-                        image_y,
-                        shift_locked,
-                    )
-                    updated = MeasurementOverride(current.kind, image_x, image_y, current.x2_px, current.y2_px)
-                else:
-                    image_x, image_y = self.snap_distance_endpoint(
-                        current.x1_px,
-                        current.y1_px,
-                        image_x,
-                        image_y,
-                        shift_locked,
-                    )
-                    updated = MeasurementOverride(current.kind, current.x1_px, current.y1_px, image_x, image_y)
-                self.update_annotation(index, updated)
+            current = self.annotations[index]
+            if endpoint == "start":
+                image_x, image_y = self.snap_distance_endpoint(
+                    current.x2_px,
+                    current.y2_px,
+                    image_x,
+                    image_y,
+                    shift_locked,
+                )
+                updated = MeasurementOverride(current.kind, image_x, image_y, current.x2_px, current.y2_px)
+            else:
+                image_x, image_y = self.snap_distance_endpoint(
+                    current.x1_px,
+                    current.y1_px,
+                    image_x,
+                    image_y,
+                    shift_locked,
+                )
+                updated = MeasurementOverride(current.kind, current.x1_px, current.y1_px, image_x, image_y)
+            self.update_annotation(index, updated)
             return
-        if self.dragging_thickness and 0 <= self.selected_index < len(self.annotations):
+        if self.dragging_thickness:
             current = self.annotations[self.selected_index]
-            if current.kind == "thickness":
-                if self.dragging_thickness == "top":
-                    updated = MeasurementOverride(current.kind, current.x1_px, image_y, current.x2_px, current.y2_px)
-                elif self.dragging_thickness == "bottom":
-                    updated = MeasurementOverride(current.kind, current.x1_px, current.y1_px, current.x2_px, image_y)
-                else:
-                    updated = MeasurementOverride(current.kind, image_x, current.y1_px, image_x, current.y2_px)
-                self.update_annotation(self.selected_index, updated)
+            if self.dragging_thickness == "top":
+                updated = MeasurementOverride(current.kind, current.x1_px, image_y, current.x2_px, current.y2_px)
+            elif self.dragging_thickness == "bottom":
+                updated = MeasurementOverride(current.kind, current.x1_px, current.y1_px, current.x2_px, image_y)
+            else:
+                updated = MeasurementOverride(current.kind, image_x, current.y1_px, image_x, current.y2_px)
+            self.update_annotation(self.selected_index, updated)
             return
 
         handle = self.nearest_annotation_handle(widget_x, widget_y)
@@ -894,7 +888,6 @@ class CalibrationDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.path = path
         self._result: CalibrationOverride | None = None
         self.setWindowTitle(f"手动标定 - {path.name}")
         self.setProperty("imageEditor", True)
@@ -1032,15 +1025,13 @@ class CalibrationDialog(QDialog):
         if annotation is None:
             raise ValueError("请先在图像上拖出一条已知长度的标定线。")
         known_length_nm = parse_scale_nm(self.known_length_edit.text().strip())
-        result = CalibrationOverride(
+        return CalibrationOverride(
             known_length_nm=known_length_nm,
             x1_px=annotation.x1_px,
             y1_px=annotation.y1_px,
             x2_px=annotation.x2_px,
             y2_px=annotation.y2_px,
         )
-        _ = result.nm_per_pixel
-        return result
 
     def update_zoom_label(self, zoom_factor: float) -> None:
         self.zoom_label.setText(f"{zoom_factor * 100:.0f}%")
@@ -1095,7 +1086,7 @@ class CalibrationDialog(QDialog):
 
     def result_calibration_override(self) -> CalibrationOverride:
         if self._result is None:
-            raise ValueError("Manual calibration dialog was not accepted.")
+            raise ValueError("尚未应用手动标定。")
         return self._result
 
 
@@ -1105,7 +1096,8 @@ class MeasurementPreviewDialog(QDialog):
         path: Path,
         measurement_overrides: list[MeasurementOverride],
         parent: QWidget | None = None,
-        calibration: Calibration | None = None,
+        *,
+        calibration: Calibration,
     ) -> None:
         super().__init__(parent)
         self.path = path
@@ -1116,11 +1108,8 @@ class MeasurementPreviewDialog(QDialog):
         self.resize(900, 760)
 
         with Image.open(path) as image:
-            selected_calibration = calibration or parse_sem_metadata(image)
-            if selected_calibration is None:
-                raise ValueError(f"没有在 {path.name} 中找到像素标定信息。")
-            self.calibration = selected_calibration
-            self.nm_per_pixel = selected_calibration.nm_per_pixel
+            self.calibration = calibration
+            self.nm_per_pixel = calibration.nm_per_pixel
             qimage = qimage_from_pil(image)
 
         self.auto_detection_attempted = False
@@ -1247,7 +1236,7 @@ class MeasurementPreviewDialog(QDialog):
         QApplication.processEvents()
         try:
             with Image.open(self.path) as image:
-                auto_measurement = detect_thickness_measurement(image, self.calibration)
+                auto_measurement = detect_thickness_measurement(image)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "膜厚识别失败", str(exc))
             describe(self.thickness_tool_button, "自动识别失败；再次点击可重试")

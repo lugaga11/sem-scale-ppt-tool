@@ -63,9 +63,33 @@ def synthetic_cross_section(bits: int = 8) -> Image.Image:
 
 
 class ManualCalibrationCoreTests(unittest.TestCase):
+    def test_invalid_calibrations_and_measurement_kinds_fail_at_construction(self) -> None:
+        for value in (0, -1, math.inf, math.nan):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    Calibration(value, "invalid")
+                with self.assertRaises(ValueError):
+                    CalibrationOverride(value, 0, 0, 100, 0)
+        for endpoint in ((0, 0), (math.inf, 0), (math.nan, 0), (1e-320, 0)):
+            with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
+                CalibrationOverride(1000, 0, 0, *endpoint)
+        with self.assertRaisesRegex(ValueError, "测量类型"):
+            MeasurementOverride("unknown", 0, 0, 100, 0)
+
+    def test_thickness_detection_handles_small_and_narrow_images(self) -> None:
+        rng = np.random.default_rng(8)
+        for height in (1, 39, 59, 60, 61, 80, 480):
+            for width in (1, 19, 20, 21, 40, 80):
+                with self.subTest(size=(width, height)):
+                    image = Image.fromarray(rng.integers(0, 256, (height, width), dtype=np.uint8))
+                    measurement = detect_thickness_measurement(image)
+                    if measurement is not None:
+                        self.assertTrue(0 <= measurement.top_y_px < measurement.bottom_y_px < height)
+                        self.assertTrue(0 <= measurement.x_center_px < width)
+
     def test_thickness_detection_finds_the_film_between_two_bright_interfaces(self) -> None:
         for bits in (8, 16):
-            measurement = detect_thickness_measurement(synthetic_cross_section(bits), Calibration(2.0, "test"))
+            measurement = detect_thickness_measurement(synthetic_cross_section(bits))
             assert measurement is not None
             self.assertAlmostEqual(measurement.top_y_px, 120, delta=2)
             self.assertAlmostEqual(measurement.bottom_y_px, 260, delta=2)
@@ -74,8 +98,8 @@ class ManualCalibrationCoreTests(unittest.TestCase):
     def test_thickness_detection_stops_at_the_data_bar_and_rejects_featureless_images(self) -> None:
         self.assertEqual(detect_sem_content_bottom(np.asarray(synthetic_cross_section())), 440)
         self.assertEqual(detect_sem_content_bottom(np.full((480, 640), 90, np.uint8)), 480)
-        self.assertIsNone(detect_thickness_measurement(Image.new("L", (640, 480), 90), Calibration(2.0, "test")))
-        self.assertIsNone(detect_thickness_measurement(Image.new("I;16", (640, 480), 20000), Calibration(2.0, "test")))
+        self.assertIsNone(detect_thickness_measurement(Image.new("L", (640, 480), 90)))
+        self.assertIsNone(detect_thickness_measurement(Image.new("I;16", (640, 480), 20000)))
 
     def test_16_bit_display_mapping_stretches_the_central_range_and_keeps_extremes_in_bounds(self) -> None:
         ramp = Image.fromarray(np.tile(np.linspace(1000, 54000, 400, dtype=np.uint16), (300, 1)))
@@ -176,11 +200,11 @@ class ManualCalibrationCoreTests(unittest.TestCase):
             choose_scale_nm(100, 1.0, parse_scale_nm("1mm"), "medium")
 
     def test_invalid_render_parameters_are_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "margin"):
+        with self.assertRaisesRegex(ValueError, "页边距"):
             validate_generation_options("medium", "bottom-right", 36, -0.1, 8, 15, 3)
-        with self.assertRaisesRegex(ValueError, "Horizontal inset"):
+        with self.assertRaisesRegex(ValueError, "横向内缩"):
             validate_generation_options("medium", "bottom-right", 36, 0, 101, 15, 3)
-        with self.assertRaisesRegex(ValueError, "Line width"):
+        with self.assertRaisesRegex(ValueError, "线宽"):
             validate_generation_options("medium", "bottom-right", 36, 0, 8, 15, 0)
 
     def test_manual_calibration_drives_both_exports_and_svg_embeds_image_once(self) -> None:

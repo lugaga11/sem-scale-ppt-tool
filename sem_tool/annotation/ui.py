@@ -158,7 +158,7 @@ class AnnotationPanel(QWidget):
 
         self.file_list = FileQueueWidget()
         self.file_list.paths_dropped.connect(self.add_paths)
-        self.file_list.rows_reorder_requested.connect(self.reorder_queue_rows)
+        self.file_list.row_reorder_requested.connect(self.reorder_queue_row)
         self.file_list.itemChanged.connect(self.on_queue_item_changed)
         self.file_list.itemDoubleClicked.connect(self.open_original_file)
         self.file_list.customContextMenuRequested.connect(self.show_queue_context_menu)
@@ -340,9 +340,6 @@ class AnnotationPanel(QWidget):
     def current_output_format(self) -> str:
         return OUTPUT_FORMATS[self.output_format_control.currentText()]
 
-    def current_output_suffix(self) -> str:
-        return f".{self.current_output_format()}"
-
     def on_output_format_changed(self, _button: QPushButton, checked: bool) -> None:
         if not checked:
             return
@@ -382,7 +379,7 @@ class AnnotationPanel(QWidget):
             title = "保存 PPTX"
         path, _ = QFileDialog.getSaveFileName(self, title, self.output_edit.text(), file_filter)
         if path:
-            suffix = self.current_output_suffix()
+            suffix = f".{output_format}"
             if Path(path).suffix.lower() != suffix:
                 path += suffix
             self.output_edit.setText(path)
@@ -422,9 +419,9 @@ class AnnotationPanel(QWidget):
                 return row
         return -1
 
-    def inspect_metadata_calibration(self, path: Path, force: bool = False) -> None:
+    def inspect_metadata_calibration(self, path: Path) -> None:
         key = path_key(path)
-        if not force and key in self.metadata_calibrations:
+        if key in self.metadata_calibrations:
             return
         try:
             with Image.open(path) as image:
@@ -448,18 +445,14 @@ class AnnotationPanel(QWidget):
         return [path for path in paths if self.effective_calibration(path) is None]
 
     def update_file_calibration_status(self, row: int) -> None:
-        if row < 0 or row >= self.file_list.rowCount():
-            return
         item = self.file_list.item(row, COL_NAME)
-        if item is None:
-            return
+        assert item is not None
         path = self.item_path(row)
         key = path_key(path)
         override = self.calibration_overrides.get(key)
         calibration = self.effective_calibration(path)
         measurement_cell = self.measurement_cell(row)
-        if measurement_cell is not None:
-            measurement_cell.set_calibration_available(calibration is not None)
+        measurement_cell.set_calibration_available(calibration is not None)
         if override is not None:
             status = (
                 f"手动标定：{override.nm_per_pixel:.9g} nm/px\n"
@@ -488,30 +481,27 @@ class AnnotationPanel(QWidget):
         return item
 
     def add_queue_row(self, path: Path, generate: bool) -> None:
-        self.inspect_metadata_calibration(path)
         row = self.file_list.rowCount()
-        was_blocked = self.file_list.blockSignals(True)
-        try:
+        with QSignalBlocker(self.file_list):
             self.file_list.insertRow(row)
             self.file_list.setItem(row, COL_GENERATE, self.checkbox_item(generate))
             self.file_list.setItem(row, COL_NAME, self.text_item(path.name, path))
             measurement_cell = MeasurementCellWidget()
             measurement_cell.edit_requested.connect(self.on_measurement_edit_requested)
             self.file_list.setCellWidget(row, COL_MEASUREMENT, measurement_cell)
-        finally:
-            self.file_list.blockSignals(was_blocked)
         self.update_measurement_status(row)
         self.update_file_calibration_status(row)
 
     def item_path(self, row: int) -> Path:
         item = self.file_list.item(row, COL_NAME)
         if item is None:
-            raise ValueError(f"Queue row {row} has no file item.")
+            raise ValueError(f"队列第 {row + 1} 行缺少文件项。")
         return Path(item.data(Qt.ItemDataRole.UserRole))
 
-    def measurement_cell(self, row: int) -> MeasurementCellWidget | None:
+    def measurement_cell(self, row: int) -> MeasurementCellWidget:
         widget = self.file_list.cellWidget(row, COL_MEASUREMENT)
-        return widget if isinstance(widget, MeasurementCellWidget) else None
+        assert isinstance(widget, MeasurementCellWidget)
+        return widget
 
     def row_for_measurement_cell(self, cell: MeasurementCellWidget) -> int:
         for row in range(self.file_list.rowCount()):
@@ -519,21 +509,18 @@ class AnnotationPanel(QWidget):
                 return row
         return -1
 
-    def row_checked(self, row: int, column: int) -> bool:
-        item = self.file_list.item(row, column)
-        return item is not None and item.checkState() == Qt.CheckState.Checked
+    def row_checked(self, row: int) -> bool:
+        item = self.file_list.item(row, COL_GENERATE)
+        assert item is not None
+        return item.checkState() == Qt.CheckState.Checked
 
-    def set_row_checked(self, row: int, column: int, checked: bool) -> None:
-        item = self.file_list.item(row, column)
-        if item is not None:
-            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+    def set_row_checked(self, row: int, checked: bool) -> None:
+        item = self.file_list.item(row, COL_GENERATE)
+        assert item is not None
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
 
     def update_measurement_status(self, row: int) -> None:
-        if row < 0 or row >= self.file_list.rowCount():
-            return
         cell = self.measurement_cell(row)
-        if cell is None:
-            return
         path = self.item_path(row)
         key = path_key(path)
         cell.set_summary(self.measurement_summary(key))
@@ -552,19 +539,8 @@ class AnnotationPanel(QWidget):
     def checked_paths(self) -> list[Path]:
         paths: list[Path] = []
         for row in range(self.file_list.rowCount()):
-            if self.row_checked(row, COL_GENERATE):
+            if self.row_checked(row):
                 paths.append(self.item_path(row))
-        return paths
-
-    def marked_measurement_paths(self) -> list[Path]:
-        paths: list[Path] = []
-        for row in range(self.file_list.rowCount()):
-            if not self.row_checked(row, COL_GENERATE):
-                continue
-            path = self.item_path(row)
-            key = path_key(path)
-            if self.measurement_overrides.get(key):
-                paths.append(path)
         return paths
 
     def selected_rows(self) -> list[int]:
@@ -578,11 +554,11 @@ class AnnotationPanel(QWidget):
         for row in range(self.file_list.rowCount()):
             path = self.item_path(row)
             name_item = self.file_list.item(row, COL_NAME)
-            if name_item:
-                display_name = path.name
-                if name_counts.get(path.name.lower(), 0) > 1:
-                    display_name = f"{path.name} [{path.parent.name or path.parent}]"
-                name_item.setText(display_name)
+            assert name_item is not None
+            display_name = path.name
+            if name_counts[path.name.lower()] > 1:
+                display_name = f"{path.name} [{path.parent.name or path.parent}]"
+            name_item.setText(display_name)
 
     def update_count(self, *_args) -> None:
         total = self.file_list.rowCount()
@@ -677,7 +653,7 @@ class AnnotationPanel(QWidget):
     def sort_queue(self) -> None:
         selected = self.selected_rows()
         selected_path = self.item_path(selected[0]) if selected else None
-        rows = [(self.item_path(row), self.row_checked(row, COL_GENERATE)) for row in range(self.file_list.rowCount())]
+        rows = [(self.item_path(row), self.row_checked(row)) for row in range(self.file_list.rowCount())]
         rows.sort(key=lambda row: natural_key(row[0]))
         self.file_list.setRowCount(0)
         for path, generate in rows:
@@ -687,33 +663,17 @@ class AnnotationPanel(QWidget):
             self.select_path(selected_path)
         self.update_count()
 
-    def reorder_queue_rows(self, rows: list[int], drop_row: int) -> None:
-        row_count = self.file_list.rowCount()
-        rows = sorted({row for row in rows if 0 <= row < row_count})
-        if not rows:
+    def reorder_queue_row(self, source_row: int, drop_row: int) -> None:
+        insert_at = drop_row - int(source_row < drop_row)
+        if insert_at == source_row:
             return
-
-        queue_rows = [(self.item_path(row), self.row_checked(row, COL_GENERATE)) for row in range(row_count)]
-        moved_rows = [queue_rows[row] for row in rows]
-        remaining_rows = [row for index, row in enumerate(queue_rows) if index not in rows]
-        insert_at = max(0, min(drop_row, row_count))
-        insert_at -= sum(1 for row in rows if row < insert_at)
-        insert_at = max(0, min(insert_at, len(remaining_rows)))
-
-        reordered_rows = remaining_rows[:insert_at] + moved_rows + remaining_rows[insert_at:]
-        if reordered_rows == queue_rows:
-            return
-
+        rows = [(self.item_path(row), self.row_checked(row)) for row in range(self.file_list.rowCount())]
+        rows.insert(insert_at, rows.pop(source_row))
         self.file_list.setRowCount(0)
-        for path, generate in reordered_rows:
+        for path, generate in rows:
             self.add_queue_row(path, generate=generate)
         self.refresh_item_labels()
-        self.file_list.clearSelection()
-        for row in range(insert_at, insert_at + len(moved_rows)):
-            for column in range(self.file_list.columnCount()):
-                item = self.file_list.item(row, column)
-                if item is not None:
-                    item.setSelected(True)
+        self.file_list.selectRow(insert_at)
         self.update_count()
 
     def clear_queue(self) -> None:
@@ -737,7 +697,7 @@ class AnnotationPanel(QWidget):
     def _set_all_generate(self, checked: bool) -> None:
         with QSignalBlocker(self.file_list):
             for row in range(self.file_list.rowCount()):
-                self.set_row_checked(row, COL_GENERATE, checked)
+                self.set_row_checked(row, checked)
         self.update_count()
 
     def clear_selected_measurements(self) -> None:
@@ -780,7 +740,7 @@ class AnnotationPanel(QWidget):
 
     def measurement_overrides_for_generation(self) -> dict[Path, list[MeasurementOverride]]:
         overrides: dict[Path, list[MeasurementOverride]] = {}
-        for path in self.marked_measurement_paths():
+        for path in self.checked_paths():
             annotations = self.measurement_overrides.get(path_key(path))
             if annotations:
                 overrides[path] = list(annotations)

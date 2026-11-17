@@ -308,8 +308,6 @@ class SearchPanel(QWidget):
         return False
 
     def _paths_from_drop(self, event: QDragEnterEvent | QDropEvent) -> list[Path]:
-        if not event.mimeData().hasUrls():
-            return []
         paths = []
         for url in event.mimeData().urls():
             local = url.toLocalFile()
@@ -534,12 +532,11 @@ class SearchPanel(QWidget):
     def _on_progress(self, current: int, total: int, message: str) -> None:
         value = int(current * 100 / total) if total else 0
         self.progress.setValue(max(0, min(100, value)))
-        self.status_label.setText(self._format_progress_message(current, total, message))
+        self.status_label.setText(self._format_progress_message(current, total, value, message))
 
-    def _format_progress_message(self, current: int, total: int, message: str) -> str:
+    def _format_progress_message(self, current: int, total: int, percent: int, message: str) -> str:
         if total <= 0:
             return shorten_progress_message(message)
-        percent = int(current * 100 / total)
         parts = [f"进度 {current}/{total}（{percent}%）"]
         if self.work_started_at and current > 0 and current < total:
             elapsed = time.monotonic() - self.work_started_at
@@ -675,14 +672,7 @@ class SearchPanel(QWidget):
             f"错误：{status.error_files}\n\n"
             "仍要使用当前索引继续搜索吗？"
         )
-        answer = QMessageBox.question(
-            self,
-            "建议更新索引",
-            message,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        return answer == QMessageBox.StandardButton.Yes
+        return self._confirm_action("建议更新索引", message)
 
     def _confirm_action(self, title: str, message: str) -> bool:
         answer = QMessageBox.question(
@@ -902,8 +892,8 @@ def shorten_progress_message(message: str, max_length: int = 48) -> str:
 
 def format_bytes(size: int) -> str:
     value = float(size)
-    for unit in ["B", "KB", "MB", "GB"]:
-        if value < 1024 or unit == "GB":
+    for unit in ("B", "KB", "MB"):
+        if value < 1024:
             if unit == "B":
                 return f"{int(value)} {unit}"
             return f"{value:.1f} {unit}"

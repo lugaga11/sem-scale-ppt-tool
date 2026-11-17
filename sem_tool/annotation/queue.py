@@ -185,7 +185,7 @@ class FileQueueWidget(QTableWidget):
     QUEUE_ROW_MIME = "application/x-sem-scale-queue-rows"
 
     paths_dropped = Signal(list)
-    rows_reorder_requested = Signal(list, int)
+    row_reorder_requested = Signal(int, int)
 
     def sizeHintForColumn(self, column: int) -> int:
         width = super().sizeHintForColumn(column)
@@ -197,14 +197,12 @@ class FileQueueWidget(QTableWidget):
 
         self.drag_start_position: QPoint | None = None
         self.drag_start_row = -1
+        self.dragged_row: int | None = None
         self.drop_indicator_row: int | None = None
 
         self.setAcceptDrops(True)
         self.setDragEnabled(False)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
-        self.setDragDropOverwriteMode(False)
-        self.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.setDropIndicatorShown(True)
         self.setAutoScroll(True)
         self.setAutoScrollMargin(36)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -312,24 +310,12 @@ class FileQueueWidget(QTableWidget):
         self.dismiss_hover()
         super().keyPressEvent(event)
 
-    def event_position(self, event) -> QPoint:
-        return event.position().toPoint()
-
     def is_queue_drag(self, event) -> bool:
         return event.source() is self and event.mimeData().hasFormat(self.QUEUE_ROW_MIME)
 
     def dragEnterEvent(self, event) -> None:
         self.dismiss_hover()
-        if event.mimeData().hasUrls():
-            self.clear_drop_indicator()
-            event.setDropAction(Qt.DropAction.CopyAction)
-            event.acceptProposedAction()
-        elif self.is_queue_drag(event):
-            self.set_drop_indicator(self.drop_row(event))
-            event.setDropAction(Qt.DropAction.MoveAction)
-            event.accept()
-        else:
-            event.ignore()
+        self.dragMoveEvent(event)
 
     def dragMoveEvent(self, event) -> None:
         if event.mimeData().hasUrls():
@@ -348,25 +334,18 @@ class FileQueueWidget(QTableWidget):
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event) -> None:
+        self.clear_drop_indicator()
         if event.mimeData().hasUrls():
-            self.clear_drop_indicator()
             paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
             self.paths_dropped.emit(paths)
             event.setDropAction(Qt.DropAction.CopyAction)
             event.acceptProposedAction()
         elif self.is_queue_drag(event):
-            row = self.mime_row(event.mimeData())
-            if row is not None:
-                drop_row = self.drop_row(event)
-                self.clear_drop_indicator()
-                self.rows_reorder_requested.emit([row], drop_row)
-                event.setDropAction(Qt.DropAction.MoveAction)
-                event.accept()
-            else:
-                self.clear_drop_indicator()
-                event.ignore()
+            assert self.dragged_row is not None
+            self.row_reorder_requested.emit(self.dragged_row, self.drop_row(event))
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
         else:
-            self.clear_drop_indicator()
             event.ignore()
 
     def paintEvent(self, event) -> None:
@@ -396,14 +375,14 @@ class FileQueueWidget(QTableWidget):
             self.drag_start_position = None
             self.drag_start_row = -1
             return
-        position = self.event_position(event)
+        position = event.position().toPoint()
         index = self.indexAt(position)
         self.drag_start_position = position
         self.drag_start_row = index.row() if index.isValid() else -1
 
     def mouseMoveEvent(self, event) -> None:
         if not (event.buttons() & Qt.MouseButton.LeftButton):
-            self.track_thumbnail(self.event_position(event))
+            self.track_thumbnail(event.position().toPoint())
             super().mouseMoveEvent(event)
             return
         self.dismiss_hover()
@@ -411,7 +390,7 @@ class FileQueueWidget(QTableWidget):
             super().mouseMoveEvent(event)
             return
 
-        position = self.event_position(event)
+        position = event.position().toPoint()
         if (position - self.drag_start_position).manhattanLength() < QApplication.startDragDistance():
             super().mouseMoveEvent(event)
             return
@@ -426,29 +405,21 @@ class FileQueueWidget(QTableWidget):
         super().mouseReleaseEvent(event)
 
     def start_queue_row_drag(self, row: int) -> None:
-        if row < 0 or row >= self.rowCount():
-            return
         mime_data = QMimeData()
-        mime_data.setData(self.QUEUE_ROW_MIME, str(row).encode("ascii"))
+        mime_data.setData(self.QUEUE_ROW_MIME, b"")
         drag = QDrag(self)
         drag.setMimeData(mime_data)
-        preview = self.drag_preview(row)
-        if not preview.isNull():
-            drag.setPixmap(preview)
-            drag.setHotSpot(QPoint(18, min(24, max(1, preview.height() // 2))))
-        drag.exec(Qt.DropAction.MoveAction)
-        self.clear_drop_indicator()
-
-    def mime_row(self, mime_data: QMimeData) -> int | None:
+        drag.setPixmap(self.drag_preview(row))
+        drag.setHotSpot(QPoint(18, 24))
+        self.dragged_row = row
         try:
-            encoded_row = mime_data.data(self.QUEUE_ROW_MIME)
-            text = bytes(encoded_row.data()).decode("ascii")
-            return int(text)
-        except (UnicodeDecodeError, ValueError):
-            return None
+            drag.exec(Qt.DropAction.MoveAction)
+        finally:
+            self.dragged_row = None
+            self.clear_drop_indicator()
 
     def drop_row(self, event) -> int:
-        position = self.event_position(event)
+        position = event.position().toPoint()
         index = self.indexAt(position)
         if not index.isValid():
             return self.rowCount()
@@ -456,7 +427,7 @@ class FileQueueWidget(QTableWidget):
         rect = self.visualRect(index)
         if position.y() > rect.center().y():
             row += 1
-        return max(0, min(row, self.rowCount()))
+        return row
 
     def drop_indicator_y(self, row: int) -> int:
         if self.rowCount() == 0:
@@ -471,7 +442,6 @@ class FileQueueWidget(QTableWidget):
         return self.visualRect(index).top()
 
     def set_drop_indicator(self, row: int) -> None:
-        row = max(0, min(row, self.rowCount()))
         if self.drop_indicator_row != row:
             self.drop_indicator_row = row
             self.viewport().update()
@@ -483,18 +453,9 @@ class FileQueueWidget(QTableWidget):
         self.viewport().update()
 
     def drag_preview(self, row: int) -> QPixmap:
-        if row < 0 or row >= self.rowCount() or self.isRowHidden(row):
-            return QPixmap()
-        top_index = self.model().index(row, 0)
-        bottom_index = self.model().index(row, 0)
-        top = self.visualRect(top_index).top()
-        bottom = self.visualRect(bottom_index).bottom()
-        if bottom <= top:
-            return QPixmap()
-        rect = QRect(0, top, self.viewport().width(), min(bottom - top + 1, 140))
+        row_rect = self.visualRect(self.model().index(row, 0))
+        rect = QRect(0, row_rect.top(), self.viewport().width(), row_rect.height())
         pixmap = self.viewport().grab(rect)
-        if pixmap.isNull():
-            return pixmap
         preview = QPixmap(pixmap.size())
         preview.fill(Qt.GlobalColor.transparent)
         painter = QPainter(preview)

@@ -80,6 +80,7 @@ class DropLineEdit(PathLineEdit):
 
 class SearchPanel(QWidget):
     queue_requested = Signal(list)
+    queue_removal_requested = Signal(list)
     busy_changed = Signal(bool)
 
     def __init__(self) -> None:
@@ -708,6 +709,7 @@ class SearchPanel(QWidget):
         widget = ResultWidget(rank, result)
         widget.set_queued(path_key(result.path) in self._queue_path_keys)
         widget.queue_requested.connect(self.queue_requested)
+        widget.queue_removal_requested.connect(self.queue_removal_requested)
         item.setSizeHint(QSize(0, max(widget.minimumHeight(), widget.sizeHint().height())))
         self.results_list.addItem(item)
         self.results_list.setItemWidget(item, widget)
@@ -756,10 +758,12 @@ class SearchPanel(QWidget):
 
 class ResultWidget(QFrame):
     queue_requested = Signal(list)
+    queue_removal_requested = Signal(list)
 
     def __init__(self, rank: int, result: SearchResult) -> None:
         super().__init__()
         self.result = result
+        self._queued = False
         self.setObjectName("searchResult")
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setMinimumHeight(144)
@@ -805,7 +809,7 @@ class ResultWidget(QFrame):
         self.add_button.setIcon(icon("plus", COLORS.primary))
         self.add_button.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
         self.add_button.setToolTip("把这张原图加入“标注与导出”的文件队列")
-        self.add_button.clicked.connect(lambda: self.queue_requested.emit([result.path]))
+        self.add_button.clicked.connect(self.toggle_queue)
         open_button = QPushButton("打开")
         open_button.setToolTip("用默认程序打开原图")
         reveal_button = QPushButton("定位")
@@ -826,14 +830,20 @@ class ResultWidget(QFrame):
         self.add_button.setFixedSize(self.add_button.sizeHint())
 
     def set_queued(self, queued: bool) -> None:
+        self._queued = queued
         variant = "added" if queued else "soft"
         if self.add_button.property("variant") == variant:
             return
         self.add_button.setText("已加入" if queued else "加入队列")
         self.add_button.setProperty("variant", variant)
         self.add_button.setIcon(icon("check" if queued else "plus", COLORS.success if queued else COLORS.primary))
-        self.add_button.setEnabled(not queued)
+        self.add_button.setToolTip("再次点击，从标注与导出队列移除" if queued else "把这张原图加入“标注与导出”的文件队列")
         restyle(self.add_button)
+
+    @Slot()
+    def toggle_queue(self) -> None:
+        signal = self.queue_removal_requested if self._queued else self.queue_requested
+        signal.emit([self.result.path])
 
     def open_file(self) -> None:
         open_file_or_warn(self, self.result.path)

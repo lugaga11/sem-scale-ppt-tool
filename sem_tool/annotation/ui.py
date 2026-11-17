@@ -651,7 +651,16 @@ class AnnotationPanel(QWidget):
             self.remove_selected()
 
     def remove_selected(self) -> None:
-        for row in self.selected_rows():
+        self.remove_paths([self.item_path(row) for row in self.selected_rows()])
+
+    @Slot(list)
+    def remove_paths(self, paths: list[Path]) -> None:
+        keys = {path_key(path) for path in paths}
+        rows = [
+            row for row in range(self.file_list.rowCount() - 1, -1, -1)
+            if path_key(self.item_path(row)) in keys
+        ]
+        for row in rows:
             path = self.item_path(row)
             key = path_key(path)
             self.file_list.name_delegate.thumbnails.pop(str(path), None)
@@ -660,7 +669,6 @@ class AnnotationPanel(QWidget):
             self.calibration_overrides.pop(key, None)
             self.metadata_calibrations.pop(key, None)
             self.calibration_errors.pop(key, None)
-        for row in self.selected_rows():
             self.file_list.removeRow(row)
         self.refresh_item_labels()
         self.update_count()

@@ -108,6 +108,7 @@ class MainWindow(QMainWindow):
         self._refresh_navigation(0)
         self.setCentralWidget(self.tabs)
         self.search_panel.queue_requested.connect(self.add_to_annotation_queue)
+        self.search_panel.queue_removal_requested.connect(self.annotation_panel.remove_paths)
         self.annotation_panel.queue_changed.connect(self._update_queue_title)
         self.annotation_panel.queue_changed.connect(self.search_panel.set_queue_paths)
         self.annotation_panel.log_message.connect(self.log_panel.append)

@@ -131,7 +131,8 @@ QPushButton#generateButton { min-height: ${h_primary}px; font-size: ${f_body}px;
 QPushButton[variant="soft"] { background: $tint; color: $primary_hover; border-color: $tint; font-weight: 500; }
 QPushButton[variant="soft"]:hover { background: $tint_strong; border-color: $tint_strong; }
 QPushButton[variant="soft"]:disabled { background: $disabled_surface; border-color: $disabled_surface; color: $disabled; }
-QPushButton[variant="added"], QPushButton[variant="added"]:disabled { background: $success_surface; color: $success; border-color: $success_border; }
+QPushButton[variant="added"] { background: $success_surface; color: $success; border-color: $success_border; }
+QPushButton[variant="added"]:hover, QPushButton[variant="added"]:pressed { background: $success_hover; }
 QPushButton[variant="toolbar"], QToolButton[variant="toolbar"] { border-color: transparent; background: transparent; }
 QPushButton[variant="toolbar"]:hover, QToolButton[variant="toolbar"]:hover { background: $hover; }
 QPushButton[variant="toolbar"]:pressed, QToolButton[variant="toolbar"]:pressed { background: $pressed; }

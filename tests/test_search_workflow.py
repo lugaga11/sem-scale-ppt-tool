@@ -616,15 +616,45 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         original = self.make_original()
         search = self.window.search_panel
         panel = self.window.annotation_panel
+        self.window.tabs.setCurrentWidget(search)
         search._add_result(1, SearchResult(original, 1, 20, 30, 2))
         widget = search.results_list.itemWidget(search.results_list.item(0))
         assert isinstance(widget, ResultWidget)
         widget.add_button.click()
         self.assertEqual(widget.add_button.text(), "已加入")
-        self.assertFalse(widget.add_button.isEnabled())
+        self.assertTrue(widget.add_button.isEnabled())
         search._add_result(2, SearchResult(original, 1, 20, 30, 2))
         duplicate = search.results_list.itemWidget(search.results_list.item(1))
         assert isinstance(duplicate, ResultWidget)
+        self.assertEqual(duplicate.add_button.text(), "已加入")
+        other = self.root / "other" / original.name
+        other.parent.mkdir()
+        texture().save(other)
+        panel.add_paths([other])
+        panel.select_path(other)
+        panel.set_row_checked(1, 0, False)
+        annotation = MeasurementOverride("distance", 0, 20, 100, 20)
+        calibration = CalibrationOverride(500, 0, 0, 100, 0)
+        panel.measurement_overrides[path_key(other)] = [annotation]
+        panel.calibration_overrides[path_key(other)] = calibration
+        panel.measurement_overrides[path_key(original)] = [annotation]
+        panel.calibration_overrides[path_key(original)] = calibration
+        button_size = widget.add_button.size()
+        duplicate.add_button.click()
+        self.assertIs(self.window.tabs.currentWidget(), search)
+        self.assertEqual(panel.file_list.rowCount(), 1)
+        self.assertEqual(panel.item_path(0), other)
+        self.assertFalse(panel.row_checked(0, 0))
+        self.assertEqual(panel.measurement_overrides[path_key(other)], [annotation])
+        self.assertEqual(panel.calibration_overrides[path_key(other)], calibration)
+        for state in (panel.measurement_overrides, panel.calibration_overrides, panel.metadata_calibrations):
+            self.assertNotIn(path_key(original), state)
+        self.assertEqual(self.window.tabs.tabText(0), "标注与导出 (1)")
+        for result in (widget, duplicate):
+            self.assertEqual(result.add_button.text(), "加入队列")
+            self.assertEqual(result.add_button.size(), button_size)
+        widget.add_button.click()
+        self.assertEqual(panel.file_list.rowCount(), 2)
         self.assertEqual(duplicate.add_button.text(), "已加入")
         panel.select_path(original)
         panel.remove_selected()

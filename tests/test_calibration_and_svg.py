@@ -14,6 +14,7 @@ from zipfile import ZipFile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import numpy as np
 from PIL import Image
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QImage
@@ -25,6 +26,8 @@ from sem_tool.annotation.core import (
     CalibrationOverride,
     MeasurementOverride,
     choose_scale_nm,
+    detect_sem_content_bottom,
+    detect_thickness_measurement,
     dynamic_scale_candidates_nm,
     format_scale_label,
     generate_pptx,
@@ -44,7 +47,46 @@ from sem_tool.imaging import convert_image_to_png, image_to_display_grayscale
 from sem_tool.theme import apply_theme
 
 
+def synthetic_cross_section(bits: int = 8) -> Image.Image:
+    """A dark background, a film between two bright interfaces at rows 120 and 260, and a data bar from row 440."""
+    rows = np.full(480, 30.0)
+    rows[120:260] = 120
+    rows[260:440] = 70
+    for edge in (120, 260):
+        rows[edge - 2 : edge + 3] += 90
+    rows[440:] = 245
+    noise = np.random.default_rng(3).normal(0, 6, (480, 640))
+    data = (rows[:, None] + noise).clip(0, 255)
+    if bits == 16:
+        return Image.fromarray((data * 200 + 1000).astype(np.uint16))
+    return Image.fromarray(data.astype(np.uint8))
+
+
 class ManualCalibrationCoreTests(unittest.TestCase):
+    def test_thickness_detection_finds_the_film_between_two_bright_interfaces(self) -> None:
+        for bits in (8, 16):
+            measurement = detect_thickness_measurement(synthetic_cross_section(bits), Calibration(2.0, "test"))
+            assert measurement is not None
+            self.assertAlmostEqual(measurement.top_y_px, 120, delta=2)
+            self.assertAlmostEqual(measurement.bottom_y_px, 260, delta=2)
+            self.assertTrue(0 < measurement.x_center_px < 640)
+
+    def test_thickness_detection_stops_at_the_data_bar_and_rejects_featureless_images(self) -> None:
+        self.assertEqual(detect_sem_content_bottom(np.asarray(synthetic_cross_section())), 440)
+        self.assertEqual(detect_sem_content_bottom(np.full((480, 640), 90, np.uint8)), 480)
+        self.assertIsNone(detect_thickness_measurement(Image.new("L", (640, 480), 90), Calibration(2.0, "test")))
+        self.assertIsNone(detect_thickness_measurement(Image.new("I;16", (640, 480), 20000), Calibration(2.0, "test")))
+
+    def test_16_bit_display_mapping_stretches_the_central_range_and_keeps_extremes_in_bounds(self) -> None:
+        ramp = Image.fromarray(np.tile(np.linspace(1000, 54000, 400, dtype=np.uint16), (300, 1)))
+        display = np.asarray(image_to_display_grayscale(ramp))
+        self.assertEqual((int(display.min()), int(display.max())), (0, 255))
+        self.assertTrue(np.all(np.diff(display[0].astype(int)) >= 0))
+        self.assertAlmostEqual(int(display[0, 200]), 128, delta=2)
+        flat = image_to_display_grayscale(Image.new("I;16", (30, 20), 65535))
+        self.assertEqual(flat.getextrema(), (255, 255))
+        self.assertEqual(image_to_display_grayscale(Image.new("I;16", (3, 2), 0)).getextrema(), (0, 0))
+
     def test_dynamic_scale_candidates_cover_extreme_calibrations(self) -> None:
         width_px = 1024
         for nm_per_pixel in (1e-9, 1.0, 1e6):
@@ -82,7 +124,7 @@ class ManualCalibrationCoreTests(unittest.TestCase):
                 with Image.open(output) as converted:
                     # Pillow before 10.3 reports a 16-bit grayscale PNG as mode "I"; the samples are what matters.
                     self.assertIn(converted.mode, ("I;16", "I"))
-                    self.assertEqual(list(converted.getdata()), values)
+                    self.assertEqual(np.asarray(converted).ravel().tolist(), values)
             display = image_to_display_grayscale(source)
             self.assertEqual(display.mode, "L")
             self.assertEqual(display.getextrema(), (0, 255))
@@ -107,7 +149,7 @@ class ManualCalibrationCoreTests(unittest.TestCase):
             embedded_path.write_bytes(base64.b64decode(match.group(1)))
             with Image.open(embedded_path) as embedded:
                 self.assertIn(embedded.mode, ("I;16", "I"))
-                self.assertEqual(list(embedded.getdata()), values)
+                self.assertEqual(np.asarray(embedded).ravel().tolist(), values)
 
             pptx_path = root / "result.pptx"
             generate_pptx([source], pptx_path, calibration_overrides={source: override})
@@ -116,7 +158,7 @@ class ManualCalibrationCoreTests(unittest.TestCase):
                 self.assertEqual(len(media_names), 1)
                 with Image.open(BytesIO(archive.read(media_names[0]))) as embedded:
                     self.assertIn(embedded.mode, ("I;16", "I"))
-                    self.assertEqual(list(embedded.getdata()), values)
+                    self.assertEqual(np.asarray(embedded).ravel().tolist(), values)
 
     def test_dynamic_auto_scale_covers_small_and_large_fields(self) -> None:
         for field_width_nm in (10.0, 1_000_000_000.0):

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence, cast
 from xml.sax.saxutils import escape
 
+import numpy as np
 from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -288,19 +289,21 @@ def format_length_label(length_nm: float) -> str:
     return f"{length_nm:.3f} nm"
 
 
-def moving_average(values: list[float], radius: int) -> list[float]:
-    if not values:
-        return []
-    radius = max(0, radius)
-    prefix = [0.0]
-    for value in values:
-        prefix.append(prefix[-1] + value)
-    smoothed: list[float] = []
-    for index in range(len(values)):
-        start = max(0, index - radius)
-        end = min(len(values), index + radius + 1)
-        smoothed.append((prefix[end] - prefix[start]) / (end - start))
-    return smoothed
+def moving_average(values: np.ndarray, radius: int) -> np.ndarray:
+    """Centred mean over up to 2 * radius + 1 samples; the window is clipped at both ends."""
+    prefix = np.concatenate(([0.0], np.cumsum(values)))
+    index = np.arange(len(values))
+    start = np.maximum(0, index - radius)
+    end = np.minimum(len(values), index + radius + 1)
+    return (prefix[end] - prefix[start]) / (end - start)
+
+
+def first_argmax(values: np.ndarray, start: int, stop: int) -> int:
+    return start + int(np.argmax(values[start:stop]))
+
+
+def first_argmin(values: np.ndarray, start: int, stop: int) -> int:
+    return start + int(np.argmin(values[start:stop]))
 
 
 def weighted_median(values: list[tuple[float, float]]) -> float:
@@ -319,22 +322,17 @@ def weighted_median(values: list[tuple[float, float]]) -> float:
     return sorted_values[-1][0]
 
 
-def detect_sem_content_bottom(gray: Image.Image) -> int:
-    width, height = gray.size
-    pixels = gray.load()
-    if pixels is None:
-        raise ValueError("Unable to load image pixels.")
-    sample_step = max(1, width // 256)
+def detect_sem_content_bottom(gray: np.ndarray) -> int:
+    """Return the row where a bright data bar at the bottom starts, or the image height without one."""
+    height, width = gray.shape
+    sampled = gray[:, :: max(1, width // 256)]
+    footer_rows = (sampled.mean(axis=1) > 185) & ((sampled > 230).mean(axis=1) > 0.70)
     search_top = int(height * 0.45)
     footer_top = height
     bright_run = 0
     gap_run = 0
     for y in range(height - 1, search_top, -1):
-        values = [pixels[x, y] for x in range(0, width, sample_step)]
-        mean_value = sum(values) / len(values)
-        bright_fraction = sum(value > 230 for value in values) / len(values)
-        is_footer_row = mean_value > 185 and bright_fraction > 0.70
-        if is_footer_row:
+        if footer_rows[y]:
             bright_run += 1
             gap_run = 0
             footer_top = y
@@ -349,20 +347,13 @@ def detect_sem_content_bottom(gray: Image.Image) -> int:
     return max(1, footer_top) if bright_run >= 8 else height
 
 
-def row_profile(gray: Image.Image, x0: int, x1: int, y_end: int) -> list[float]:
-    pixels = gray.load()
-    if pixels is None:
-        raise ValueError("Unable to load image pixels.")
-    sample_step = max(1, (x1 - x0) // 256)
-    profile: list[float] = []
-    for y in range(y_end):
-        values = [pixels[x, y] for x in range(x0, x1, sample_step)]
-        profile.append(sum(values) / len(values))
-    return profile
+def row_profile(gray: np.ndarray, x0: int, x1: int, y_end: int) -> np.ndarray:
+    """Mean brightness of each row above y_end inside the band x0..x1."""
+    return gray[:y_end, x0 : x1 : max(1, (x1 - x0) // 256)].mean(axis=1)
 
 
 def detect_thickness_candidate(
-    gray: Image.Image,
+    gray: np.ndarray,
     x0: int,
     x1: int,
     content_bottom: int,
@@ -372,38 +363,30 @@ def detect_thickness_candidate(
     if len(profile) < 40:
         return None
     smooth = moving_average(profile, max(3, min(12, int(content_bottom * 0.008))))
-    gradient = [0.0] * len(smooth)
-    for index in range(1, len(smooth) - 1):
-        gradient[index] = (smooth[index + 1] - smooth[index - 1]) / 2
+    gradient = np.zeros_like(smooth)
+    gradient[1:-1] = (smooth[2:] - smooth[:-2]) / 2
 
     top_start = max(5, int(content_bottom * 0.03))
     top_end = min(content_bottom - 10, max(top_start + 10, int(content_bottom * 0.55)))
     if top_end <= top_start:
         return None
-    top_edge_y = max(range(top_start, top_end), key=lambda y: gradient[y])
-    top_peak_start = max(0, top_edge_y - 2)
-    top_peak_end = min(content_bottom, top_edge_y + 16)
-    top_y = max(range(top_peak_start, top_peak_end), key=lambda y: smooth[y])
+    top_edge_y = first_argmax(gradient, top_start, top_end)
+    top_y = first_argmax(smooth, max(0, top_edge_y - 2), min(content_bottom, top_edge_y + 16))
 
     min_gap = max(12, int(content_bottom * min_gap_percent / 100))
     lower_start = min(content_bottom - 10, top_y + min_gap)
     lower_end = min(content_bottom - 3, max(lower_start + 10, int(content_bottom * 0.95)))
     if lower_end <= lower_start:
         return None
-    lower_edge_y = max(range(lower_start, lower_end), key=lambda y: -gradient[y])
+    lower_edge_y = first_argmin(gradient, lower_start, lower_end)
     lower_peak_start = max(lower_start, lower_edge_y - max(8, int(content_bottom * 0.025)))
-    lower_peak_end = min(content_bottom, lower_edge_y + 4)
-    bottom_y = max(range(lower_peak_start, lower_peak_end), key=lambda y: smooth[y])
+    bottom_y = first_argmax(smooth, lower_peak_start, min(content_bottom, lower_edge_y + 4))
     rebound_start = lower_edge_y + 2
     rebound_end = min(content_bottom - 1, lower_edge_y + max(14, int(content_bottom * 0.045)))
     if rebound_end > rebound_start:
-        rebound_edge_y = max(range(rebound_start, rebound_end), key=lambda y: gradient[y])
-        rebound_peak_start = max(rebound_start, rebound_edge_y - 2)
-        rebound_peak_end = min(content_bottom, rebound_edge_y + 8)
-        rebound_peak_y = max(range(rebound_peak_start, rebound_peak_end), key=lambda y: smooth[y])
-        valley_start = max(lower_start, lower_edge_y - 3)
-        valley_end = min(content_bottom, rebound_edge_y + 2)
-        valley_y = min(range(valley_start, valley_end), key=lambda y: smooth[y])
+        rebound_edge_y = first_argmax(gradient, rebound_start, rebound_end)
+        rebound_peak_y = first_argmax(smooth, max(rebound_start, rebound_edge_y - 2), min(content_bottom, rebound_edge_y + 8))
+        valley_y = first_argmin(smooth, max(lower_start, lower_edge_y - 3), min(content_bottom, rebound_edge_y + 2))
         recovery = smooth[rebound_peak_y] - smooth[valley_y]
         if recovery >= 12.0 and smooth[rebound_peak_y] >= smooth[bottom_y] + 8.0:
             bottom_y = rebound_peak_y
@@ -414,7 +397,7 @@ def detect_thickness_candidate(
     top_contrast = smooth[top_y] - smooth[max(0, top_y - contrast_offset)]
     bottom_contrast = smooth[bottom_y] - smooth[min(content_bottom - 1, bottom_y + contrast_offset)]
     edge_strength = max(0.0, gradient[top_edge_y]) + max(0.0, -gradient[lower_edge_y])
-    score = top_contrast + bottom_contrast + edge_strength
+    score = float(top_contrast + bottom_contrast + edge_strength)
     if score < 70:
         return None
     return ThicknessCandidate(
@@ -433,8 +416,8 @@ def detect_thickness_measurement(
     band_width_percent: float = DEFAULTS["thickness_band_width_percent"],
     min_gap_percent: float = DEFAULTS["thickness_min_gap_percent"],
 ) -> ThicknessMeasurement | None:
-    gray = image_to_display_grayscale(image)
-    width, height = gray.size
+    gray = np.asarray(image_to_display_grayscale(image))
+    height, width = gray.shape
     content_bottom = detect_sem_content_bottom(gray)
     if content_bottom < max(60, int(height * 0.2)):
         return None

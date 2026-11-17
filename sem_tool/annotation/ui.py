@@ -27,9 +27,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..files import IMAGE_FILE_FILTER, image_paths_from_inputs, natural_key, open_path, path_key
+from ..files import IMAGE_FILE_FILTER, image_paths_from_inputs, natural_key, path_key
 from ..theme import icon
-from ..widgets import PathLineEdit, SegmentedControl, ToggleSwitch, section_heading
+from ..widgets import PathLineEdit, SegmentedControl, ToggleSwitch, open_file_or_warn, section_heading
 from .core import (
     DEFAULT_MARGIN_INCHES,
     DEFAULTS,
@@ -37,6 +37,7 @@ from .core import (
     CalibrationOverride,
     MeasurementOverride,
     choose_scale_nm,
+    hex_color,
     parse_scale_nm,
     parse_sem_metadata,
     validate_generation_options,
@@ -190,7 +191,7 @@ class AnnotationPanel(QWidget):
         self.position_combo = NoWheelComboBox()
         self.position_combo.addItems(list(POSITIONS.keys()))
         self.position_combo.setCurrentText(label_for_value(POSITIONS, DEFAULTS["scale_position"]))
-        self.color_edit = QLineEdit(QColor(DEFAULTS["bar_color"]).name().upper())
+        self.color_edit = QLineEdit(f"#{hex_color(DEFAULTS['bar_color'])}")
         self.line_width_spin = NoWheelDoubleSpinBox()
         self.line_width_spin.setRange(0.25, 20.0)
         self.line_width_spin.setDecimals(2)
@@ -307,13 +308,18 @@ class AnnotationPanel(QWidget):
         self.advanced_options.setVisible(expanded)
         self.advanced_toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
 
+    def bar_color(self) -> str | None:
+        """The colour both exporters will use, as #RRGGBB; None while the text is not a colour they accept."""
+        try:
+            return f"#{hex_color(self.color_edit.text())}"
+        except ValueError:
+            return None
+
     @Slot()
     def update_color_swatch(self) -> None:
-        color = QColor(self.color_edit.text().strip())
-        self.color_button.setText("" if color.isValid() else "?")
-        self.color_button.setStyleSheet(
-            f"background-color: {color.name() if color.isValid() else '#ffffff'}; border: 1px solid #dce3ed;"
-        )
+        color = self.bar_color()
+        self.color_button.setText("" if color else "?")
+        self.color_button.setStyleSheet(f"background-color: {color or '#ffffff'}; border: 1px solid #dce3ed;")
 
     def _button(self, text: str, callback) -> QPushButton:
         button = QPushButton(text)
@@ -372,21 +378,13 @@ class AnnotationPanel(QWidget):
             self.output_edit.setText(path)
 
     def choose_color(self) -> None:
-        color = QColorDialog.getColor(QColor("#FFFFFF"), self, "选择标尺颜色")
+        color = QColorDialog.getColor(QColor(self.bar_color() or "#FFFFFF"), self, "选择标尺颜色")
         if color.isValid():
             self.color_edit.setText(color.name().upper())
 
     def open_original_file(self, item: QTableWidgetItem) -> None:
-        if item.column() != COL_NAME:
-            return
-        path = self.item_path(item.row())
-        if not path.exists():
-            QMessageBox.warning(self, "文件不存在", str(path))
-            return
-        try:
-            open_path(path)
-        except OSError as exc:
-            QMessageBox.warning(self, "无法打开文件", str(exc))
+        if item.column() == COL_NAME:
+            open_file_or_warn(self, self.item_path(item.row()))
 
     def add_paths(self, paths: list[Path]) -> None:
         existing = {path_key(self.item_path(row)) for row in range(self.file_list.rowCount())}
@@ -848,6 +846,9 @@ class AnnotationPanel(QWidget):
             if output_path.suffix.lower() != suffix:
                 output_path = output_path.with_suffix(suffix)
 
+            bar_color = self.bar_color()
+            if bar_color is None:
+                raise ValueError("标尺颜色无效，请输入 white 这样的名称或 #FFFFFF 这样的十六进制值。")
             margin = float(self.margin_edit.text().strip())
             fixed_scale = None if self.auto_scale_check.isChecked() else self.fixed_scale_edit.text().strip()
             if fixed_scale == "":
@@ -860,7 +861,7 @@ class AnnotationPanel(QWidget):
                 "fixed_scale": fixed_scale,
                 "auto_scale_preset": AUTO_SCALE_PRESETS[self.auto_scale_choice.currentText()],
                 "position": POSITIONS[self.position_combo.currentText()],
-                "bar_color": self.color_edit.text().strip(),
+                "bar_color": bar_color,
                 "font_size": self.font_spin.value() or None,
                 "font_bold": self.font_bold_check.isChecked(),
                 "margin_inches": margin,

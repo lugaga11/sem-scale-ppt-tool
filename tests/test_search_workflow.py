@@ -24,11 +24,11 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from sem_tool.annotation.core import CalibrationOverride, MeasurementOverride
 from sem_tool.annotation.preview import CalibrationDialog, MeasurementPreviewDialog
 from sem_tool.app import MainWindow
-from sem_tool.files import image_paths_from_inputs, path_key
+from sem_tool.files import image_paths_from_inputs, natural_key, path_key
 from sem_tool.imaging import image_to_display_rgb
 from sem_tool.search.engine import SearchResult, extract_features
 from sem_tool.search.index import ImageIndex
-from sem_tool.search.ui import ResultWidget
+from sem_tool.search.ui import CLIPBOARD_KEEP_DAYS, ResultWidget, prune_clipboard_images
 from sem_tool.search.worker import ProgressThrottler, SearchWorker
 from sem_tool.settings import AppSettings, default_db_path
 
@@ -106,6 +106,23 @@ class SearchCoreTests(unittest.TestCase):
             texture().save(two)
             self.assertEqual(image_paths_from_inputs([ten, two, root, nested]), [ten, two])
             self.assertEqual(image_paths_from_inputs([root, nested]), [two, ten])
+
+    def test_natural_key_orders_numbers_and_accepts_superscript_digits(self) -> None:
+        names = ["样品10.tif", "样品2.tif", "样品1²3.tif", "样品1.tif"]
+        ordered = sorted(names, key=lambda name: natural_key(Path(name)))
+        self.assertEqual(ordered, ["样品1.tif", "样品1²3.tif", "样品2.tif", "样品10.tif"])
+
+    def test_old_pasted_screenshots_are_pruned_and_other_files_are_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            old, recent, unrelated = folder / "clipboard_old.png", folder / "clipboard_new.png", folder / "notes.png"
+            for path in (old, recent, unrelated):
+                path.write_bytes(b"png")
+            stale = old.stat().st_mtime - (CLIPBOARD_KEEP_DAYS + 1) * 24 * 3600
+            os.utime(old, (stale, stale))
+            os.utime(unrelated, (stale, stale))
+            prune_clipboard_images(folder)
+            self.assertEqual(sorted(path.name for path in folder.iterdir()), ["clipboard_new.png", "notes.png"])
 
     def test_settings_reuse_old_location_and_ignore_malformed_values(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -346,7 +363,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         queue = panel.file_list
         checkbox = queue.item(0, 0)
         assert checkbox is not None
-        with patch("sem_tool.annotation.ui.open_path") as open_original:
+        with patch("sem_tool.widgets.open_path") as open_original:
             for _ in range(2):
                 position = queue.visualItemRect(checkbox).center()
                 QTest.mouseClick(queue.viewport(), Qt.MouseButton.LeftButton, pos=position)
@@ -373,6 +390,9 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.assertTrue(panel.row_checked(0, 0))
         QTest.mouseClick(queue.viewport(), Qt.MouseButton.LeftButton, pos=queue.visualRect(queue.model().index(0, 1)).center())
         self.assertTrue(panel.row_checked(0, 0))
+        for expected in (False, True):
+            QTest.mouseClick(queue.viewport(), Qt.MouseButton.LeftButton, pos=queue.visualItemRect(checkbox).center())
+            self.assertEqual(panel.row_checked(0, 0), expected)
 
         QTest.mouseClick(panel.auto_scale_choice.buttons["长"], Qt.MouseButton.LeftButton)
         self.assertEqual(panel.auto_scale_choice.currentText(), "长")
@@ -576,6 +596,45 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.assertEqual(failed.add_button.text(), "加入列表")
         self.assertTrue(failed.add_button.isEnabled())
         self.assertEqual([title for title, _ in self.messages], ["原图不可用"])
+
+    def test_drops_on_the_path_fields_are_routed_by_content(self) -> None:
+        gallery = self.root / "图库"
+        gallery.mkdir()
+        screenshot = self.root / "截图.png"
+        texture().save(screenshot)
+        search = self.window.search_panel
+        self.window.tabs.setCurrentWidget(search)
+        self.window.show()
+        self.app.processEvents()
+
+        def drop(target, path: Path) -> bool:
+            mime = QMimeData()
+            mime.setUrls([QUrl.fromLocalFile(str(path))])
+            enter = QDragEnterEvent(QPoint(10, 10), Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+            self.app.sendEvent(target, enter)
+            event = QDropEvent(QPointF(10, 10), Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+            self.app.sendEvent(target, event)
+            return event.isAccepted()
+
+        self.assertTrue(drop(search.query_edit, gallery))
+        self.assertEqual(search.root_edit.text(), str(gallery))
+        self.assertEqual(search.query_edit.text(), "")
+        self.assertEqual(search.settings.last_gallery_dir, str(gallery.resolve()))
+        self.assertIn("当前图库", search.index_status_label.text())
+        self.assertTrue(drop(search.root_edit, screenshot))
+        self.assertEqual(search.query_edit.text(), str(screenshot))
+        self.assertEqual(search.root_edit.text(), str(gallery))
+
+    def test_search_result_actions_report_missing_files_instead_of_failing_silently(self) -> None:
+        search = self.window.search_panel
+        search._add_result(1, SearchResult(self.root / "已移走.tif", 1, 20, 30, 2))
+        widget = search.results_list.itemWidget(search.results_list.item(0))
+        assert isinstance(widget, ResultWidget)
+        widget.open_file()
+        self.assertEqual(self.messages[-1][0], "文件不存在")
+        with patch("sem_tool.widgets.reveal_path", side_effect=OSError("no file manager")):
+            widget.reveal_file()
+        self.assertEqual(self.messages[-1], ("无法定位文件", "no file manager"))
 
     def test_editor_io_errors_are_reported_and_programming_errors_propagate(self) -> None:
         original = self.make_original()

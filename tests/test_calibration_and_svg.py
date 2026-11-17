@@ -78,7 +78,8 @@ class ManualCalibrationCoreTests(unittest.TestCase):
                 output = Path(temp) / f"converted_{name}.png"
                 convert_image_to_png(endian_source, output)
                 with Image.open(output) as converted:
-                    self.assertEqual(converted.mode, "I;16")
+                    # Pillow before 10.3 reports a 16-bit grayscale PNG as mode "I"; the samples are what matters.
+                    self.assertIn(converted.mode, ("I;16", "I"))
                     self.assertEqual(list(converted.getdata()), values)
             display = image_to_display_grayscale(source)
             self.assertEqual(display.mode, "L")
@@ -103,7 +104,7 @@ class ManualCalibrationCoreTests(unittest.TestCase):
             embedded_path = root / "embedded.png"
             embedded_path.write_bytes(base64.b64decode(match.group(1)))
             with Image.open(embedded_path) as embedded:
-                self.assertEqual(embedded.mode, "I;16")
+                self.assertIn(embedded.mode, ("I;16", "I"))
                 self.assertEqual(list(embedded.getdata()), values)
 
             pptx_path = root / "result.pptx"
@@ -112,7 +113,7 @@ class ManualCalibrationCoreTests(unittest.TestCase):
                 media_names = [name for name in archive.namelist() if name.startswith("ppt/media/")]
                 self.assertEqual(len(media_names), 1)
                 with Image.open(BytesIO(archive.read(media_names[0]))) as embedded:
-                    self.assertEqual(embedded.mode, "I;16")
+                    self.assertIn(embedded.mode, ("I;16", "I"))
                     self.assertEqual(list(embedded.getdata()), values)
 
     def test_dynamic_auto_scale_covers_small_and_large_fields(self) -> None:
@@ -228,6 +229,30 @@ class ManualCalibrationGuiTests(unittest.TestCase):
                 self.assertIn("缺标定 1", window.count_label.text())
                 self.assertEqual(name_item.toolTip(), "")
                 self.assertIn("未检测到像素标定", name_item.data(Qt.ItemDataRole.WhatsThisRole))
+            finally:
+                window.close()
+
+    def test_color_swatch_shows_the_exported_color_and_invalid_colors_stop_before_export(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "plain.tif"
+            Image.new("L", (200, 100), 60).save(source, tiffinfo={270: "PixelSize=2.5"})
+            window = MainWindow()
+            try:
+                window.add_paths([source])
+                window.output_edit.setText(str(Path(temp) / "out.svg"))
+                for text, exported in (("green", "#00AA00"), ("blue", "#0066CC"), ("ffffff", "#FFFFFF"), ("#12ab34", "#12AB34")):
+                    window.color_edit.setText(text)
+                    self.assertEqual(window.bar_color(), exported)
+                    self.assertIn(exported, window.color_button.styleSheet())
+                    self.assertEqual(window.color_button.text(), "")
+                for text in ("orange", "#fff", "#FF000080", ""):
+                    window.color_edit.setText(text)
+                    self.assertIsNone(window.bar_color())
+                    self.assertEqual(window.color_button.text(), "?")
+                with patch("sem_tool.annotation.ui.QMessageBox.warning") as warning:
+                    window.generate()
+                self.assertIn("颜色", warning.call_args.args[2])
+                self.assertIsNone(window.thread)
             finally:
                 window.close()
 

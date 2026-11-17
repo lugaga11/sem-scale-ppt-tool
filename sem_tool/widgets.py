@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import QEvent, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -11,6 +13,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QStyle,
@@ -19,7 +22,27 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .files import open_path, reveal_path
 from .theme import icon
+
+
+def open_file_or_warn(parent: QWidget, path: Path) -> None:
+    """Open a file with its default application; a moved file or a launcher error is reported."""
+    if not path.exists():
+        QMessageBox.warning(parent, "文件不存在", str(path))
+        return
+    try:
+        open_path(path)
+    except OSError as exc:
+        QMessageBox.warning(parent, "无法打开文件", str(exc))
+
+
+def reveal_file_or_warn(parent: QWidget, path: Path) -> None:
+    """Show a file in the system file manager; when the file is gone its folder is opened instead."""
+    try:
+        reveal_path(path)
+    except OSError as exc:
+        QMessageBox.warning(parent, "无法定位文件", str(exc))
 
 
 def section_heading(text: str, icon_name: str) -> QHBoxLayout:

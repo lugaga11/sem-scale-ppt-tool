@@ -18,7 +18,9 @@ def path_key(path: Path) -> str:
 
 
 def natural_key(path: Path) -> list[str | int]:
-    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", str(path).casefold())]
+    # Splitting on one capturing group alternates text and digit runs; the digit runs sit at odd positions.
+    parts = re.split(r"(\d+)", str(path).casefold())
+    return [int(part) if index % 2 else part for index, part in enumerate(parts)]
 
 
 def is_supported_image(path: Path) -> bool:

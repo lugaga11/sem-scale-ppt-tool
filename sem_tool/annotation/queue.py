@@ -81,7 +81,9 @@ class GenerateCheckDelegate(QStyledItemDelegate):
         else:
             return False
         checked = Qt.CheckState(index.data(Qt.ItemDataRole.CheckStateRole)) == Qt.CheckState.Checked
-        return model.setData(index, Qt.CheckState.Unchecked if checked else Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole)
+        # PySide6 6.6 stores an enum passed to setData as "unchecked"; the integer value works on every version.
+        new_state = Qt.CheckState.Unchecked if checked else Qt.CheckState.Checked
+        return model.setData(index, new_state.value, Qt.ItemDataRole.CheckStateRole)
 
 
 class FileNameDelegate(QStyledItemDelegate):

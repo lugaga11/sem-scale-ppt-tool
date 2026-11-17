@@ -29,11 +29,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..files import IMAGE_FILE_FILTER, is_supported_image, open_path, path_key, reveal_path
+from ..files import IMAGE_FILE_FILTER, is_supported_image, open_path, path_key
 from ..image_widgets import ImageCanvas
 from ..settings import AppSettings, default_db_path
 from ..theme import icon
-from ..widgets import ElidedLabel, EmptyState, PathLineEdit, section_heading
+from ..widgets import ElidedLabel, EmptyState, PathLineEdit, open_file_or_warn, reveal_file_or_warn, section_heading
 from .engine import SearchResult
 from .index import ImageIndex, IndexStats, IndexStatus
 from .worker import SearchWorker
@@ -42,23 +42,13 @@ from .worker import SearchWorker
 class DropLineEdit(PathLineEdit):
     paste_requested = Signal()
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.setAcceptDrops(True)
-
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        # Files and folders belong to the panel, which decides between screenshot and gallery and
+        # refreshes the index status; only plain text is dropped into the field itself.
         if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+            event.ignore()
         else:
             super().dragEnterEvent(event)
-
-    def dropEvent(self, event: QDropEvent) -> None:
-        urls = event.mimeData().urls()
-        if urls:
-            self.setText(urls[0].toLocalFile())
-            event.acceptProposedAction()
-        else:
-            super().dropEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.matches(QKeySequence.StandardKey.Paste):
@@ -378,6 +368,7 @@ class SearchPanel(QWidget):
                 return
             output_path = clipboard_image_path()
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            prune_clipboard_images(output_path.parent)
             if not image.save(str(output_path)):
                 QMessageBox.warning(self, "粘贴失败", "无法保存剪贴板图片。")
                 return
@@ -776,22 +767,36 @@ class ResultWidget(QFrame):
         self.add_button.update()
 
     def open_file(self) -> None:
-        open_path(self.result.path)
+        open_file_or_warn(self, self.result.path)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        open_path(self.result.path)
+        self.open_file()
         event.accept()
 
     def reveal_file(self) -> None:
-        reveal_path(self.result.path)
+        reveal_file_or_warn(self, self.result.path)
 
     def copy_path(self) -> None:
         QApplication.clipboard().setText(str(self.result.path))
 
 
+CLIPBOARD_KEEP_DAYS = 7
+
+
 def clipboard_image_path() -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     return default_db_path().parent / "clipboard" / f"clipboard_{stamp}.png"
+
+
+def prune_clipboard_images(directory: Path) -> None:
+    """A pasted screenshot only serves the search it was pasted for; drop the ones from earlier weeks."""
+    cutoff = time.time() - CLIPBOARD_KEEP_DAYS * 24 * 3600
+    for path in directory.glob("clipboard_*.png"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue  # still open in a viewer, or already removed by another window
 
 
 def format_timestamp(value: Optional[float]) -> str:

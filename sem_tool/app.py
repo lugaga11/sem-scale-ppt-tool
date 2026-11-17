@@ -98,6 +98,7 @@ class MainWindow(QMainWindow):
         if self.search_panel.thread is not None or self.annotation_panel.thread is not None:
             self._closing = True
             self.annotation_panel.closing = True
+            self.search_panel.closing = True
             self.search_panel.cancel_work()
             self.tabs.setEnabled(False)
             self.statusBar().showMessage("正在结束搜索并等待导出完成，随后自动关闭…")

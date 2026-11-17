@@ -663,7 +663,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.assertEqual(search.root_edit.text(), str(gallery))
         self.assertEqual(search.query_edit.text(), "")
         self.assertEqual(search.settings.last_gallery_dir, str(gallery.resolve()))
-        self.assertIn("当前图库", search.index_status_label.text())
+        self.wait_until(lambda: "当前图库" in search.index_status_label.text())
         self.assertTrue(drop(search.root_edit, screenshot))
         self.assertEqual(search.query_edit.text(), str(screenshot))
         self.assertEqual(search.root_edit.text(), str(gallery))
@@ -776,6 +776,106 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         QTest.keyClick(panel.output_edit, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
         self.assertEqual(panel.output_edit.text(), "normal text")
 
+    def answer_messages(self, button: QMessageBox.StandardButton) -> QTimer:
+        """Click one button of every message box instead of the default dismissal."""
+        self.message_timer.stop()
+
+        def answer() -> None:
+            box = self.app.activeModalWidget()
+            if isinstance(box, QMessageBox):
+                self.messages.append((box.windowTitle(), box.text()))
+                box.button(button).click()
+
+        timer = QTimer(self.window)
+        timer.timeout.connect(answer)
+        timer.start(10)
+        return timer
+
+    def test_start_up_leaves_the_gallery_alone_until_the_search_page_is_opened(self) -> None:
+        gallery = self.root / "图库"
+        gallery.mkdir()
+        texture().save(gallery / "a.png")
+        AppSettings(str(gallery)).save()
+        scanning_threads = []
+        real_status = ImageIndex.status
+
+        def recording_status(index, root, **kwargs):
+            scanning_threads.append(threading.current_thread())
+            return real_status(index, root, **kwargs)
+
+        with patch.object(ImageIndex, "status", autospec=True, side_effect=recording_status):
+            window = MainWindow()
+            try:
+                search = window.search_panel
+                window.show()
+                self.app.processEvents()
+                self.assertEqual(search.root_edit.text(), str(gallery))
+                self.assertEqual(scanning_threads, [])
+                self.assertIsNone(search.thread)
+                window.tabs.setCurrentWidget(search)
+                self.wait_until(lambda: "建议更新索引" in search.index_status_label.text())
+                self.assertEqual(len(scanning_threads), 1)
+                self.assertIsNot(scanning_threads[0], threading.main_thread())
+                # The background check never locks the page.
+                self.assertTrue(search.search_button.isEnabled())
+                self.assertTrue(search.progress.isHidden())
+                self.wait_until(lambda: search.thread is None)
+            finally:
+                window.close()
+                self.wait_until(lambda: window.search_panel.thread is None)
+                window.annotation_panel.file_list.name_delegate.timer.stop()
+                window.deleteLater()
+
+    def test_search_with_a_stale_index_asks_first_and_maintenance_runs_in_the_worker(self) -> None:
+        gallery = self.root / "图库"
+        gallery.mkdir()
+        source = texture()
+        source.save(gallery / "source.tif")
+        query = self.root / "crop.png"
+        source.crop((45, 35, 420, 320)).save(query)
+        search = self.window.search_panel
+        search.root_edit.setText(str(gallery))
+        search.query_edit.setText(str(query))
+
+        search.start_search()
+        self.wait_until(lambda: search.thread is None and bool(self.messages))
+        self.assertEqual(self.messages.pop()[0], "需要索引")
+        self.assertEqual(search.results_list.count(), 0)
+
+        search.start_index()
+        self.wait_until(lambda: search.thread is None)
+        self.assertIn("索引已是最新", search.index_status_label.text())
+        texture(7).save(gallery / "later.png")
+
+        search.start_search()  # the default dismissal answers "no"
+        self.wait_until(lambda: search.thread is None and bool(self.messages))
+        self.assertEqual(self.messages.pop()[0], "建议更新索引")
+        self.assertEqual(search.results_list.count(), 0)
+        self.assertTrue(search.search_button.isEnabled())
+        self.assertIn("新增 1", search.index_status_label.text())
+
+        timer = self.answer_messages(QMessageBox.StandardButton.Yes)
+        try:
+            search.start_search()
+            self.wait_until(lambda: search.thread is None and search.results_list.count() == 1)
+        finally:
+            timer.stop()
+        self.assertEqual(self.messages.pop()[0], "建议更新索引")
+
+        (gallery / "source.tif").unlink()
+        search.prune_missing_index()
+        self.wait_until(lambda: search.thread is None)
+        self.assertIn("删除 1 条", search.status_label.text())
+        timer = self.answer_messages(QMessageBox.StandardButton.Yes)
+        try:
+            search.clear_current_index()
+            self.wait_until(lambda: search.thread is None and "已清空" in search.status_label.text())
+            search.vacuum_index_database()
+            self.wait_until(lambda: search.thread is None and "压缩完成" in search.status_label.text())
+        finally:
+            timer.stop()
+        self.assertIn("已索引 0/1", search.index_status_label.text())
+
     def test_closing_waits_for_search_worker_to_finish(self) -> None:
         started = threading.Event()
 
@@ -790,7 +890,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.window.show()
         self.assertTrue(search.progress.isHidden())
         with patch.object(ImageIndex, "search", autospec=True, side_effect=delayed_search):
-            worker = SearchWorker(self.root, search._new_cancel_event(), query=self.root / "query.png")
+            worker = SearchWorker(self.root, search._new_cancel_event(), "search", query=self.root / "query.png")
             search._start_worker(worker, search._on_search_finished)
             self.wait_until(lambda: started.is_set() and search.progress.value() == 25)
             self.assertTrue(search.progress.isVisible())
@@ -830,7 +930,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
     def test_failed_search_reports_error_and_restores_controls(self) -> None:
         search = self.window.search_panel
         with patch.object(ImageIndex, "search", side_effect=ValueError("test read failure")):
-            worker = SearchWorker(self.root, search._new_cancel_event(), query=self.root / "query.png")
+            worker = SearchWorker(self.root, search._new_cancel_event(), "search", query=self.root / "query.png")
             search._start_worker(worker, search._on_search_finished)
             self.wait_until(lambda: search.thread is None)
         self.assertEqual(self.messages, [("操作失败", "test read failure")])

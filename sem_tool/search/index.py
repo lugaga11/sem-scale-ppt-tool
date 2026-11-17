@@ -44,6 +44,7 @@ class IndexStatus:
     changed_files: int
     removed_files: int
     error_files: int
+    searchable_files: int
     last_indexed_at: Optional[float]
 
     @property
@@ -89,11 +90,13 @@ class ImageIndex:
         *,
         progress: Optional[ProgressCallback] = None,
         cancel_event: Optional[threading.Event] = None,
-        force: bool = False,
         max_workers: Optional[int] = None,
     ) -> IndexStats:
         root = root.resolve()
-        files = list(iter_image_files(root))
+        files = list(scan_gallery(root, cancel_event))
+        if cancel_event and cancel_event.is_set():
+            # A listing cut short must not be read as "the remaining files were deleted".
+            return IndexStats(total=0, indexed=0, skipped=0, removed=0, errors=0)
         now = time.time()
         indexed = 0
         skipped = 0
@@ -107,7 +110,7 @@ class ImageIndex:
                     (str(root),),
                 )
             }
-            seen = {str(path.resolve()) for path in files}
+            seen = {str(path) for path, _stat in files}
             removed = 0
             for path_text in set(existing) - seen:
                 conn.execute(
@@ -119,16 +122,13 @@ class ImageIndex:
             total = len(files)
             processed = 0
             jobs: list[IndexJob] = []
-            for path in files:
+            for path, stat in files:
                 if cancel_event and cancel_event.is_set():
                     break
-                path = path.resolve()
-                stat = path.stat()
                 path_text = str(path)
                 old = existing.get(path_text)
                 if (
-                    not force
-                    and old
+                    old
                     and not old["error"]
                     and old["size"] == stat.st_size
                     and old["mtime"] == stat.st_mtime
@@ -165,13 +165,7 @@ class ImageIndex:
                     progress(processed, total, f"索引: {result.job.path.name}")
             conn.commit()
 
-        return IndexStats(
-            total=len(files),
-            indexed=indexed,
-            skipped=skipped,
-            removed=removed,
-            errors=errors,
-        )
+        return IndexStats(total=total, indexed=indexed, skipped=skipped, removed=removed, errors=errors)
 
     def rebuild(
         self,
@@ -181,55 +175,28 @@ class ImageIndex:
         cancel_event: Optional[threading.Event] = None,
         max_workers: Optional[int] = None,
     ) -> IndexStats:
+        # With the old rows gone every file is new to update(), so nothing is skipped.
         removed = self.clear(root)
-        stats = self.update(
-            root,
-            progress=progress,
-            cancel_event=cancel_event,
-            force=True,
-            max_workers=max_workers,
-        )
-        return IndexStats(
-            total=stats.total,
-            indexed=stats.indexed,
-            skipped=stats.skipped,
-            removed=removed + stats.removed,
-            errors=stats.errors,
-        )
+        stats = self.update(root, progress=progress, cancel_event=cancel_event, max_workers=max_workers)
+        return replace(stats, removed=removed)
 
-    def clear(self, root: Optional[Path] = None) -> int:
+    def clear(self, root: Path) -> int:
         with closing(self._connect()) as conn:
-            if root is None:
-                cursor = conn.execute("delete from images")
-            else:
-                cursor = conn.execute(
-                    "delete from images where root = ?",
-                    (str(root.resolve()),),
-                )
+            cursor = conn.execute("delete from images where root = ?", (str(root.resolve()),))
             conn.commit()
             return cursor.rowcount
 
-    def prune_missing(self, root: Optional[Path] = None) -> int:
+    def prune_missing(self, root: Path, *, cancel_event: Optional[threading.Event] = None) -> int:
+        root_text = str(root.resolve())
         with closing(self._connect()) as conn:
-            if root is None:
-                rows = list(conn.execute("select root, path from images"))
-            else:
-                rows = list(
-                    conn.execute(
-                        "select root, path from images where root = ?",
-                        (str(root.resolve()),),
-                    )
-                )
+            paths = [row["path"] for row in conn.execute("select path from images where root = ?", (root_text,))]
             removed = 0
-            for row in rows:
-                path = Path(row["path"])
-                if path.exists():
-                    continue
-                conn.execute(
-                    "delete from images where root = ? and path = ?",
-                    (row["root"], row["path"]),
-                )
-                removed += 1
+            for path_text in paths:
+                if cancel_event and cancel_event.is_set():
+                    break
+                if not Path(path_text).exists():
+                    conn.execute("delete from images where root = ? and path = ?", (root_text, path_text))
+                    removed += 1
             conn.commit()
             return removed
 
@@ -294,20 +261,19 @@ class ImageIndex:
             ).fetchone()
             return int(row["count"])
 
-    def status(self, root: Path) -> IndexStatus:
-        root = root.resolve()
-        files = list(iter_image_files(root))
-        current: dict[str, os.stat_result] = {}
-        for path in files:
-            resolved = path.resolve()
-            current[str(resolved)] = resolved.stat()
+    def status(self, root: Path, *, cancel_event: Optional[threading.Event] = None) -> IndexStatus:
+        """Compare the gallery on disk with its index rows.
 
+        The scan stops as soon as the event is set, so a result obtained after cancelling is incomplete.
+        """
+        root = root.resolve()
+        current = {str(path): stat for path, stat in scan_gallery(root, cancel_event)}
         with closing(self._connect()) as conn:
             rows = {
                 row["path"]: row
                 for row in conn.execute(
                     """
-                    select path, size, mtime, updated_at, error
+                    select path, size, mtime, updated_at, error, descriptors is not null as searchable
                     from images
                     where root = ?
                     """,
@@ -317,41 +283,28 @@ class ImageIndex:
 
         current_paths = set(current)
         indexed_paths = set(rows)
-        new_files = len(current_paths - indexed_paths)
-        removed_files = len(indexed_paths - current_paths)
         changed_files = 0
         error_files = 0
         indexed_files = 0
-        last_indexed_at: Optional[float] = None
-
         for path_text in current_paths & indexed_paths:
             stat = current[path_text]
             row = rows[path_text]
-            if row["updated_at"] is not None:
-                updated_at = float(row["updated_at"])
-                last_indexed_at = updated_at if last_indexed_at is None else max(last_indexed_at, updated_at)
             if row["error"]:
                 error_files += 1
             if row["size"] != stat.st_size or row["mtime"] != stat.st_mtime:
                 changed_files += 1
-                continue
-            if not row["error"]:
+            elif not row["error"]:
                 indexed_files += 1
 
-        for path_text in indexed_paths - current_paths:
-            row = rows[path_text]
-            if row["updated_at"] is not None:
-                updated_at = float(row["updated_at"])
-                last_indexed_at = updated_at if last_indexed_at is None else max(last_indexed_at, updated_at)
-
         return IndexStatus(
-            total_files=len(files),
+            total_files=len(current),
             indexed_files=indexed_files,
-            new_files=new_files,
+            new_files=len(current_paths - indexed_paths),
             changed_files=changed_files,
-            removed_files=removed_files,
+            removed_files=len(indexed_paths - current_paths),
             error_files=error_files,
-            last_indexed_at=last_indexed_at,
+            searchable_files=sum(1 for row in rows.values() if row["searchable"]),
+            last_indexed_at=max((row["updated_at"] for row in rows.values()), default=None),
         )
 
     def _iter_feature_rows(self, root: Path) -> Iterator[sqlite3.Row]:
@@ -405,6 +358,24 @@ class ImageIndex:
                 """
             )
             conn.commit()
+
+
+def scan_gallery(
+    root: Path, cancel_event: Optional[threading.Event] = None
+) -> Iterator[tuple[Path, os.stat_result]]:
+    """Yield each image under the gallery as (resolved path, stat).
+
+    The listing ends early once the event is set; callers check the event before trusting it.
+    """
+    for path in iter_image_files(root):
+        if cancel_event and cancel_event.is_set():
+            return
+        resolved = path.resolve()
+        try:
+            stat = resolved.stat()
+        except FileNotFoundError:
+            continue  # removed between listing and stat, e.g. a temporary file of the acquisition software
+        yield resolved, stat
 
 
 def serialize_empty_keypoints() -> bytes:

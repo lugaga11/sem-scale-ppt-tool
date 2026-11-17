@@ -1,14 +1,22 @@
 from __future__ import annotations
 
-import sqlite3
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, cast
+from typing import Callable, Optional, cast
 
 from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeyEvent, QKeySequence, QMouseEvent, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QDragEnterEvent,
+    QDropEvent,
+    QKeyEvent,
+    QKeySequence,
+    QMouseEvent,
+    QPixmap,
+    QShowEvent,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -35,8 +43,8 @@ from ..settings import AppSettings, default_db_path
 from ..theme import icon
 from ..widgets import ElidedLabel, EmptyState, PathLineEdit, open_file_or_warn, reveal_file_or_warn, section_heading
 from .engine import SearchResult
-from .index import ImageIndex, IndexStats, IndexStatus
-from .worker import SearchWorker
+from .index import IndexStats, IndexStatus
+from .worker import SearchBlocked, SearchWorker, Task
 
 
 class DropLineEdit(PathLineEdit):
@@ -70,6 +78,12 @@ class SearchPanel(QWidget):
         self.thread: Optional[QThread] = None
         self.worker: Optional[SearchWorker] = None
         self.work_started_at: Optional[float] = None
+        self.closing = False
+        # A background task is the quiet status check: it leaves the controls usable and gives way to any other task.
+        self._background = False
+        self._follow_up: Optional[Callable[[], None]] = None
+        self._status_root: Optional[str] = None
+        self._search_request: Optional[tuple[Path, Path, int]] = None
         self.settings = AppSettings.load()
         self._queue_path_keys: set[str] = set()
         self.query_edit = DropLineEdit()
@@ -282,8 +296,11 @@ class SearchPanel(QWidget):
         if not self._handle_drop(event):
             super().dropEvent(event)
 
+    def _foreground_busy(self) -> bool:
+        return self.thread is not None and not self._background
+
     def _has_supported_drop(self, event: QDragEnterEvent | QDropEvent) -> bool:
-        if self.thread is not None:
+        if self._foreground_busy():
             return False
         for path in self._paths_from_drop(event):
             if path.is_dir() or is_supported_image(path):
@@ -291,7 +308,7 @@ class SearchPanel(QWidget):
         return False
 
     def _handle_drop(self, event: QDropEvent) -> bool:
-        if self.thread is not None:
+        if self._foreground_busy():
             return False
         for path in self._paths_from_drop(event):
             if path.is_dir():
@@ -324,9 +341,15 @@ class SearchPanel(QWidget):
             path = Path(self.settings.last_gallery_dir)
             if path.is_dir():
                 self.root_edit.setText(str(path))
-                self.refresh_index_status()
+                self.index_status_label.setText("索引状态: 尚未检查")
             else:
                 self.index_status_label.setText(f"索引状态: 上次图库不存在: {path}")
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        # The gallery is scanned when the page is first used, never while the application starts.
+        if self.root_edit.text().strip() != self._status_root:
+            self.refresh_index_status()
 
     def remember_gallery_dir(self) -> None:
         text = self.root_edit.text().strip()
@@ -335,14 +358,17 @@ class SearchPanel(QWidget):
         path = Path(text)
         if not path.is_dir():
             return
-        self.settings.last_gallery_dir = str(path.resolve())
+        resolved = str(path.resolve())
+        if resolved == self.settings.last_gallery_dir:
+            return
+        self.settings.last_gallery_dir = resolved
         try:
             self.settings.save()
         except OSError as exc:
             self.status_label.setText(f"无法保存图库设置: {exc}")
 
     def paste_from_clipboard(self) -> None:
-        if self.thread is not None:
+        if self._foreground_busy():
             return
         clipboard = QApplication.clipboard()
         mime = clipboard.mimeData()
@@ -400,8 +426,7 @@ class SearchPanel(QWidget):
         if root is None:
             return
         self.remember_gallery_dir()
-        self.results_list.clear()
-        self._start_worker(SearchWorker(root, self._new_cancel_event()), self._on_index_finished)
+        self._when_idle(lambda: self._run_task(root, "update", "正在扫描图库…", self._on_index_finished))
 
     def rebuild_current_index(self) -> None:
         root = self._validated_root()
@@ -413,8 +438,7 @@ class SearchPanel(QWidget):
         ):
             return
         self.remember_gallery_dir()
-        self.results_list.clear()
-        self._start_worker(SearchWorker(root, self._new_cancel_event(), rebuild=True), self._on_index_finished)
+        self._when_idle(lambda: self._run_task(root, "rebuild", "正在扫描图库…", self._on_index_finished))
 
     def clear_current_index(self) -> None:
         root = self._validated_root()
@@ -425,19 +449,13 @@ class SearchPanel(QWidget):
             "将删除当前图库的全部索引记录，但不会删除任何图片文件。\n\n继续吗？",
         ):
             return
-        removed = ImageIndex().clear(root)
-        self.progress.setValue(0)
-        self.status_label.setText(f"已清空当前图库索引: 删除 {removed} 条记录")
-        self.results_list.clear()
-        self.refresh_index_status()
+        self._when_idle(lambda: self._run_task(root, "clear", "正在清空索引…", self._on_clear_finished))
 
     def prune_missing_index(self) -> None:
         root = self._validated_root()
         if root is None:
             return
-        removed = ImageIndex().prune_missing(root)
-        self.status_label.setText(f"已清理失效索引记录: 删除 {removed} 条")
-        self.refresh_index_status()
+        self._when_idle(lambda: self._run_task(root, "prune", "正在清理失效记录…", self._on_prune_finished))
 
     def vacuum_index_database(self) -> None:
         if not self._confirm_action(
@@ -445,11 +463,7 @@ class SearchPanel(QWidget):
             "将整理整个 index.sqlite 文件并释放清空索引后留下的空闲空间。\n\n图库很大时可能需要一些时间，继续吗？",
         ):
             return
-        before = db_file_size()
-        ImageIndex().vacuum()
-        after = db_file_size()
-        self.status_label.setText(f"索引库压缩完成: {format_bytes(before)} -> {format_bytes(after)}")
-        self.refresh_index_status()
+        self._when_idle(lambda: self._run_task(None, "vacuum", "正在压缩索引库…", self._on_vacuum_finished))
 
     def start_search(self) -> None:
         root = self._validated_root()
@@ -457,26 +471,38 @@ class SearchPanel(QWidget):
         if root is None or query is None:
             return
         self.remember_gallery_dir()
-        index = ImageIndex()
-        if index.count(root) == 0:
-            QMessageBox.information(self, "需要索引", "当前图库还没有索引，请先更新索引。")
-            return
-        try:
-            status = index.status(root)
-        except (OSError, ValueError, sqlite3.Error) as exc:
-            QMessageBox.warning(self, "索引状态检查失败", str(exc))
-            return
-        self._set_index_status(status)
-        if status.needs_update and not self._confirm_search_with_stale_index(status):
-            return
+        top_n = self.top_spin.value()
+        self._when_idle(lambda: self._run_search(root, query, top_n, precheck=True))
+
+    def _run_task(self, root: Optional[Path], task: Task, message: str, finish_slot) -> None:
+        if task in ("update", "rebuild", "clear"):
+            self.results_list.clear()  # the shown matches no longer describe the index
+        self.status_label.setText(message)
+        self._start_worker(SearchWorker(root, self._new_cancel_event(), task), finish_slot)
+
+    def _run_search(self, root: Path, query: Path, top_n: int, *, precheck: bool) -> None:
         self.results_list.clear()
-        worker = SearchWorker(root, self._new_cancel_event(), query=query, top_n=self.top_spin.value())
+        self.status_label.setText("正在检查索引状态…" if precheck else "正在匹配…")
+        self._search_request = (root, query, top_n)
+        worker = SearchWorker(root, self._new_cancel_event(), "search", query=query, top_n=top_n, precheck=precheck)
         self._start_worker(worker, self._on_search_finished)
 
-    def cancel_work(self) -> None:
-        if self.cancel_event:
+    def _when_idle(self, action: Callable[[], None]) -> None:
+        """Run now, or as soon as a background status check has been stopped to make room."""
+        if self.thread is None:
+            action()
+        elif self._background:
+            assert self.cancel_event is not None
             self.cancel_event.set()
-            self.status_label.setText("正在取消...")
+            self._follow_up = action
+        # Otherwise a foreground task owns the disabled controls, so there is nothing to queue.
+
+    def cancel_work(self) -> None:
+        self._follow_up = None
+        if self.thread is not None and self.cancel_event is not None:
+            self.cancel_event.set()
+            if not self._background:
+                self.status_label.setText("正在取消...")
 
     def open_index_directory(self) -> None:
         path = default_db_path().parent
@@ -484,21 +510,29 @@ class SearchPanel(QWidget):
         open_path(path)
         self.status_label.setText(f"已打开索引目录: {path}")
 
-    def _start_worker(self, worker: SearchWorker, finish_slot) -> None:
-        self._set_busy(True)
-        self.progress.setValue(0)
-        self.work_started_at = time.monotonic()
+    def _start_worker(self, worker: SearchWorker, finish_slot=None, *, background: bool = False) -> None:
+        self._background = background
+        if not background:
+            self._set_busy(True)
+            self.progress.setValue(0)
+            self.work_started_at = time.monotonic()
         self.thread = QThread(self)
         self.worker = worker
         worker.moveToThread(self.thread)
         self.thread.started.connect(worker.run)
-        worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
-        worker.finished.connect(finish_slot, Qt.ConnectionType.QueuedConnection)
-        worker.failed.connect(self._on_failed, Qt.ConnectionType.QueuedConnection)
-        worker.canceled.connect(self._on_canceled, Qt.ConnectionType.QueuedConnection)
+        queued = Qt.ConnectionType.QueuedConnection
+        worker.status_ready.connect(self._set_index_status, queued)
+        if background:
+            worker.failed.connect(self._on_status_failed, queued)
+        else:
+            worker.progress.connect(self._on_progress, queued)
+            worker.failed.connect(self._on_failed, queued)
+            worker.canceled.connect(self._on_canceled, queued)
+        if finish_slot is not None:
+            worker.finished.connect(finish_slot, queued)
         worker.done.connect(self.thread.quit, Qt.ConnectionType.DirectConnection)
         worker.done.connect(worker.deleteLater)
-        self.thread.finished.connect(self._cleanup_worker, Qt.ConnectionType.QueuedConnection)
+        self.thread.finished.connect(self._cleanup_worker, queued)
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
@@ -509,7 +543,11 @@ class SearchPanel(QWidget):
         self.thread = None
         self.worker = None
         self.work_started_at = None
-        self._set_busy(False)
+        follow_up, self._follow_up = self._follow_up, None
+        if follow_up is not None and not self.closing:
+            follow_up()
+        # The follow-up may have started the next task; the controls stay locked only for a foreground one.
+        self._set_busy(self._foreground_busy())
 
     @Slot(int, int, str)
     def _on_progress(self, current: int, total: int, message: str) -> None:
@@ -535,12 +573,32 @@ class SearchPanel(QWidget):
         self.status_label.setText(
             f"索引完成: 总数 {stats.total}, 新增/更新 {stats.indexed}, 跳过 {stats.skipped}, 删除 {stats.removed}, 错误 {stats.errors}"
         )
-        self.refresh_index_status()
         self.results_empty.title.setText("图库已准备好")
         self.results_empty.detail.setText("选择截图，点击“搜索”查找对应原图")
 
     @Slot(object)
-    def _on_search_finished(self, results: list[SearchResult]) -> None:
+    def _on_clear_finished(self, removed: int) -> None:
+        self.status_label.setText(f"已清空当前图库索引: 删除 {removed} 条记录")
+
+    @Slot(object)
+    def _on_prune_finished(self, removed: int) -> None:
+        self.status_label.setText(f"已清理失效索引记录: 删除 {removed} 条")
+
+    @Slot(object)
+    def _on_vacuum_finished(self, sizes: tuple[int, int]) -> None:
+        before, after = sizes
+        self.status_label.setText(f"索引库压缩完成: {format_bytes(before)} -> {format_bytes(after)}")
+
+    @Slot(object)
+    def _on_search_finished(self, outcome: list[SearchResult] | SearchBlocked) -> None:
+        if isinstance(outcome, SearchBlocked):
+            # Ask once this worker has been cleaned up, so the dialog never overlaps the thread hand-over.
+            assert self._search_request is not None
+            root, query, top_n = self._search_request
+            status = outcome.status
+            self._follow_up = lambda: self._resolve_blocked_search(status, root, query, top_n)
+            return
+        results = outcome
         self.progress.setValue(100)
         self.status_label.setText(f"搜索完成: {len(results)} 个候选")
         self.results_empty.title.setText("没有找到匹配原图")
@@ -561,9 +619,26 @@ class SearchPanel(QWidget):
         self.status_label.setText("已取消")
         self.results_empty.title.setText("操作已取消")
         self.results_empty.detail.setText("可以更换截图或图库后重新开始")
+        if self.worker is not None and self.worker.task != "search":
+            self._follow_up = self.refresh_index_status  # a stopped index task leaves the index half updated
+
+    def _resolve_blocked_search(self, status: IndexStatus, root: Path, query: Path, top_n: int) -> None:
+        if status.searchable_files == 0:
+            self.status_label.setText("当前图库还没有索引")
+            self.results_empty.title.setText("图库还没有索引")
+            self.results_empty.detail.setText("点击“更新索引”后再搜索")
+            QMessageBox.information(self, "需要索引", "当前图库还没有索引，请先更新索引。")
+        elif self._confirm_search_with_stale_index(status):
+            self._run_search(root, query, top_n, precheck=False)
+        else:
+            self.status_label.setText("已取消搜索，可以先更新索引")
+            self.results_empty.title.setText("搜索未开始")
+            self.results_empty.detail.setText("更新索引后重新搜索，或直接使用当前索引")
 
     def refresh_index_status(self) -> None:
+        """Compare the gallery with its index in the background; the label follows when the result arrives."""
         text = self.root_edit.text().strip()
+        self._status_root = text
         if not text:
             self.index_status_label.setText("索引状态: 未选择图库")
             return
@@ -571,13 +646,17 @@ class SearchPanel(QWidget):
         if not root.is_dir():
             self.index_status_label.setText("索引状态: 图库目录不存在")
             return
-        try:
-            status = ImageIndex().status(root)
-        except (OSError, ValueError, sqlite3.Error) as exc:
-            self.index_status_label.setText(f"索引状态: 检查失败: {exc}")
-            return
-        self._set_index_status(status)
+        self._when_idle(lambda: self._start_status_check(root))
 
+    def _start_status_check(self, root: Path) -> None:
+        self.index_status_label.setText("索引状态: 正在检查…")
+        self._start_worker(SearchWorker(root, self._new_cancel_event(), "status"), background=True)
+
+    @Slot(str)
+    def _on_status_failed(self, message: str) -> None:
+        self.index_status_label.setText(f"索引状态: 检查失败: {message}")
+
+    @Slot(object)
     def _set_index_status(self, status: IndexStatus) -> None:
         last_indexed = format_timestamp(status.last_indexed_at)
         parts = [
@@ -821,11 +900,6 @@ def shorten_progress_message(message: str, max_length: int = 48) -> str:
         return message
     keep = max(8, max_length - 3)
     return message[:keep] + "..."
-
-
-def db_file_size() -> int:
-    path = default_db_path()
-    return path.stat().st_size if path.exists() else 0
 
 
 def format_bytes(size: int) -> str:

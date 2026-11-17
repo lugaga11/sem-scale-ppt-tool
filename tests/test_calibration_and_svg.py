@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 from zipfile import ZipFile
 
@@ -40,6 +41,7 @@ from sem_tool.annotation.preview import (
 )
 from sem_tool.annotation.ui import AnnotationPanel as MainWindow
 from sem_tool.imaging import convert_image_to_png, image_to_display_grayscale
+from sem_tool.theme import apply_theme
 
 
 class ManualCalibrationCoreTests(unittest.TestCase):
@@ -185,7 +187,10 @@ class ManualCalibrationCoreTests(unittest.TestCase):
 class ManualCalibrationGuiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.app = QApplication.instance() or QApplication([])
+        cls.app = cast(QApplication, QApplication.instance() or QApplication([]))
+        # Style the application before any widget exists: replacing the style later re-polishes every
+        # widget still alive, and a window collected by Python in the middle of that crashes Qt.
+        apply_theme(cls.app)
 
     def test_queue_preflight_and_manual_override_status(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

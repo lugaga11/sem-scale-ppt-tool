@@ -124,9 +124,11 @@ class ManualCalibrationCoreTests(unittest.TestCase):
             self.assertLessEqual(fraction, 0.20)
 
     def test_invalid_or_oversized_fixed_scale_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "greater than zero"):
+        with self.assertRaisesRegex(ValueError, "必须大于零"):
             parse_scale_nm("0nm")
-        with self.assertRaisesRegex(ValueError, "exceeds the image field width"):
+        with self.assertRaisesRegex(ValueError, "无法识别长度"):
+            parse_scale_nm("1 micron")
+        with self.assertRaisesRegex(ValueError, "超出了图像视野宽度"):
             choose_scale_nm(100, 1.0, parse_scale_nm("1mm"), "medium")
 
     def test_invalid_render_parameters_are_rejected(self) -> None:
@@ -160,7 +162,7 @@ class ManualCalibrationCoreTests(unittest.TestCase):
             self.assertEqual(svg_text.count("data:image/png;base64,"), 1)
             self.assertEqual(svg_text.count("xlink:href="), 1)
             self.assertAlmostEqual(svg_items[0].calibration.nm_per_pixel, 10.0)
-            self.assertIn("manual calibration", svg_items[0].calibration.source)
+            self.assertIn("手动标定", svg_items[0].calibration.source)
 
             pptx_path = root / "result.pptx"
             pptx_items = generate_pptx(
@@ -176,7 +178,7 @@ class ManualCalibrationCoreTests(unittest.TestCase):
             root = Path(temp)
             source = root / "plain.png"
             Image.new("RGB", (100, 50)).save(source)
-            with self.assertRaisesRegex(ValueError, "manual calibration"):
+            with self.assertRaisesRegex(ValueError, "没有像素标定"):
                 generate_svg([source], root / "result.svg")
 
 

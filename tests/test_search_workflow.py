@@ -23,7 +23,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from sem_tool.annotation.core import CalibrationOverride, MeasurementOverride
 from sem_tool.annotation.preview import CalibrationDialog, MeasurementPreviewDialog
-from sem_tool.app import MainWindow
+from sem_tool.app import MainWindow, install_qt_translation
 from sem_tool.files import image_paths_from_inputs, natural_key, path_key
 from sem_tool.imaging import image_to_display_rgb
 from sem_tool.search.engine import SearchResult, extract_features
@@ -684,6 +684,36 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         panel.clear_queue()
         self.assertFalse(panel.measurement_overrides)
         self.assertEqual(self.window.tabs.tabText(0), "标注与导出 (0)")
+
+    def test_qt_dialog_buttons_and_field_menus_follow_the_interface_language(self) -> None:
+        translator = install_qt_translation(self.app)
+        if translator is None:
+            self.skipTest("this Qt build ships without translations")
+        try:
+            box = QMessageBox(QMessageBox.Icon.Question, "标题", "内容", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+            self.assertIn("是", box.button(QMessageBox.StandardButton.Yes).text())
+            self.assertEqual(box.button(QMessageBox.StandardButton.Cancel).text(), "取消")
+            menu = self.window.annotation_panel.color_edit.createStandardContextMenu()
+            self.assertTrue(any("粘贴" in action.text() for action in menu.actions()))
+            menu.deleteLater()
+            box.deleteLater()
+        finally:
+            self.app.removeTranslator(translator)
+
+    def test_page_margin_is_bounded_so_the_largest_value_still_exports(self) -> None:
+        panel = self.window.annotation_panel
+        panel.add_paths([self.make_original("margin.tif")])
+        panel.margin_spin.setValue(99)
+        self.assertEqual(panel.margin_spin.value(), panel.margin_spin.maximum())
+        self.assertEqual(panel.margin_spin.suffix(), " inch")
+        for fmt in ("SVG", "PPTX"):
+            panel.output_format_control.buttons[fmt].setChecked(True)
+            panel.output_edit.setText(str(self.root / f"margin.{fmt.lower()}"))
+            panel.generate()
+            self.wait_until(lambda: panel.thread is None)
+        self.assertEqual([title for title, _ in self.messages], ["完成", "完成"])
+        self.assertTrue((self.root / "margin_01_margin.svg").is_file())
+        self.assertTrue((self.root / "margin.pptx").is_file())
 
     def test_search_shortcut_is_scoped_to_search_panel(self) -> None:
         self.assertTrue(

@@ -97,11 +97,14 @@ class CalibrationOverride:
     @property
     def nm_per_pixel(self) -> float:
         if not math.isfinite(self.known_length_nm) or self.known_length_nm <= 0:
-            raise ValueError("Manual calibration length must be greater than zero.")
+            raise ValueError("手动标定的实际长度必须大于零。")
         pixel_length = self.pixel_length
         if not math.isfinite(pixel_length) or pixel_length <= 0:
-            raise ValueError("Manual calibration line must have a positive pixel length.")
+            raise ValueError("手动标定线的像素长度必须大于零。")
         return self.known_length_nm / pixel_length
+
+    def to_calibration(self) -> Calibration:
+        return Calibration(self.nm_per_pixel, f"手动标定：{self.known_length_nm:g} nm / {self.pixel_length:.1f} px")
 
 
 @dataclass(frozen=True)
@@ -246,11 +249,11 @@ def parse_scale_nm(value: str) -> float:
         flags=re.IGNORECASE,
     )
     if not match:
-        raise ValueError(f"Invalid scale length: {value!r}. Use values like 500nm or 1um.")
+        raise ValueError(f"无法识别长度 {value!r}，请输入数字加单位，例如 500nm 或 1um。")
     unit = normalize_unit(match.group(2))
     length_nm = float(match.group(1)) * UNIT_TO_NM[unit]
     if not math.isfinite(length_nm) or length_nm <= 0:
-        raise ValueError("Scale length must be a finite value greater than zero.")
+        raise ValueError("长度必须大于零。")
     return length_nm
 
 
@@ -550,8 +553,8 @@ def choose_scale_nm(
             raise ValueError("Fixed scale length must be a finite value greater than zero.")
         if fixed_scale_nm > field_width_nm * (1.0 + 1e-12):
             raise ValueError(
-                f"Fixed scale {format_scale_label(fixed_scale_nm)} exceeds the image field width "
-                f"of {format_scale_label(field_width_nm)}."
+                f"固定标尺 {format_scale_label(fixed_scale_nm)} 超出了图像视野宽度 "
+                f"{format_scale_label(field_width_nm)}。"
             )
         return fixed_scale_nm
 
@@ -585,7 +588,7 @@ def hex_color(value: str) -> str:
     value = value.lstrip("#")
     if re.fullmatch(r"[0-9a-fA-F]{6}", value):
         return value.upper()
-    raise ValueError("Color must be a name like white or a hex value like #FFFFFF")
+    raise ValueError("颜色必须是 white 这样的名称，或 #FFFFFF 这样的十六进制值。")
 
 
 def prepare_slide_item(
@@ -600,20 +603,11 @@ def prepare_slide_item(
     with Image.open(path) as image:
         width_px, height_px = image.size
         if calibration_override is not None:
-            calibration = Calibration(
-                calibration_override.nm_per_pixel,
-                (
-                    "manual calibration: "
-                    f"{calibration_override.known_length_nm:g} nm / "
-                    f"{calibration_override.pixel_length:.1f} px"
-                ),
-            )
+            calibration = calibration_override.to_calibration()
         else:
             calibration = parse_sem_metadata(image)
         if not calibration:
-            raise ValueError(
-                f"No pixel calibration found for {path.name}. Add embedded metadata or provide a manual calibration."
-            )
+            raise ValueError(f"{path.name} 没有像素标定：图片里没有可识别的元数据，也没有手动标定。")
         png_path = temp_dir / f"{index:05d}_{path.stem}.png"
         convert_image_to_png(image, png_path)
         try:
@@ -649,7 +643,7 @@ def fit_image(width_px: int, height_px: int, slide_w: int, slide_h: int, margin:
     max_w = slide_w - margin * 2
     max_h = slide_h - margin * 2
     if max_w <= 0 or max_h <= 0:
-        raise ValueError("Page margin is too large for the output page size.")
+        raise ValueError("页边距过大，页面放不下图片。")
     scale = min(max_w / width_px, max_h / height_px)
     image_w = int(round(width_px * scale))
     image_h = int(round(height_px * scale))
@@ -666,7 +660,7 @@ def fit_tight_page(width_px: int, height_px: int, max_page_w: int, max_page_h: i
     max_image_w = max_page_w - margin * 2
     max_image_h = max_page_h - margin * 2
     if max_image_w <= 0 or max_image_h <= 0:
-        raise ValueError("Page margin is too large for the output page size.")
+        raise ValueError("页边距过大，页面放不下图片。")
     scale = min(max_image_w / width_px, max_image_h / height_px)
     image_w = int(round(width_px * scale))
     image_h = int(round(height_px * scale))

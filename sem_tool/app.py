@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import cast
 
-from PySide6.QtCore import QSize, QTimer, Slot
+from PySide6.QtCore import QLibraryInfo, QLocale, QSize, QTimer, QTranslator, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -106,9 +106,21 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+def install_qt_translation(app: QApplication) -> QTranslator | None:
+    """Give Qt's own texts (dialog buttons, the text-field context menu) the interface language."""
+    translator = QTranslator()
+    directory = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
+    if not translator.load(QLocale(QLocale.Language.Chinese, QLocale.Country.China), "qtbase", "_", directory):
+        return None  # a Qt build shipped without translations keeps its English defaults
+    translator.setParent(app)
+    app.installTranslator(translator)
+    return translator
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("SEMTool")
+    install_qt_translation(app)
     window = MainWindow()
     if len(sys.argv) > 1:
         window.annotation_panel.add_paths([Path(argument) for argument in sys.argv[1:]])

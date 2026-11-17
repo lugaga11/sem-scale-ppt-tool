@@ -70,6 +70,8 @@ OUTPUT_FORMATS = {
     "PPTX": "pptx",
     "SVG": "svg",
 }
+# The 16:9 page is 7.5 inch high, so a margin has to stay clear of half of that on each side.
+MAX_MARGIN_INCHES = 3.5
 
 
 def label_for_value(options: dict[str, str], value: str) -> str:
@@ -205,7 +207,12 @@ class AnnotationPanel(QWidget):
         self.font_spin.setSuffix(" pt")
         self.font_bold_check = QCheckBox("加粗")
         self.font_bold_check.setChecked(bool(DEFAULTS["font_bold"]))
-        self.margin_edit = QLineEdit(f"{DEFAULT_MARGIN_INCHES:g}")
+        self.margin_spin = NoWheelDoubleSpinBox()
+        self.margin_spin.setRange(0.0, MAX_MARGIN_INCHES)
+        self.margin_spin.setDecimals(2)
+        self.margin_spin.setSingleStep(0.05)
+        self.margin_spin.setSuffix(" inch")
+        self.margin_spin.setValue(DEFAULT_MARGIN_INCHES)
         self.inset_x_spin = NoWheelSpinBox()
         self.inset_x_spin.setRange(0, 40)
         self.inset_x_spin.setValue(DEFAULTS["inset_x_percent"])
@@ -253,7 +260,7 @@ class AnnotationPanel(QWidget):
         advanced_form.addRow("纵向内缩", self.inset_y_spin)
         advanced_form.addRow("字体大小", self.font_spin)
         advanced_form.addRow("字体样式", self.font_bold_check)
-        advanced_form.addRow("页边距 inch", self.margin_edit)
+        advanced_form.addRow("页边距", self.margin_spin)
         self.advanced_options.setVisible(False)
         settings_layout.addWidget(self.advanced_options)
 
@@ -430,10 +437,7 @@ class AnnotationPanel(QWidget):
         key = path_key(path)
         override = self.calibration_overrides.get(key)
         if override is not None:
-            return Calibration(
-                override.nm_per_pixel,
-                f"手动标定：{override.known_length_nm:g} nm / {override.pixel_length:.1f} px",
-            )
+            return override.to_calibration()
         self.inspect_metadata_calibration(path)
         return self.metadata_calibrations.get(key)
 
@@ -849,7 +853,6 @@ class AnnotationPanel(QWidget):
             bar_color = self.bar_color()
             if bar_color is None:
                 raise ValueError("标尺颜色无效，请输入 white 这样的名称或 #FFFFFF 这样的十六进制值。")
-            margin = float(self.margin_edit.text().strip())
             fixed_scale = None if self.auto_scale_check.isChecked() else self.fixed_scale_edit.text().strip()
             if fixed_scale == "":
                 raise ValueError("请输入固定长度，例如 1um 或 500nm。")
@@ -864,7 +867,7 @@ class AnnotationPanel(QWidget):
                 "bar_color": bar_color,
                 "font_size": self.font_spin.value() or None,
                 "font_bold": self.font_bold_check.isChecked(),
-                "margin_inches": margin,
+                "margin_inches": float(self.margin_spin.value()),
                 "inset_x_percent": float(self.inset_x_spin.value()),
                 "inset_y_percent": float(self.inset_y_spin.value()),
                 "line_width_pt": float(self.line_width_spin.value()),

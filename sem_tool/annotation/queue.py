@@ -16,7 +16,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QCursor, QDrag, QFont, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QCursor, QDrag, QDragLeaveEvent, QFont, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..image_widgets import load_display_pixmap
-from ..theme import CHECK_SIZE, COLORS, FONT_BODY, FONT_CAPTION, RADIUS_SMALL, icon
+from ..theme import CHECK_SIZE, COLORS, FONT_BODY, FONT_CAPTION, RADIUS, RADIUS_SMALL, SPACE, icon
 from ..widgets import EmptyState, describe
 from .core import DEFAULTS
 from .hover import ImageHoverCard
@@ -59,7 +59,7 @@ class GenerateCheckDelegate(QStyledItemDelegate):
         background.features &= ~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
         self.table.style().drawControl(QStyle.ControlElement.CE_ItemViewItem, background, painter, self.table)
         if option.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(option.rect.left(), option.rect.top() + 10, 3, option.rect.height() - 20, QColor(COLORS.primary))
+            painter.fillRect(option.rect.left(), option.rect.top() + SPACE.sm, 3, option.rect.height() - 2 * SPACE.sm, QColor(COLORS.primary))
         indicator = QStyleOptionButton()
         indicator.rect = self.indicator_rect(option)
         indicator.state = QStyle.StateFlag.State_Enabled if index.flags() & Qt.ItemFlag.ItemIsEnabled else QStyle.StateFlag.State_None
@@ -97,7 +97,7 @@ class FileNameDelegate(QStyledItemDelegate):
 
     @staticmethod
     def thumbnail_rect(cell: QRect) -> QRect:
-        return QRect(cell.left() + 8, cell.center().y() - 22, 64, 44)
+        return QRect(cell.left() + SPACE.sm, cell.center().y() - 22, 64, 44)
 
     @Slot()
     def load_next_thumbnail(self) -> None:
@@ -139,7 +139,7 @@ class FileNameDelegate(QStyledItemDelegate):
         image_rect = self.thumbnail_rect(option.rect)
         painter.setPen(QPen(QColor(COLORS.border), 1))
         painter.setBrush(QColor(COLORS.subtle))
-        painter.drawRoundedRect(image_rect.adjusted(-2, -2, 2, 2), RADIUS_SMALL + 1, RADIUS_SMALL + 1)
+        painter.drawRoundedRect(image_rect.adjusted(-SPACE.xs, -SPACE.xs, SPACE.xs, SPACE.xs), RADIUS, RADIUS)
         if thumbnail is not None and not thumbnail.isNull():
             self.thumbnails.move_to_end(key)
             target = QRect(0, 0, thumbnail.width(), thumbnail.height())
@@ -157,7 +157,8 @@ class FileNameDelegate(QStyledItemDelegate):
             painter.setPen(QColor(COLORS.muted))
             painter.drawText(image_rect, Qt.AlignmentFlag.AlignCenter, path.suffix.lstrip(".").upper())
 
-        text_rect = option.rect.adjusted(86, 9, -8, -9)
+        text_rect = option.rect.adjusted(0, SPACE.sm, -SPACE.sm, -SPACE.sm)
+        text_rect.setLeft(image_rect.right() + 1 + SPACE.md)
         font = QFont(option.font)
         font.setPixelSize(FONT_BODY)
         font.setWeight(QFont.Weight.Medium)
@@ -199,10 +200,12 @@ class FileQueueWidget(QTableWidget):
         self.drag_start_row = -1
         self.dragged_row: int | None = None
         self.drop_indicator_row: int | None = None
+        self.drop_position: QPoint | None = None
 
         self.setAcceptDrops(True)
         self.setDragEnabled(False)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.setDropIndicatorShown(False)
         self.setAutoScroll(True)
         self.setAutoScrollMargin(36)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -299,6 +302,7 @@ class FileQueueWidget(QTableWidget):
 
     def hideEvent(self, event) -> None:
         self.dismiss_hover()
+        self.dragLeaveEvent(QDragLeaveEvent())
         super().hideEvent(event)
 
     def eventFilter(self, watched, event) -> bool:
@@ -318,23 +322,32 @@ class FileQueueWidget(QTableWidget):
         self.dragMoveEvent(event)
 
     def dragMoveEvent(self, event) -> None:
+        if not (event.mimeData().hasUrls() or self.is_queue_drag(event)):
+            self.dragLeaveEvent(QDragLeaveEvent())
+            event.ignore()
+            return
+
+        # Our MIME is handled outside the table model; Qt still owns edge scrolling.
+        self.setState(QAbstractItemView.State.DraggingState)
+        super().dragMoveEvent(event)
         if event.mimeData().hasUrls():
             self.clear_drop_indicator()
             event.setDropAction(Qt.DropAction.CopyAction)
             event.acceptProposedAction()
-        elif self.is_queue_drag(event):
-            self.set_drop_indicator(self.drop_row(event))
+        else:
+            position: QPoint = event.position().toPoint()
+            self.drop_position = position
+            self.set_drop_indicator(self.drop_row(position))
             event.setDropAction(Qt.DropAction.MoveAction)
             event.accept()
-        else:
-            event.ignore()
 
     def dragLeaveEvent(self, event) -> None:
         self.clear_drop_indicator()
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event) -> None:
-        self.clear_drop_indicator()
+        # Stop edge scrolling at release; our handler moves the row exactly once.
+        self.dragLeaveEvent(QDragLeaveEvent())
         if event.mimeData().hasUrls():
             paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
             self.paths_dropped.emit(paths)
@@ -342,11 +355,16 @@ class FileQueueWidget(QTableWidget):
             event.acceptProposedAction()
         elif self.is_queue_drag(event):
             assert self.dragged_row is not None
-            self.row_reorder_requested.emit(self.dragged_row, self.drop_row(event))
+            self.row_reorder_requested.emit(self.dragged_row, self.drop_row(event.position().toPoint()))
             event.setDropAction(Qt.DropAction.MoveAction)
             event.accept()
         else:
             event.ignore()
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:
+        super().scrollContentsBy(dx, dy)
+        if self.drop_position is not None:
+            self.set_drop_indicator(self.drop_row(self.drop_position))
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -360,8 +378,8 @@ class FileQueueWidget(QTableWidget):
         pen = QPen(color, 3)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
-        left = 8
-        right = self.viewport().width() - 8
+        left = SPACE.sm
+        right = self.viewport().width() - SPACE.sm
         painter.drawLine(left, y, right, y)
         painter.setBrush(color)
         painter.setPen(Qt.PenStyle.NoPen)
@@ -416,10 +434,9 @@ class FileQueueWidget(QTableWidget):
             drag.exec(Qt.DropAction.MoveAction)
         finally:
             self.dragged_row = None
-            self.clear_drop_indicator()
+            self.dragLeaveEvent(QDragLeaveEvent())
 
-    def drop_row(self, event) -> int:
-        position = event.position().toPoint()
+    def drop_row(self, position: QPoint) -> int:
         index = self.indexAt(position)
         if not index.isValid():
             return self.rowCount()
@@ -447,6 +464,7 @@ class FileQueueWidget(QTableWidget):
             self.viewport().update()
 
     def clear_drop_indicator(self) -> None:
+        self.drop_position = None
         if self.drop_indicator_row is None:
             return
         self.drop_indicator_row = None
@@ -478,7 +496,7 @@ class MeasurementCellWidget(QWidget):
         self.calibration_available = True
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 0, 12, 0)
+        layout.setContentsMargins(SPACE.sm, 0, SPACE.md, 0)
         layout.setSpacing(0)
         layout.addWidget(self.edit_button)
         layout.addStretch()

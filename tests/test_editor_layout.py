@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QApplication, QDialog
 
 from sem_tool.annotation.core import Calibration, MeasurementOverride
 from sem_tool.annotation.preview import CalibrationDialog, MeasurementPreviewDialog
-from sem_tool.theme import apply_theme
+from sem_tool.theme import COLORS, apply_theme
 
 
 class CompactEditorTests(unittest.TestCase):
@@ -79,11 +79,15 @@ class CompactEditorTests(unittest.TestCase):
         QTest.keyClicks(edit, "0nm")
         self.assertFalse(dialog.apply_button.isEnabled())
         self.assertEqual(dialog.calibration_result_label.text(), "长度无效")
+        self.assertEqual(edit.palette().text().color().name(), COLORS.error)
+        self.assertEqual(dialog.calibration_result_label.palette().windowText().color().name(), COLORS.error)
         with self.assertRaises(ValueError):
             dialog.calculated_override()
         edit.selectAll()
         QTest.keyClicks(edit, "500nm")
         self.assertTrue(dialog.apply_button.isEnabled())
+        self.assertNotEqual(edit.palette().text().color().name(), COLORS.error)
+        self.assertNotEqual(dialog.calibration_result_label.palette().windowText().color().name(), COLORS.error)
         QTest.keyClick(edit, Qt.Key.Key_Return)
         self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
         result = dialog.result_calibration_override()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import gc
 import os
 import tempfile
@@ -7,6 +8,7 @@ import threading
 import unittest
 import weakref
 from contextlib import closing
+from io import BytesIO
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
@@ -18,10 +20,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
-from PySide6.QtGui import QDrag, QDragEnterEvent, QDropEvent
+from pptx import Presentation
+from pptx.shapes.picture import Picture
+from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QMimeData, QPoint, QPointF, QRect, Qt, QTimer, QUrl
+from PySide6.QtGui import QDrag, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from sem_tool.annotation.core import CalibrationOverride, MeasurementOverride
 from sem_tool.annotation.preview import CalibrationDialog, MeasurementPreviewDialog
@@ -33,7 +37,8 @@ from sem_tool.search.index import ImageIndex, IndexJob, IndexResult, IndexStatus
 from sem_tool.search.ui import CLIPBOARD_KEEP_DAYS, ResultWidget, prune_clipboard_images
 from sem_tool.search.worker import ProgressThrottler, SearchWorker
 from sem_tool.settings import AppSettings, default_db_path
-from sem_tool.theme import apply_theme
+from sem_tool.theme import COLORS, apply_theme
+from sem_tool.widgets import HelpPopover
 
 
 def texture(seed: int = 10) -> Image.Image:
@@ -278,8 +283,10 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         panel.remove_selected()
         self.assertEqual(panel.file_list.rowCount(), 1)
         self.assertNotIn(str(second), thumbnails)
-        panel.clear_queue()
+        self.assertTrue(panel.clear_queue_button.isEnabled())
+        QTest.mouseClick(panel.clear_queue_button, Qt.MouseButton.LeftButton)
         self.assertEqual(panel.file_list.rowCount(), 0)
+        self.assertFalse(panel.clear_queue_button.isEnabled())
         self.assertFalse(thumbnails)
 
     def test_unreadable_thumbnail_does_not_reuse_another_image(self) -> None:
@@ -327,6 +334,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.assertEqual(queue_changes, [[original, second]])
 
         actions = {action.text(): action for action in panel.queue_menu.actions()}
+        self.assertEqual(set(actions), {"添加文件…", "添加文件夹…"})
         with patch("sem_tool.annotation.ui.QFileDialog.getOpenFileNames", return_value=([str(original)], "")):
             actions["添加文件…"].trigger()
         with patch("sem_tool.annotation.ui.QFileDialog.getExistingDirectory", return_value=str(folder)):
@@ -421,6 +429,30 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
             QTest.mouseRelease(queue.viewport(), Qt.MouseButton.LeftButton, pos=position)
             open_original.assert_called_once_with(original.resolve())
 
+    def drop_queue_row(self, source_row: int, position: QPoint) -> None:
+        queue = self.window.annotation_panel.file_list
+
+        class QueueEnterEvent(QDragEnterEvent):
+            def source(self):
+                return queue
+
+        class QueueDropEvent(QDropEvent):
+            def source(self):
+                return queue
+
+        def drop(drag, action):
+            mime = drag.mimeData()
+            enter = QueueEnterEvent(position, action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+            self.app.sendEvent(queue.viewport(), enter)
+            self.assertTrue(enter.isAccepted())
+            event = QueueDropEvent(QPointF(position), action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+            self.app.sendEvent(queue.viewport(), event)
+            self.assertTrue(event.isAccepted())
+            return action
+
+        with patch.object(QDrag, "exec", new=drop):
+            queue.start_queue_row_drag(source_row)
+
     def test_single_row_drag_preserves_queue_state_in_both_directions(self) -> None:
         paths = [self.make_original(f"{number}.tif") for number in range(3)]
         panel = self.window.annotation_panel
@@ -434,14 +466,6 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.app.processEvents()
         queue = panel.file_list
 
-        class QueueEnterEvent(QDragEnterEvent):
-            def source(self):
-                return queue
-
-        class QueueDropEvent(QDropEvent):
-            def source(self):
-                return queue
-
         for source_row, target_row, at_bottom, expected in (
             (0, 2, True, [paths[1], paths[2], paths[0]]),
             (2, 0, False, paths),
@@ -451,18 +475,7 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
                 rect = queue.visualRect(queue.model().index(target_row, 1))
                 position = QPoint(rect.center().x(), rect.bottom() - 1 if at_bottom else rect.top() + 1)
 
-                def drop(drag, action):
-                    mime = drag.mimeData()
-                    enter = QueueEnterEvent(position, action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
-                    self.app.sendEvent(queue.viewport(), enter)
-                    self.assertTrue(enter.isAccepted())
-                    event = QueueDropEvent(QPointF(position), action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
-                    self.app.sendEvent(queue.viewport(), event)
-                    self.assertTrue(event.isAccepted())
-                    return action
-
-                with patch.object(QDrag, "exec", new=drop):
-                    queue.start_queue_row_drag(source_row)
+                self.drop_queue_row(source_row, position)
                 self.assertEqual([panel.item_path(row) for row in range(3)], expected)
                 self.assertEqual(panel.checked_paths(), [path for path in expected if path != paths[0]])
                 self.assertEqual(panel.measurement_overrides[path_key(paths[0])], [annotation])
@@ -475,6 +488,191 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
             queue.start_queue_row_drag(0)
         self.assertEqual([panel.item_path(row) for row in range(3)], paths)
         self.assertIsNone(queue.dragged_row)
+
+    def test_drag_keeps_viewport_and_exports_checked_images_in_drop_order(self) -> None:
+        paths = [self.root / f"{n:02d}.tif" for n in range(1, 25)]
+        for n, path in enumerate(paths, 1):
+            Image.new("I;16", (160, 96), n * 1000).save(path, tiffinfo={270: "PixelSize=2.5"})
+        panel = self.window.annotation_panel
+        panel.add_paths(paths)
+        for row in range(len(paths)):
+            panel.set_row_checked(row, row in (9, 10, 12, 13))
+        self.window.resize(940, 620)
+        self.window.show()
+        self.app.processEvents()
+        queue = panel.file_list
+        queue.verticalScrollBar().setValue(9)
+        queue.selectRow(10)  # 11.tif
+        viewport = queue.verticalScrollBar().value()
+        neighbor = panel.measurement_cell(12)
+        dest = queue.visualRect(queue.model().index(13, 1))
+        position = QPoint(dest.center().x(), dest.bottom() - 4)  # after 14.tif
+        self.assertTrue(queue.viewport().rect().contains(position))
+        self.drop_queue_row(10, position)
+        self.app.processEvents()
+        self.assertEqual(queue.verticalScrollBar().value(), viewport)
+        self.assertEqual(panel.selected_rows(), [13])
+        self.assertIs(panel.measurement_cell(11), neighbor)
+        expected = [10, 13, 14, 11]
+        self.assertEqual(panel.checked_paths(), [paths[n - 1] for n in expected])
+
+        for fmt in ("PPTX", "SVG"):
+            panel.output_format_control.buttons[fmt].setChecked(True)
+            panel.output_edit.setText(str(self.root / f"order.{fmt.lower()}"))
+            QTest.mouseClick(panel.generate_button, Qt.MouseButton.LeftButton)
+            self.wait_until(lambda: panel.thread is None)
+        self.assertEqual([title for title, _ in self.messages], ["完成", "完成"])
+
+        slides = Presentation(str(self.root / "order.pptx")).slides
+        self.assertEqual(len(slides), len(expected))
+        for slide, n in zip(slides, expected):
+            picture, = [shape for shape in slide.shapes if isinstance(shape, Picture)]
+            with Image.open(BytesIO(picture.image.blob)) as png:
+                self.assertEqual(png.getextrema(), (n * 1000, n * 1000))
+        files = sorted(self.root.glob("order_*.svg"))
+        self.assertEqual([p.name for p in files], [f"order_{i:02d}_{n:02d}.svg" for i, n in enumerate(expected, 1)])
+        for path, n in zip(files, expected):
+            embedded, = ElementTree.parse(path).getroot().findall("{http://www.w3.org/2000/svg}image")
+            uri = embedded.attrib["{http://www.w3.org/1999/xlink}href"]
+            with Image.open(BytesIO(base64.b64decode(uri.split(",", 1)[1]))) as png:
+                self.assertEqual(png.getextrema(), (n * 1000, n * 1000))
+
+    def test_queue_drag_autoscrolls_to_both_ends_and_drops_at_the_indicator(self) -> None:
+        paths = [self.make_original(f"{number}.tif") for number in range(24)]
+        panel = self.window.annotation_panel
+        panel.add_paths(paths)
+        panel.set_row_checked(0, False)
+        annotation = MeasurementOverride("distance", 0, 20, 100, 20)
+        calibration = CalibrationOverride(500, 0, 0, 100, 0)
+        panel.measurement_overrides[path_key(paths[0])] = [annotation]
+        panel.calibration_overrides[path_key(paths[0])] = calibration
+        self.window.show()
+        self.app.processEvents()
+        queue = panel.file_list
+        scroll = queue.verticalScrollBar()
+        self.assertGreater(scroll.maximum(), 0)
+
+        class QueueEnterEvent(QDragEnterEvent):
+            def source(self):
+                return queue
+
+        class QueueMoveEvent(QDragMoveEvent):
+            def source(self):
+                return queue
+
+        class QueueDropEvent(QDropEvent):
+            def source(self):
+                return queue
+
+        for down in (True, False):
+            with self.subTest(down=down):
+                source_row = 0 if down else len(paths) - 1
+                scroll.setValue(scroll.minimum() if down else scroll.maximum())
+                center = queue.viewport().rect().center()
+                edge = QPoint(center.x(), queue.viewport().height() - 2 if down else 2)
+
+                def drop_after_scrolling(drag, action):
+                    mime = drag.mimeData()
+                    enter = QueueEnterEvent(center, action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+                    self.app.sendEvent(queue.viewport(), enter)
+                    self.assertTrue(enter.isAccepted())
+                    move = QueueMoveEvent(edge, action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+                    self.app.sendEvent(queue.viewport(), move)
+                    self.assertTrue(move.isAccepted())
+                    initial_indicator = queue.drop_indicator_row
+                    target = scroll.maximum() if down else scroll.minimum()
+                    # One drag move must keep scrolling while the pointer stays at the edge.
+                    self.wait_until(lambda: scroll.value() == target, timeout=5)
+                    self.assertNotEqual(queue.drop_indicator_row, initial_indicator)
+                    self.assertEqual(queue.drop_indicator_row, len(paths) if down else 0)
+                    event = QueueDropEvent(QPointF(edge), action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+                    self.app.sendEvent(queue.viewport(), event)
+                    self.assertTrue(event.isAccepted())
+                    return action
+
+                with patch.object(QDrag, "exec", new=drop_after_scrolling):
+                    queue.start_queue_row_drag(source_row)
+                expected = paths[1:] + paths[:1] if down else paths
+                self.assertEqual([panel.item_path(row) for row in range(len(paths))], expected)
+                self.assertEqual(panel.checked_paths(), [path for path in expected if path != paths[0]])
+                self.assertEqual(panel.measurement_overrides[path_key(paths[0])], [annotation])
+                self.assertEqual(panel.calibration_overrides[path_key(paths[0])], calibration)
+                self.assertEqual([panel.item_path(row) for row in panel.selected_rows()], [paths[0]])
+                self.assertIsNone(queue.dragged_row)
+                self.assertIsNone(queue.drop_indicator_row)
+
+    def test_queue_drag_stops_scrolling_when_pointer_returns_or_drag_ends(self) -> None:
+        panel = self.window.annotation_panel
+        panel.add_paths([self.make_original(f"{number}.tif") for number in range(24)])
+        self.window.show()
+        self.app.processEvents()
+        queue = panel.file_list
+        scroll = queue.verticalScrollBar()
+        center = queue.viewport().rect().center()
+        edge = QPoint(center.x(), queue.viewport().height() - 2)
+
+        class QueueEnterEvent(QDragEnterEvent):
+            def source(self):
+                return queue
+
+        class QueueMoveEvent(QDragMoveEvent):
+            def source(self):
+                return queue
+
+        class QueueDropEvent(QDropEvent):
+            def source(self):
+                return queue
+
+        def assert_scroll_stopped():
+            value = scroll.value()
+            loop = QEventLoop()
+            timer = QTimer()
+            timer.setSingleShot(True)
+            timer.timeout.connect(loop.quit)
+            timer.start(400)
+            loop.exec()
+            timer.stop()
+            self.assertEqual(scroll.value(), value)
+
+        for finish in ("center", "leave", "drop", "cancel", "foreign_source"):
+            with self.subTest(finish=finish):
+                scroll.setValue(0)
+
+                def finish_drag(drag, action):
+                    mime = drag.mimeData()
+                    enter = QueueEnterEvent(center, action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+                    self.app.sendEvent(queue.viewport(), enter)
+                    move = QueueMoveEvent(edge, action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+                    self.app.sendEvent(queue.viewport(), move)
+                    self.wait_until(lambda: scroll.value() > 0, timeout=2)
+                    self.assertLess(scroll.value(), scroll.maximum())
+                    if finish == "center":
+                        move = QueueMoveEvent(center, action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+                        self.app.sendEvent(queue.viewport(), move)
+                    elif finish == "leave":
+                        self.app.sendEvent(queue.viewport(), QDragLeaveEvent())
+                        self.assertIsNone(queue.drop_indicator_row)
+                    elif finish == "drop":
+                        event = QueueDropEvent(QPointF(center), action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+                        self.app.sendEvent(queue.viewport(), event)
+                        self.assertTrue(event.isAccepted())
+                        self.assertIsNone(queue.drop_indicator_row)
+                    elif finish == "foreign_source":
+                        # The MIME marker alone must not authorize a drag from another widget.
+                        foreign = QDragMoveEvent(edge, action, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+                        self.app.sendEvent(queue.viewport(), foreign)
+                        self.assertFalse(foreign.isAccepted())
+                        self.assertIsNone(queue.drop_indicator_row)
+                    else:
+                        return Qt.DropAction.IgnoreAction  # cancellation without a drag-leave event
+                    assert_scroll_stopped()
+                    return action if finish == "drop" else Qt.DropAction.IgnoreAction
+
+                with patch.object(QDrag, "exec", new=finish_drag):
+                    queue.start_queue_row_drag(0)
+                self.assertIsNone(queue.drop_indicator_row)
+                self.assertIsNone(queue.dragged_row)
+                assert_scroll_stopped()
 
     def test_queue_checkboxes_and_scale_controls_respond_to_mouse_and_keyboard(self) -> None:
         panel = self.window.annotation_panel
@@ -808,12 +1006,73 @@ class SearchAnnotationWorkflowTests(unittest.TestCase):
         self.assertIn("其他文件夹", item.text())
         override = MeasurementOverride("distance", 1, 1, 11, 1)
         panel.measurement_overrides[path_key(second)] = [override]
-        panel.reorder_queue_row(0, 2)
+        # Models without native moveRow support must preserve duplicate-name labels as well.
+        neighbor = panel.measurement_cell(1)
+        with patch.object(panel.file_list.model(), "moveRow", return_value=False):
+            panel.reorder_queue_row(0, 2)
+        self.assertIs(panel.file_list.item(1, 1), item)
+        self.assertIs(panel.measurement_cell(0), neighbor)
         self.assertEqual(panel.checked_paths(), [first, second])
         self.assertEqual(panel.measurement_overrides_for_generation()[second], [override])
         panel.clear_queue()
         self.assertFalse(panel.measurement_overrides)
         self.assertEqual(self.window.tabs.tabText(0), "标注与导出 (0)")
+
+    def test_popups_paint_a_rounded_surface_and_keep_native_controls(self) -> None:
+        def check_frame(popup: QWidget) -> None:
+            self.wait_until(popup.isVisible)
+            image = popup.grab().toImage()
+            right, bottom = image.width() - 1, image.height() - 1
+            for x, y in ((0, 0), (right, 0), (0, bottom), (right, bottom)):
+                self.assertEqual(image.pixelColor(x, y).alpha(), 0)
+            edge = image.pixelColor(right // 2, 0)
+            inside = image.pixelColor(right // 2, round(2 * image.devicePixelRatio()))
+            self.assertGreater(edge.alpha(), 0)
+            self.assertNotEqual(edge, inside)
+            self.assertEqual((inside.name(), inside.alpha()), (COLORS.surface, 255))
+
+        self.window.show()
+        panel = self.window.annotation_panel
+        source = self.make_original()
+        menu = panel.queue_menu
+        menu.popup(self.window.mapToGlobal(QPoint(40, 40)))
+        check_frame(menu)
+        QTest.keyClick(menu, Qt.Key.Key_Down)
+        self.assertEqual(menu.activeAction(), menu.actions()[0])
+        QTest.keyClick(menu, Qt.Key.Key_Escape)
+        self.assertFalse(menu.isVisible())
+
+        combo = panel.position_combo
+        combo.setCurrentIndex(0)
+        combo.showPopup()
+        view = combo.view()
+        check_frame(view.window())
+        last = combo.count() - 1
+        row = view.visualRect(combo.model().index(last, 0))
+        self.assertTrue(view.viewport().rect().contains(row))
+        QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=row.center())
+        self.assertEqual(combo.currentIndex(), last)
+        self.assertFalse(view.window().isVisible())
+
+        hover = panel.file_list.hover_card
+        hover.show_image(source, "测试标定", QRect(100, 100, 64, 48))
+        check_frame(hover)
+        hover.hide()
+        dialog = CalibrationDialog(source, None, None)
+        try:
+            dialog.show()
+            QTest.mouseClick(dialog.help_button, Qt.MouseButton.LeftButton)
+            help_card = dialog.help_button.findChild(HelpPopover)
+            if help_card is None:
+                self.fail("The help button did not create a popover")
+            check_frame(help_card)
+            self.assertTrue(help_card.screen().availableGeometry().contains(help_card.geometry()))
+            QTest.keyClick(help_card, Qt.Key.Key_Escape)
+            self.assertFalse(help_card.isVisible())
+            self.assertTrue(dialog.isVisible())
+        finally:
+            dialog.close()
+            dialog.deleteLater()
 
     def test_qt_dialog_buttons_and_field_menus_follow_the_interface_language(self) -> None:
         translator = install_qt_translation(self.app)

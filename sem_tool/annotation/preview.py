@@ -22,8 +22,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..image_widgets import qimage_from_pil
-from ..theme import COLORS, COMPACT_HEIGHT, FONT_BODY, RADIUS_SMALL, icon
-from ..widgets import HelpPopover, SegmentedControl, describe, restyle
+from ..theme import COLORS, COMPACT_HEIGHT, FONT_BODY, RADIUS_SMALL, SPACE, icon
+from ..widgets import HelpPopover, SegmentedControl, describe, set_semantic_state
 from .core import (
     Calibration,
     CalibrationOverride,
@@ -46,8 +46,8 @@ def editor_bar() -> tuple[QFrame, QHBoxLayout]:
     frame = QFrame()
     frame.setProperty("editorBar", True)
     row = QHBoxLayout(frame)
-    row.setContentsMargins(10, 6, 10, 6)
-    row.setSpacing(8)
+    row.setContentsMargins(SPACE.sm, SPACE.xs, SPACE.sm, SPACE.xs)
+    row.setSpacing(SPACE.sm)
     return frame, row
 
 
@@ -62,14 +62,14 @@ INTERFACE_BOTTOM_COLOR = "#FF4D4D"
 LABEL_BACKDROP = QColor(0, 0, 0, 150)
 
 
-def editor_help_button(html: str) -> QToolButton:
+def editor_help_button(title: str, *paragraphs: str, note: str) -> QToolButton:
     button = QToolButton()
     button.setText("?")
     button.setProperty("shape", "icon")
     button.setFixedSize(COMPACT_HEIGHT, COMPACT_HEIGHT)
     button.setToolTip("操作说明")
     button.setAccessibleName("操作说明")
-    popover = HelpPopover(html, button)
+    popover = HelpPopover(title, paragraphs, note, button)
     button.clicked.connect(lambda: popover.show_below(button))
     return button
 
@@ -549,7 +549,7 @@ class MeasurementPreviewWidget(QWidget):
     @staticmethod
     def draw_label(painter: QPainter, baseline: QPointF, text: str, color: QColor) -> None:
         """Text on a dark backdrop, so a value stays readable on bright and dark parts of the image."""
-        box = QRectF(painter.fontMetrics().boundingRect(text)).translated(baseline).adjusted(-5, -2, 5, 2)
+        box = QRectF(painter.fontMetrics().boundingRect(text)).translated(baseline).adjusted(-SPACE.xs, -SPACE.xs, SPACE.xs, SPACE.xs)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(LABEL_BACKDROP)
         painter.drawRoundedRect(box, RADIUS_SMALL, RADIUS_SMALL)
@@ -911,8 +911,8 @@ class CalibrationDialog(QDialog):
             )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(SPACE.sm, SPACE.sm, SPACE.sm, SPACE.sm)
+        layout.setSpacing(SPACE.sm)
         self.toolbar, tool_row = editor_bar()
         tool_icon = QLabel()
         tool_icon.setPixmap(icon("ruler", COLORS.primary).pixmap(17, 17))
@@ -940,11 +940,11 @@ class CalibrationDialog(QDialog):
         describe(self.reset_zoom_button, "重置缩放与平移，完整显示图片")
         tool_row.addWidget(self.reset_zoom_button)
         self.help_button = editor_help_button(
-            "<b>手动标定</b><br>沿已知实际长度拖出标定线，输入对应长度，例如 1um 或 500nm。"
-            "<br>Shift 锁定方向；拖动端点微调，拖动线段整体移动。"
-            "<br>Ctrl + 滚轮缩放，放大后中键拖动平移。"
-            "<br>Ctrl + Z 撤销，Ctrl + Y 重做；Esc 取消正在绘制的线段。"
-            "<br>应用后，手动标定优先于元数据，并用于标尺和所有测量值。"
+            "手动标定",
+            "沿已知长度画线，输入实际长度，如 500 nm 或 1 µm。",
+            "按住 Shift 锁定方向；拖端点微调，拖线段整体移动。",
+            "Ctrl + 滚轮缩放，放大后用中键平移。\nCtrl + Z 撤销，Ctrl + Y 重做，Esc 取消绘制。",
+            note="应用后，标尺和测量值优先使用手动标定。",
         )
         tool_row.addWidget(self.help_button)
         layout.addWidget(self.toolbar)
@@ -969,10 +969,10 @@ class CalibrationDialog(QDialog):
         self.footer = QFrame()
         self.footer.setProperty("editorBar", True)
         footer_layout = QVBoxLayout(self.footer)
-        footer_layout.setContentsMargins(10, 7, 10, 6)
-        footer_layout.setSpacing(4)
+        footer_layout.setContentsMargins(SPACE.sm, SPACE.xs, SPACE.sm, SPACE.xs)
+        footer_layout.setSpacing(SPACE.xs)
         controls = QHBoxLayout()
-        controls.setSpacing(8)
+        controls.setSpacing(SPACE.sm)
         controls.addWidget(QLabel("实际长度"))
         self.known_length_edit = QLineEdit(
             scale_input_from_nm(existing_override.known_length_nm) if existing_override else "1um"
@@ -1040,8 +1040,8 @@ class CalibrationDialog(QDialog):
         self.info_label.setText("手动标定优先于元数据，并用于标尺和所有测量")
         annotation = self.distance_annotation()
         self.clear_button.setEnabled(annotation is not None)
-        self._mark_length_invalid(False)
         if annotation is None:
+            self._mark_length_invalid(False)
             self.pixel_length_label.setText("— px")
             self.calibration_result_label.setText("等待画线")
             describe(self.calibration_result_label, "请沿已知实际长度拖出一条标定线")
@@ -1061,16 +1061,14 @@ class CalibrationDialog(QDialog):
             self.apply_button.setEnabled(False)
             self._mark_length_invalid(True)
         else:
+            self._mark_length_invalid(False)
             self.calibration_result_label.setText(f"{result.nm_per_pixel:.9g} nm/px")
             describe(self.calibration_result_label, f"每像素对应 {result.nm_per_pixel:.9g} nm")
             self.apply_button.setEnabled(True)
 
     def _mark_length_invalid(self, invalid: bool) -> None:
-        state = "invalid" if invalid else ""
         for widget in (self.known_length_edit, self.calibration_result_label):
-            if (widget.property("state") or "") != state:
-                widget.setProperty("state", state)
-                restyle(widget)
+            set_semantic_state(widget, "error" if invalid else "")
 
     def accept(self) -> None:
         try:
@@ -1115,8 +1113,8 @@ class MeasurementPreviewDialog(QDialog):
         self.auto_detection_attempted = False
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(SPACE.sm, SPACE.sm, SPACE.sm, SPACE.sm)
+        layout.setSpacing(SPACE.sm)
         self.toolbar, tool_row = editor_bar()
         self.tool_control = SegmentedControl(list(TOOL_LABELS.values()))
         self.tool_control.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
@@ -1178,12 +1176,11 @@ class MeasurementPreviewDialog(QDialog):
         tool_row.addWidget(self.zoom_label)
         tool_row.addWidget(self.reset_zoom_button)
         self.help_button = editor_help_button(
-            "<b>测量标注</b><br>测距：拖拽添加线段，Shift 锁定方向。"
-            "<br>膜厚：首次点击运行自动识别，建议位置可手动调整。"
-            "<br>拖动端点调整标注，拖动线段整体移动。"
-            "<br>Ctrl + 滚轮缩放，放大后中键拖动平移。"
-            "<br>Ctrl + Z 撤销，Ctrl + Y / Ctrl + Shift + Z 重做，Delete 删除选中。"
-            "<br>Esc 取消正在绘制的线段；点击应用后，标注才会保存到队列并用于导出。"
+            "测量标注",
+            "测距：拖动画线，按住 Shift 锁定方向。\n膜厚：首次点击会识别界面，可手动调整建议位置。",
+            "拖动端点可微调，拖动线段可整体移动。\nCtrl + 滚轮缩放，放大后用中键平移。",
+            "Ctrl + Z 撤销；Ctrl + Y 或 Ctrl + Shift + Z 重做。\nDelete 删除选中标注，Esc 取消绘制。",
+            note="点击「应用标注」后才会保存到队列，用于导出。",
         )
         tool_row.addWidget(self.help_button)
 

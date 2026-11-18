@@ -7,15 +7,16 @@ from pathlib import Path
 
 from PySide6.QtCore import QRect, QSize, Qt
 from PySide6.QtGui import QGuiApplication, QPixmap
-from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QWidget
 
 from ..image_widgets import ImageCanvas, load_display_pixmap
-from ..widgets import ElidedLabel
+from ..theme import SPACE
+from ..widgets import ElidedLabel, PopupCard, set_semantic_state
 
 
-class ImageHoverCard(QFrame):
+class ImageHoverCard(PopupCard):
     def __init__(self, parent: QWidget) -> None:
-        super().__init__(parent, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        super().__init__(parent, Qt.WindowType.ToolTip)
         self.setObjectName("imageHoverCard")
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -25,9 +26,6 @@ class ImageHoverCard(QFrame):
         self.error = ""
         self._signature = None
         self._image_format = ""
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(9)
         self.title = ElidedLabel()
         self.title.setProperty("role", "heading")
         self.image = ImageCanvas("无法读取图片")
@@ -39,15 +37,15 @@ class ImageHoverCard(QFrame):
         self.details.setProperty("role", "hoverDetail")
         self.location = ElidedLabel()
         self.location.setProperty("role", "muted")
-        layout.addWidget(self.title)
-        layout.addWidget(self.image)
-        layout.addWidget(self.metadata)
-        layout.addWidget(self.details)
-        layout.addWidget(self.location)
+        self.body.addWidget(self.title)
+        self.body.addWidget(self.image)
+        self.body.addWidget(self.metadata)
+        self.body.addWidget(self.details)
+        self.body.addWidget(self.location)
 
     def show_image(self, path: Path, detail: str, anchor: QRect) -> None:
         screen = QGuiApplication.screenAt(anchor.center()) or self.screen()
-        available = screen.availableGeometry().adjusted(10, 10, -10, -10)
+        available = screen.availableGeometry().adjusted(SPACE.sm, SPACE.sm, -SPACE.sm, -SPACE.sm)
         self.setFixedWidth(min(470, available.width()))
         self.image.setFixedHeight(min(320, max(100, available.height() - 220)))
         self.title.setText(path.name)
@@ -76,12 +74,13 @@ class ImageHoverCard(QFrame):
             )
             modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
             self.details.setText(f"{detail}\n修改时间：{modified}")
+        set_semantic_state(self.metadata, "error" if self.error else "")
         self.path = path
         self.adjustSize()
-        x = anchor.right() + 14
+        x = anchor.right() + SPACE.md
         if x + self.width() > available.right():
-            x = anchor.left() - self.width() - 14
+            x = anchor.left() - self.width() - SPACE.md
         x = max(available.left(), min(x, available.right() - self.width() + 1))
-        y = max(available.top(), min(anchor.top() - 12, available.bottom() - self.height() + 1))
+        y = max(available.top(), min(anchor.top() - SPACE.md, available.bottom() - self.height() + 1))
         self.move(x, y)
         self.show()

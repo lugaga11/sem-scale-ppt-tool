@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..files import IMAGE_FILE_FILTER, image_paths_from_inputs, natural_key, path_key
-from ..theme import CARD_MARGIN, COLORS, ICON_SIZE, SPACING, icon
+from ..theme import COLORS, ICON_SIZE, SPACE, icon
 from ..widgets import (
     ColorSwatchButton,
     NoWheelComboBox,
@@ -41,6 +41,7 @@ from ..widgets import (
     make_icon_button,
     open_file_or_warn,
     section_heading,
+    set_semantic_state,
 )
 from .core import (
     DEFAULT_MARGIN_INCHES,
@@ -112,9 +113,9 @@ class AnnotationPanel(QWidget):
     def _build_ui(self) -> None:
         self.setObjectName("annotationPanel")
         root_layout = QHBoxLayout(self)
-        root_layout.setContentsMargins(CARD_MARGIN, SPACING, CARD_MARGIN, SPACING)
+        root_layout.setContentsMargins(SPACE.lg, SPACE.md, SPACE.lg, SPACE.md)
         self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.content_splitter.setHandleWidth(SPACING)
+        self.content_splitter.setHandleWidth(SPACE.md)
         self.content_splitter.setChildrenCollapsible(False)
         root_layout.addWidget(self.content_splitter)
         self.content_splitter.addWidget(self._build_queue_card())
@@ -141,17 +142,19 @@ class AnnotationPanel(QWidget):
         sort_button.setProperty("variant", "toolbar")
         make_icon_button(sort_button, "sort", "按文件名自然排序")
         title_row.addWidget(sort_button)
+        self.clear_queue_button = self._button("", self.clear_queue)
+        self.clear_queue_button.setProperty("variant", "toolbar")
+        make_icon_button(self.clear_queue_button, "trash", "清空队列")
+        self.clear_queue_button.setEnabled(False)
+        title_row.addWidget(self.clear_queue_button)
         more_button = QToolButton()
         more_button.setObjectName("queueMoreButton")
         more_button.setProperty("variant", "toolbar")
-        make_icon_button(more_button, "more", "队列操作")
+        make_icon_button(more_button, "more", "添加文件或文件夹")
         more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.queue_menu = QMenu(more_button)
         self.queue_menu.addAction(icon("plus"), "添加文件…", self.choose_input_files)
         self.queue_menu.addAction(icon("folder"), "添加文件夹…", self.choose_input_folder)
-        self.queue_menu.addSeparator()
-        self.queue_menu.addAction("删除选中", self.remove_selected)
-        self.queue_menu.addAction("清空", self.clear_queue)
         more_button.setMenu(self.queue_menu)
         title_row.addWidget(more_button)
         queue_layout.addLayout(title_row)
@@ -176,7 +179,7 @@ class AnnotationPanel(QWidget):
         inspector.setMinimumWidth(300)
         inspector.setMaximumWidth(390)
         layout = QVBoxLayout(inspector)
-        layout.setContentsMargins(1, 6, 1, 1)
+        layout.setContentsMargins(SPACE.xs, SPACE.sm, SPACE.xs, SPACE.xs)
         layout.setSpacing(0)
         self.settings_scroll = QScrollArea()
         self.settings_scroll.setWidgetResizable(True)
@@ -184,8 +187,8 @@ class AnnotationPanel(QWidget):
         settings = QWidget()
         settings.setObjectName("inspectorContents")
         settings_layout = QVBoxLayout(settings)
-        settings_layout.setContentsMargins(CARD_MARGIN, 8, CARD_MARGIN, SPACING)
-        settings_layout.setSpacing(SPACING)
+        settings_layout.setContentsMargins(SPACE.md, SPACE.sm, SPACE.md, SPACE.sm)
+        settings_layout.setSpacing(SPACE.md)
         settings_layout.addLayout(section_heading("标尺设置", "ruler"))
         settings_layout.addLayout(self._build_scale_form())
         settings_layout.addLayout(section_heading("导出设置", "document"))
@@ -195,8 +198,8 @@ class AnnotationPanel(QWidget):
         layout.addWidget(self.settings_scroll, 1)
 
         actions = QVBoxLayout()
-        actions.setContentsMargins(CARD_MARGIN, SPACING, CARD_MARGIN, CARD_MARGIN)
-        actions.setSpacing(8)
+        actions.setContentsMargins(SPACE.md, SPACE.sm, SPACE.md, SPACE.md)
+        actions.setSpacing(SPACE.sm)
         self.export_count = QLabel("已勾选 0 张")
         self.export_count.setProperty("role", "muted")
         actions.addWidget(self.export_count)
@@ -213,8 +216,8 @@ class AnnotationPanel(QWidget):
     def _build_scale_form(self) -> QFormLayout:
         """One form for the everyday and the advanced rows, so every field shares a left edge."""
         self.scale_form = QFormLayout()
-        self.scale_form.setVerticalSpacing(SPACING)
-        self.scale_form.setHorizontalSpacing(SPACING)
+        self.scale_form.setVerticalSpacing(SPACE.md)
+        self.scale_form.setHorizontalSpacing(SPACE.md)
         self.scale_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.auto_scale_check = ToggleSwitch("自动选择标尺长度")
         self.auto_scale_check.setChecked(True)
@@ -223,6 +226,7 @@ class AnnotationPanel(QWidget):
         self.auto_scale_choice.setCurrentText(label_for_value(AUTO_SCALE_PRESETS, DEFAULTS["auto_scale_preset"]))
         self.fixed_scale_edit = QLineEdit(DEFAULTS["fixed_scale"])
         self.fixed_scale_edit.setPlaceholderText("例如 1um 或 500nm")
+        self.fixed_scale_edit.textChanged.connect(self._update_fixed_scale_state)
         self.position_combo = NoWheelComboBox()
         self.position_combo.addItems(list(POSITIONS.keys()))
         self.position_combo.setCurrentText(label_for_value(POSITIONS, DEFAULTS["scale_position"]))
@@ -238,7 +242,7 @@ class AnnotationPanel(QWidget):
         self.color_edit.textChanged.connect(self.update_color_swatch)
         self.update_color_swatch()
         color_row = QHBoxLayout()
-        color_row.setSpacing(8)
+        color_row.setSpacing(SPACE.sm)
         color_row.addWidget(self.color_button)
         color_row.addWidget(self.color_edit)
         automatic_row = QHBoxLayout()
@@ -309,7 +313,7 @@ class AnnotationPanel(QWidget):
         save_button = self._button("", self.choose_output)
         make_icon_button(save_button, "folder", "另存为…")
         output_path_row = QHBoxLayout()
-        output_path_row.setSpacing(8)
+        output_path_row.setSpacing(SPACE.sm)
         output_path_row.addWidget(self.output_edit, 1)
         output_path_row.addWidget(save_button)
         layout.addLayout(output_path_row)
@@ -320,6 +324,15 @@ class AnnotationPanel(QWidget):
             self.scale_form.setRowVisible(field, expanded)
         self.advanced_toggle.setIcon(icon("chevron-up" if expanded else "chevron-down", COLORS.muted))
 
+    @Slot(str)
+    def _update_fixed_scale_state(self, text: str) -> None:
+        try:
+            parse_scale_nm(text)
+        except ValueError:
+            set_semantic_state(self.fixed_scale_edit, "error")
+        else:
+            set_semantic_state(self.fixed_scale_edit, "")
+
     def bar_color(self) -> str | None:
         """The colour both exporters will use, as #RRGGBB; None while the text is not a colour they accept."""
         try:
@@ -329,7 +342,9 @@ class AnnotationPanel(QWidget):
 
     @Slot()
     def update_color_swatch(self) -> None:
-        self.color_button.set_color(self.bar_color())
+        color = self.bar_color()
+        self.color_button.set_color(color)
+        set_semantic_state(self.color_edit, "error" if color is None else "")
 
     def _button(self, text: str, callback) -> QPushButton:
         button = QPushButton(text)
@@ -481,11 +496,13 @@ class AnnotationPanel(QWidget):
         return item
 
     def add_queue_row(self, path: Path, generate: bool) -> None:
-        row = self.file_list.rowCount()
+        self._insert_queue_row(self.file_list.rowCount(), self.checkbox_item(generate), self.text_item(path.name, path))
+
+    def _insert_queue_row(self, row: int, checkbox: QTableWidgetItem, name: QTableWidgetItem) -> None:
         with QSignalBlocker(self.file_list):
             self.file_list.insertRow(row)
-            self.file_list.setItem(row, COL_GENERATE, self.checkbox_item(generate))
-            self.file_list.setItem(row, COL_NAME, self.text_item(path.name, path))
+            self.file_list.setItem(row, COL_GENERATE, checkbox)
+            self.file_list.setItem(row, COL_NAME, name)
             measurement_cell = MeasurementCellWidget()
             measurement_cell.edit_requested.connect(self.on_measurement_edit_requested)
             self.file_list.setCellWidget(row, COL_MEASUREMENT, measurement_cell)
@@ -562,6 +579,7 @@ class AnnotationPanel(QWidget):
 
     def update_count(self, *_args) -> None:
         total = self.file_list.rowCount()
+        self.clear_queue_button.setEnabled(total > 0)
         checked = self.checked_paths()
         marked = [path for path in checked if self.measurement_overrides.get(path_key(path))]
         selected = len(checked)
@@ -664,17 +682,27 @@ class AnnotationPanel(QWidget):
         self.update_count()
 
     def reorder_queue_row(self, source_row: int, drop_row: int) -> None:
+        table = self.file_list
+        if not (0 <= source_row < table.rowCount() and 0 <= drop_row <= table.rowCount()):
+            return
         insert_at = drop_row - int(source_row < drop_row)
         if insert_at == source_row:
             return
-        rows = [(self.item_path(row), self.row_checked(row)) for row in range(self.file_list.rowCount())]
-        rows.insert(insert_at, rows.pop(source_row))
-        self.file_list.setRowCount(0)
-        for path, generate in rows:
-            self.add_queue_row(path, generate=generate)
-        self.refresh_item_labels()
-        self.file_list.selectRow(insert_at)
-        self.update_count()
+        horizontal, vertical = table.horizontalScrollBar(), table.verticalScrollBar()
+        x, y = horizontal.value(), vertical.value()
+        root = table.rootIndex()
+        if not table.model().moveRow(root, source_row, root, drop_row):
+            # Older QTableWidget models do not implement moveRow. Transfer only this row.
+            with QSignalBlocker(table):
+                checkbox = table.takeItem(source_row, COL_GENERATE)
+                name = table.takeItem(source_row, COL_NAME)
+                assert checkbox is not None and name is not None
+                table.removeRow(source_row)
+                self._insert_queue_row(insert_at, checkbox, name)
+        if not table.selectionModel().isRowSelected(insert_at, root):
+            table.selectRow(insert_at)
+        horizontal.setValue(x)
+        vertical.setValue(y)
 
     def clear_queue(self) -> None:
         self.file_list.setRowCount(0)

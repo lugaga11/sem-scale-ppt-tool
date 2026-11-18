@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from .files import open_path, reveal_path
-from .theme import CARD_MARGIN, COLORS, CONTROL_HEIGHT, ICON_SIZE, RADIUS_SMALL, SPACING, icon
+from .theme import COLORS, CONTROL_HEIGHT, ICON_SIZE, RADIUS_LARGE, RADIUS_SMALL, SPACE, icon
 
 
 def open_file_or_warn(parent: QWidget, path: Path) -> None:
@@ -51,7 +51,7 @@ def reveal_file_or_warn(parent: QWidget, path: Path) -> None:
 
 def section_heading(text: str, icon_name: str) -> QHBoxLayout:
     row = QHBoxLayout()
-    row.setSpacing(9)
+    row.setSpacing(SPACE.sm)
     symbol = QLabel()
     symbol.setProperty("role", "sectionIcon")
     symbol.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -70,8 +70,8 @@ def card() -> tuple[QFrame, QVBoxLayout]:
     frame = QFrame()
     frame.setProperty("panel", True)
     layout = QVBoxLayout(frame)
-    layout.setContentsMargins(CARD_MARGIN, CARD_MARGIN - 2, CARD_MARGIN, CARD_MARGIN - 2)
-    layout.setSpacing(SPACING)
+    layout.setContentsMargins(SPACE.lg, SPACE.md, SPACE.lg, SPACE.md)
+    layout.setSpacing(SPACE.md)
     return frame, layout
 
 
@@ -96,6 +96,18 @@ def restyle(widget: QWidget) -> None:
     widget.style().unpolish(widget)
     widget.style().polish(widget)
     widget.update()
+
+
+def set_semantic_state(widget: QWidget, state: str) -> None:
+    if (widget.property("state") or "") != state:
+        widget.setProperty("state", state)
+        restyle(widget)
+
+
+class StatusLabel(QLabel):
+    def set_status(self, text: str, state: str = "") -> None:
+        set_semantic_state(self, state)
+        self.setText(text)
 
 
 class ElidedLabel(QLabel):
@@ -123,8 +135,8 @@ class EmptyState(QWidget):
         self.setGeometry(viewport.rect())
         viewport.installEventFilter(self)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(SPACING)
+        layout.setContentsMargins(SPACE.lg, SPACE.lg, SPACE.lg, SPACE.lg)
+        layout.setSpacing(SPACE.md)
         layout.addStretch()
         symbol = QLabel()
         symbol.setProperty("role", "emptyIcon")
@@ -157,8 +169,8 @@ class SegmentedControl(QFrame):
         self.group.setExclusive(True)
         self.buttons: dict[str, QPushButton] = {}
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(3, 3, 3, 3)
-        layout.setSpacing(3)
+        layout.setContentsMargins(SPACE.xs, SPACE.xs, SPACE.xs, SPACE.xs)
+        layout.setSpacing(SPACE.xs)
         for choice in choices:
             button = QPushButton(choice)
             button.setProperty("variant", "segment")
@@ -194,19 +206,21 @@ class ToggleSwitch(QCheckBox):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        track = QRectF(1, 2, 40, 20)
+        track = QRectF(self.rect())
         color = COLORS.primary if self.isChecked() else COLORS.border_strong
         if not self.isEnabled():
             color = COLORS.border
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(color))
-        painter.drawRoundedRect(track, 10, 10)
+        painter.drawRoundedRect(track, RADIUS_LARGE, RADIUS_LARGE)
         painter.setBrush(QColor(COLORS.surface))
-        painter.drawEllipse(QRectF(23 if self.isChecked() else 5, 5, 14, 14))
+        diameter = track.height() - 2 * SPACE.xs
+        left = track.width() - SPACE.xs - diameter if self.isChecked() else SPACE.xs
+        painter.drawEllipse(QRectF(left, SPACE.xs, diameter, diameter))
         if self.hasFocus():
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(QColor(COLORS.focus), 1))
-            painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 12, 12)
+            painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), RADIUS_LARGE, RADIUS_LARGE)
 
 
 class ColorSwatchButton(QPushButton):
@@ -233,38 +247,56 @@ class ColorSwatchButton(QPushButton):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(QColor(COLORS.border_strong), 1))
         painter.setBrush(QColor(self.color))
-        painter.drawRoundedRect(QRectF(self.rect()).adjusted(5.5, 5.5, -5.5, -5.5), RADIUS_SMALL, RADIUS_SMALL)
+        inset = SPACE.xs + 0.5
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(inset, inset, -inset, -inset), RADIUS_SMALL, RADIUS_SMALL)
 
 
-class HelpPopover(QFrame):
+class PopupCard(QWidget):
+    """A transparent window with a rounded, opaque content frame."""
+
+    def __init__(self, parent: QWidget, window_type: Qt.WindowType) -> None:
+        super().__init__(parent, window_type)
+        shell = QVBoxLayout(self)
+        shell.setContentsMargins(0, 0, 0, 0)
+        frame = QFrame()
+        frame.setProperty("popupSurface", True)
+        shell.addWidget(frame)
+        self.body = QVBoxLayout(frame)
+        self.body.setContentsMargins(SPACE.lg, SPACE.md, SPACE.lg, SPACE.md)
+        self.body.setSpacing(SPACE.sm)
+
+
+class HelpPopover(PopupCard):
     """Usage notes shown under a "?" button; a click anywhere else closes it."""
 
-    def __init__(self, html: str, parent: QWidget) -> None:
-        flags = Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint
-        super().__init__(parent, flags)
-        self.setObjectName("helpPopover")
-        # Only the rounded card is painted; the corners outside it stay see-through.
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(CARD_MARGIN, SPACING, CARD_MARGIN, SPACING)
-        text = QLabel(html)
-        text.setTextFormat(Qt.TextFormat.RichText)
-        text.setWordWrap(True)
-        text.setFixedWidth(340)
-        layout.addWidget(text)
+    def __init__(self, title: str, paragraphs: tuple[str, ...], note: str, parent: QWidget) -> None:
+        super().__init__(parent, Qt.WindowType.Popup)
+        self.setAccessibleName(title)
+        heading = QLabel(title)
+        heading.setProperty("role", "heading")
+        self.body.addWidget(heading)
+        for paragraph in paragraphs:
+            label = QLabel(paragraph)
+            label.setWordWrap(True)
+            self.body.addWidget(label)
+        footer = QLabel(note)
+        footer.setProperty("role", "status")
+        footer.setWordWrap(True)
+        self.body.addWidget(footer)
 
     def show_below(self, anchor: QWidget) -> None:
-        self.adjustSize()
-        available = anchor.screen().availableGeometry()
-        position = anchor.mapToGlobal(QPoint(anchor.width() - self.width(), anchor.height() + 6))
-        position.setX(max(available.left(), min(position.x(), available.right() - self.width())))
-        position.setY(max(available.top(), min(position.y(), available.bottom() - self.height())))
-        self.move(position)
+        available = anchor.screen().availableGeometry().adjusted(SPACE.sm, SPACE.sm, -SPACE.sm, -SPACE.sm)
+        self.ensurePolished()
+        self.setFixedWidth(min(400, available.width()))
+        self.resize(self.width(), self.heightForWidth(self.width()))
+        top_left = anchor.mapToGlobal(QPoint())
+        x = top_left.x() + anchor.width() - self.width()
+        y = top_left.y() + anchor.height() + SPACE.xs
+        if y + self.height() > available.bottom() + 1:
+            y = top_left.y() - self.height() - SPACE.xs
+        self.move(max(available.left(), min(x, available.right() - self.width() + 1)),
+                  max(available.top(), min(y, available.bottom() - self.height() + 1)))
         self.show()
-
-
-# A spin box draws its number flush with the frame; this lines it up with the text of a line edit.
-SPIN_TEXT_MARGIN = 10
 
 
 class NoWheelComboBox(QComboBox):
@@ -277,7 +309,7 @@ class NoWheelComboBox(QComboBox):
 class NoWheelSpinBox(QSpinBox):
     def __init__(self) -> None:
         super().__init__()
-        self.lineEdit().setTextMargins(SPIN_TEXT_MARGIN, 0, 0, 0)
+        self.lineEdit().setTextMargins(SPACE.sm, 0, 0, 0)
 
     def wheelEvent(self, event) -> None:
         event.ignore()
@@ -286,7 +318,7 @@ class NoWheelSpinBox(QSpinBox):
 class NoWheelDoubleSpinBox(QDoubleSpinBox):
     def __init__(self) -> None:
         super().__init__()
-        self.lineEdit().setTextMargins(SPIN_TEXT_MARGIN, 0, 0, 0)
+        self.lineEdit().setTextMargins(SPACE.sm, 0, 0, 0)
 
     def wheelEvent(self, event) -> None:
         event.ignore()
@@ -305,7 +337,7 @@ class PathLineEdit(QLineEdit):
         self.style().drawPrimitive(QStyle.PrimitiveElement.PE_PanelLineEdit, option, painter, self)
         painter.setFont(self.font())
         painter.setPen(self.palette().text().color())
-        rect = self.rect().adjusted(10, 0, -10, 0)
+        rect = self.rect().adjusted(SPACE.sm, 0, -SPACE.sm, 0)
         if not self.text():
             painter.setPen(self.palette().placeholderText().color())
         text = self.fontMetrics().elidedText(self.text() or self.placeholderText(), Qt.TextElideMode.ElideMiddle, rect.width())

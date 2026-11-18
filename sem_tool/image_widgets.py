@@ -11,7 +11,7 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from .imaging import image_to_display_rgb
-from .theme import COLORS, RADIUS, icon
+from .theme import COLORS, RADIUS, SPACE, icon
 
 
 def qimage_from_pil(image: Image.Image) -> QImage:
@@ -55,9 +55,9 @@ class ImageCanvas(QWidget):
             center = self.rect().center()
             icon("image", COLORS.disabled).paint(painter, center.x() - 16, center.y() - 30, 32, 32)
             painter.setPen(QColor(COLORS.muted))
-            painter.drawText(self.rect().adjusted(8, 40, -8, 0), Qt.AlignmentFlag.AlignCenter, self.placeholder)
+            painter.drawText(self.rect().adjusted(SPACE.sm, 40, -SPACE.sm, 0), Qt.AlignmentFlag.AlignCenter, self.placeholder)
             return
-        area = self.rect().adjusted(6, 6, -6, -6)
+        area = self.rect().adjusted(SPACE.sm, SPACE.sm, -SPACE.sm, -SPACE.sm)
         size = self.pixmap.size().scaled(area.size(), Qt.AspectRatioMode.KeepAspectRatio)
         target = QRectF(0, 0, size.width(), size.height())
         target.moveCenter(QRectF(area).center())

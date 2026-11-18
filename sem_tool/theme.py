@@ -1,6 +1,6 @@
 """Shared, compact desktop styling for the application and its dialogs.
 
-Every colour, radius, control height and font size of the interface is defined once in this module.
+Every colour, radius, layout spacing, control height and font size of the interface is defined once in this module.
 The stylesheet is a template over these tokens and custom-painted widgets read the same values, so a
 new control picks a token instead of introducing another literal.
 """
@@ -15,7 +15,7 @@ from string import Template
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPalette, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QApplication, QFrame, QProxyStyle, QStyle
+from PySide6.QtWidgets import QApplication, QFrame, QProxyStyle, QStyle, QWidget
 
 ASSETS = Path(__file__).resolve().parent / "assets"
 
@@ -48,7 +48,6 @@ class Palette:
     secondary: str = "#536179"
     muted: str = "#7b899f"
     disabled: str = "#aeb7c5"
-    # States: something is done / something needs attention.
     success: str = "#226c42"
     success_surface: str = "#def2e5"
     success_border: str = "#a8d2b7"
@@ -57,11 +56,23 @@ class Palette:
     warning_surface: str = "#fff0e7"
     warning_border: str = "#e6c1ae"
     warning_hover: str = "#ffe3d1"
+    error: str = "#a62c28"
+    error_surface: str = "#fff1f0"
+    error_border: str = "#ce6a64"
     # The colour the SVG assets are drawn in until icon() recolours them.
     icon: str = "#667b9a"
 
 
+@dataclass(frozen=True)
+class Spacing:
+    xs: int = 4
+    sm: int = 8
+    md: int = 12
+    lg: int = 16
+
+
 COLORS = Palette()
+SPACE = Spacing()
 
 RADIUS_SMALL = 4  # tags and check boxes
 RADIUS = 8  # buttons, inputs, list rows
@@ -69,54 +80,58 @@ RADIUS_LARGE = 12  # cards and pop-ups
 CONTROL_HEIGHT = 32  # buttons and inputs
 COMPACT_HEIGHT = 28  # controls inside the image editors and table rows
 PRIMARY_HEIGHT = 40  # the one main action of a page
+NAV_BAR_HEIGHT = 52  # three main page tabs, including the surrounding space
 ICON_SIZE = 16
 CHECK_SIZE = 18
 FONT_CAPTION = 12
 FONT_CONTROL = 13
 FONT_BODY = 14
 FONT_TITLE = 16
-SPACING = 12  # gap between rows and between cards
-CARD_MARGIN = 16
 
 STYLESHEET = Template("""
 QWidget { font-size: ${f_body}px; }
 QMainWindow, QDialog, QWidget#annotationPanel, QWidget#searchPanel, QWidget#logPanel { background: $window; }
 QFrame[panel="true"] { background: $surface; border: 1px solid $border; border-radius: ${radius_l}px; }
 QWidget#inspectorContents { background: $surface; }
-QToolTip { background: $surface; color: $text; border: 1px solid $border_strong; padding: 5px 8px; font-size: ${f_caption}px; }
+QMenu, QComboBox QAbstractItemView, QFrame[popupSurface="true"], QToolTip {
+    background: $surface; color: $text; border: 1px solid $border_strong; border-radius: ${radius_l}px;
+}
+QToolTip { padding: ${space_xs}px ${space_sm}px; font-size: ${f_caption}px; }
 
 QLabel { background: transparent; border: none; color: $text; }
 QLabel[role="heading"] { color: $heading; font-size: ${f_title}px; font-weight: 600; }
 QLabel[role="muted"] { color: $muted; font-size: ${f_caption}px; }
 QLabel[role="status"] { color: $secondary; font-size: ${f_control}px; }
-QLabel[role="badge"] { background: $tint; color: $primary_hover; border-radius: ${radius_s}px; padding: 3px 8px; font-size: ${f_caption}px; }
+QLabel[role="badge"] { background: $tint; color: $primary_hover; border-radius: ${radius_s}px; padding: ${space_xs}px ${space_sm}px; font-size: ${f_caption}px; }
 QLabel[role="sectionIcon"] { background: $tint; border-radius: ${radius}px; }
 QLabel[role="emptyIcon"] { background: $subtle; border: 1px solid $border; border-radius: ${radius_l}px; }
 QLabel[role="emptyTitle"] { color: $secondary; font-size: ${f_title}px; font-weight: 500; }
 QLabel[role="resultTitle"] { color: $heading; font-size: ${f_body}px; font-weight: 600; }
 QLabel[role="metrics"] { color: $muted; font-size: ${f_caption}px; }
-QLabel[role="confidence"] { background: $tint; color: $primary_hover; border-radius: ${radius_s}px; padding: 3px 8px; font-size: ${f_caption}px; }
+QLabel[role="confidence"] { background: $tint; color: $primary_hover; border-radius: ${radius_s}px; padding: ${space_xs}px ${space_sm}px; font-size: ${f_caption}px; }
 QLabel[role="confidence"][level="medium"] { background: $subtle; color: $secondary; }
 QLabel[role="confidence"][level="low"] { background: $warning_surface; color: $warning; }
 QLabel[role="hoverMetadata"] { color: $secondary; font-size: ${f_control}px; font-weight: 500; }
 QLabel[role="hoverDetail"] { color: $muted; font-size: ${f_caption}px; }
 QLabel[role="editorStatus"] { color: $secondary; font-size: ${f_caption}px; }
 QLabel[role="editorValue"] { color: $primary_hover; font-size: ${f_control}px; font-weight: 600; }
-QLabel[role="editorValue"][state="invalid"] { color: $warning; }
+QLabel[state="success"] { color: $success; }
+QLabel[state="warning"] { color: $warning; }
+QLabel[state="error"] { color: $error; }
 
 QTabWidget { background: $surface; }
 QTabWidget::pane { border: none; border-top: 1px solid $divider; }
 QTabBar { background: $surface; }
 QTabBar::tab {
-    background: $surface; color: $muted; height: 20px; padding: 7px 16px;
-    margin: 7px 4px; border: 1px solid transparent; border-radius: ${radius}px; font-weight: 500;
+    background: $surface; color: $muted; height: ${h_tab_content}px; padding: ${space_sm}px ${space_lg}px;
+    margin: ${space_sm}px ${space_xs}px; border: 1px solid transparent; border-radius: ${radius}px; font-weight: 500;
 }
 QTabBar::tab:selected { color: $primary_hover; background: $tint; font-weight: 600; }
 QTabBar::tab:hover:!selected { background: $subtle; color: $secondary; }
 
 QPushButton, QToolButton {
     background: $surface; color: $text; border: 1px solid $border_strong;
-    border-radius: ${radius}px; padding: 0px 12px; min-height: ${h_control}px; font-size: ${f_control}px;
+    border-radius: ${radius}px; padding: 0px ${space_md}px; min-height: ${h_control}px; font-size: ${f_control}px;
 }
 QPushButton:hover, QToolButton:hover { background: $hover; }
 QPushButton:pressed, QToolButton:pressed { background: $pressed; }
@@ -136,15 +151,15 @@ QPushButton[variant="added"]:hover, QPushButton[variant="added"]:pressed { backg
 QPushButton[variant="toolbar"], QToolButton[variant="toolbar"] { border-color: transparent; background: transparent; }
 QPushButton[variant="toolbar"]:hover, QToolButton[variant="toolbar"]:hover { background: $hover; }
 QPushButton[variant="toolbar"]:pressed, QToolButton[variant="toolbar"]:pressed { background: $pressed; }
-QPushButton[variant="menu"] { padding-right: 28px; }
+QPushButton[variant="menu"] { padding-right: ${space_lg}px; }
 QPushButton[variant="menu"]::menu-indicator {
     image: url("$assets/chevron-down.svg"); width: 12px; height: 12px;
-    subcontrol-origin: padding; subcontrol-position: center right; right: 9px;
+    subcontrol-origin: padding; subcontrol-position: center right; right: ${space_xs}px;
 }
 QToolButton::menu-indicator { image: none; }
 QPushButton[shape="icon"], QToolButton[shape="icon"] { padding: 0px; }
 QPushButton[variant="measurement"] {
-    padding: 0px 9px; min-height: ${h_compact}px; font-size: ${f_caption}px;
+    padding: 0px ${space_sm}px; min-height: ${h_compact}px; font-size: ${f_caption}px;
     background: $subtle; color: $secondary;
 }
 QPushButton[variant="measurement"]:hover { background: $hover; }
@@ -156,8 +171,8 @@ QPushButton[status="missing"] { background: $warning_surface; color: $warning; b
 QPushButton[status="missing"]:hover, QPushButton[status="missing"]:pressed { background: $warning_hover; }
 QFrame#segmentedControl { background: $subtle; border: none; border-radius: ${radius}px; }
 QPushButton[variant="segment"] {
-    background: transparent; border: 1px solid transparent; padding: 0px 8px;
-    min-height: ${h_segment}px; color: $muted; border-radius: ${radius_inner}px;
+    background: transparent; border: 1px solid transparent; padding: 0px ${space_sm}px;
+    min-height: ${h_segment}px; color: $muted; border-radius: ${radius_s}px;
 }
 QPushButton[variant="segment"]:checked { background: $surface; border-color: $border; color: $primary_hover; font-weight: 600; }
 QPushButton[variant="segment"]:hover:!checked { background: $hover; color: $secondary; }
@@ -170,26 +185,25 @@ QToolButton#advancedToggle:hover { color: $primary; }
 
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     background: $input; color: $text; border: 1px solid $border; border-radius: ${radius}px;
-    padding: 0px 10px; min-height: ${h_control}px; max-height: ${h_control}px;
+    padding: 0px ${space_sm}px; min-height: ${h_control}px; max-height: ${h_control}px;
     selection-background-color: $tint_strong; selection-color: $heading;
 }
 QLineEdit:hover, QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover { border-color: $border_strong; }
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { background: $surface; border-color: $focus; }
 QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled { background: $disabled_surface; color: $disabled; }
-QLineEdit[state="invalid"] { background: $warning_surface; border-color: $warning_border; }
-QComboBox { padding-right: 30px; }
-QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: center right; width: 26px; border: none; background: transparent; }
+QLineEdit[state="error"] { background: $error_surface; border-color: $error_border; color: $error; }
+QComboBox { padding-right: ${space_lg}px; }
+QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: center right; width: ${combo_arrow_width}px; border: none; background: transparent; }
 QComboBox::down-arrow { image: url("$assets/chevron-down.svg"); width: 12px; height: 12px; }
 QComboBox QAbstractItemView {
-    border: 1px solid $border_strong; background: $surface; color: $text;
-    outline: 0; padding: 4px; selection-background-color: $tint; selection-color: $primary_hover;
+    outline: 0; padding: ${space_xs}px; selection-background-color: $tint; selection-color: $primary_hover;
 }
-QComboBox QAbstractItemView::item { min-height: ${h_compact}px; padding: 2px 8px; border-radius: ${radius_inner}px; }
+QComboBox QAbstractItemView::item { min-height: ${h_compact}px; padding: ${space_xs}px ${space_sm}px; border-radius: ${radius}px; }
 QComboBox QAbstractItemView::item:selected { background: $tint; color: $primary_hover; }
 QAbstractSpinBox::up-button, QAbstractSpinBox::down-button { width: 20px; border: none; }
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { image: url("$assets/chevron-up.svg"); width: 12px; height: 12px; }
 QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { image: url("$assets/chevron-down.svg"); width: 12px; height: 12px; }
-QCheckBox { spacing: 7px; color: $secondary; background: transparent; }
+QCheckBox { spacing: ${space_sm}px; color: $secondary; background: transparent; }
 QCheckBox::indicator, QTableWidget::indicator { width: ${check}px; height: ${check}px; }
 
 QTableWidget {
@@ -201,21 +215,21 @@ QTableWidget::item:hover { background: $subtle; }
 QTableWidget::item:selected { background: $tint; color: $heading; }
 QHeaderView::section {
     background: $subtle; color: $muted; border: none; border-bottom: 1px solid $divider;
-    padding: 8px 10px; font-size: ${f_caption}px; font-weight: 500;
+    padding: ${space_sm}px; font-size: ${f_caption}px; font-weight: 500;
 }
 QScrollArea { background: transparent; border: none; }
-QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
-QScrollBar::handle:vertical { background: $border_strong; border-radius: 2px; min-height: 24px; }
+QScrollBar:vertical { background: transparent; width: ${space_sm}px; margin: ${space_xs}px 0; }
+QScrollBar::handle:vertical { background: $border_strong; border-radius: ${radius_s}px; min-height: 24px; }
 QScrollBar::handle:vertical:hover { background: $disabled; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-QScrollBar:horizontal { background: transparent; height: 8px; margin: 2px; }
-QScrollBar::handle:horizontal { background: $border_strong; border-radius: 2px; min-width: 24px; }
+QScrollBar:horizontal { background: transparent; height: ${space_sm}px; margin: 0 ${space_xs}px; }
+QScrollBar::handle:horizontal { background: $border_strong; border-radius: ${radius_s}px; min-width: 24px; }
 QScrollBar::handle:horizontal:hover { background: $disabled; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
 QSplitter::handle { background: $window; }
-QSplitter::handle:hover { background: $tint_strong; border-radius: 3px; }
+QSplitter::handle:hover { background: $tint_strong; border-radius: ${radius_s}px; }
 QPlainTextEdit { border: none; background: $surface; color: $text; selection-background-color: $tint_strong; selection-color: $heading; }
 QListWidget#searchResults { border: none; border-radius: 0; padding: 0; background: $surface; outline: none; }
 QListWidget#searchResults::item, QListWidget#searchResults::item:selected, QListWidget#searchResults::item:hover {
@@ -224,35 +238,34 @@ QListWidget#searchResults::item, QListWidget#searchResults::item:selected, QList
 QFrame#searchResult { border: 1px solid $border; border-radius: ${radius}px; background: $surface; }
 QFrame#searchResult:hover { border-color: $border_strong; background: $input; }
 QFrame#searchResult[selected="true"] { border-color: $focus; background: $tint; }
-QFrame#imageHoverCard, QFrame#helpPopover { background: $surface; border: 1px solid $border_strong; border-radius: ${radius_l}px; }
-QProgressBar#searchProgress { height: 3px; min-height: 3px; max-height: 3px; padding: 0; background: $divider; border: none; border-radius: 1px; }
-QProgressBar#searchProgress::chunk { background: $primary; border-radius: 1px; }
-QMenu { background: $surface; border: 1px solid $border_strong; padding: 5px; }
-QMenu::item { padding: 7px 28px 7px 12px; border-radius: ${radius_inner}px; color: $text; }
+QProgressBar#searchProgress { height: 3px; min-height: 3px; max-height: 3px; padding: 0; background: $divider; border: none; border-radius: 0; }
+QProgressBar#searchProgress::chunk { background: $primary; border-radius: 0; }
+QMenu { padding: ${space_xs}px; }
+QMenu::item { padding: ${space_sm}px ${space_lg}px ${space_sm}px ${space_md}px; border-radius: ${radius}px; color: $text; }
 QMenu::item:selected { background: $tint; color: $primary_hover; }
 QMenu::item:disabled { color: $disabled; }
-QMenu::separator { height: 1px; background: $divider; margin: 5px 8px; }
+QMenu::separator { height: 1px; background: $divider; margin: ${space_xs}px ${space_sm}px; }
 
 QFrame[editorBar="true"] { background: $surface; border: 1px solid $border; border-radius: ${radius}px; }
 QFrame[role="editorSeparator"] { background: $border; border: none; min-width: 1px; max-width: 1px; }
-QDialog[imageEditor="true"] QPushButton, QDialog[imageEditor="true"] QToolButton { padding: 0px 10px; min-height: ${h_compact}px; }
-QDialog[imageEditor="true"] QPushButton[variant="segment"] { padding: 0px 10px; min-height: ${h_compact_segment}px; }
+QDialog[imageEditor="true"] QPushButton, QDialog[imageEditor="true"] QToolButton { padding: 0px ${space_sm}px; min-height: ${h_compact}px; }
+QDialog[imageEditor="true"] QPushButton[variant="segment"] { min-height: ${h_segment}px; }
 QDialog[imageEditor="true"] QToolButton[shape="icon"] { padding: 0px; }
-QDialog[imageEditor="true"] QLineEdit { padding: 0px 8px; min-height: ${h_compact}px; max-height: ${h_compact}px; }
+QDialog[imageEditor="true"] QLineEdit { padding: 0px ${space_sm}px; min-height: ${h_compact}px; max-height: ${h_compact}px; }
 """).substitute(
     asdict(COLORS),
     assets=ASSETS.as_posix(),
     radius_s=RADIUS_SMALL,
     radius=RADIUS,
-    radius_inner=RADIUS - 2,
     radius_l=RADIUS_LARGE,
+    space_xs=SPACE.xs, space_sm=SPACE.sm, space_md=SPACE.md, space_lg=SPACE.lg,
+    combo_arrow_width=ICON_SIZE + 2 * SPACE.xs,
     # A stylesheet height excludes the 1 px border on each side.
     h_control=CONTROL_HEIGHT - 2,
     h_compact=COMPACT_HEIGHT - 2,
     h_primary=PRIMARY_HEIGHT - 2,
-    # Segments sit inside a track with a 3 px margin.
-    h_segment=CONTROL_HEIGHT - 8,
-    h_compact_segment=COMPACT_HEIGHT - 8,
+    h_tab_content=NAV_BAR_HEIGHT - 4 * SPACE.sm - 2,  # margins, padding and border
+    h_segment=CONTROL_HEIGHT - 2 * SPACE.xs - 2,
     check=CHECK_SIZE,
     f_caption=FONT_CAPTION,
     f_control=FONT_CONTROL,
@@ -266,6 +279,21 @@ class DesktopStyle(QProxyStyle):
 
     def __init__(self) -> None:
         super().__init__("Fusion")
+
+    def polish(self, target):
+        if isinstance(target, QWidget) and target.windowType() in (Qt.WindowType.Popup, Qt.WindowType.ToolTip):
+            flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint
+            target.setWindowFlags(target.windowFlags() | flags)
+            target.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        return super().polish(target)
+
+    def pixelMetric(self, metric, option=None, widget=None) -> int:
+        if metric in (QStyle.PixelMetric.PM_LayoutHorizontalSpacing, QStyle.PixelMetric.PM_LayoutVerticalSpacing):
+            return SPACE.sm
+        if metric in (QStyle.PixelMetric.PM_LayoutLeftMargin, QStyle.PixelMetric.PM_LayoutRightMargin,
+                      QStyle.PixelMetric.PM_LayoutTopMargin, QStyle.PixelMetric.PM_LayoutBottomMargin):
+            return SPACE.md
+        return super().pixelMetric(metric, option, widget)
 
     def styleHint(self, hint, option=None, widget=None, returnData=None) -> int:
         # Fusion's menu delegate bypasses the popup list's item styling.

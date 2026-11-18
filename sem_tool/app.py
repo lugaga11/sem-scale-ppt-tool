@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 from .annotation.ui import AnnotationPanel
 from .files import is_supported_image
 from .search.ui import SearchPanel
-from .theme import CARD_MARGIN, COLORS, SPACING, apply_theme, icon
+from .theme import COLORS, NAV_BAR_HEIGHT, SPACE, apply_theme, icon
 from .widgets import card, open_file_or_warn, section_heading
 
 WINDOW_TITLE = "SEM 图片工具 · 搜图 / 标注 / 导出"
@@ -35,7 +35,7 @@ class LogPanel(QWidget):
         self.setObjectName("logPanel")
         self.output_directory: Path | None = None
         root = QVBoxLayout(self)
-        root.setContentsMargins(CARD_MARGIN, SPACING, CARD_MARGIN, SPACING)
+        root.setContentsMargins(SPACE.lg, SPACE.md, SPACE.lg, SPACE.md)
         frame, layout = card()
         heading = section_heading("运行日志", "log")
         self.copy_button = QPushButton("复制")
@@ -97,7 +97,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.setIconSize(QSize(17, 17))
-        self.tabs.tabBar().setFixedHeight(52)
+        self.tabs.tabBar().setFixedHeight(NAV_BAR_HEIGHT)
         self.search_panel = SearchPanel()
         self.annotation_panel = AnnotationPanel()
         self.log_panel = LogPanel()
